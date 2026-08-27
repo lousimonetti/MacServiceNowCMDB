@@ -163,7 +163,7 @@ both leave the next run unable to reason about the fleet.
 ## 6. Debugging a run
 
 ```bash
-intune-cmdb-sync --check                   # connectivity only, no writes
+intune-cmdb-sync --check                   # both connections + a simulated write
 intune-cmdb-sync --dry-run --log-level DEBUG --log-format text
 intune-cmdb-sync --dry-run --report-devices --report ./run.json
 ```
@@ -218,7 +218,8 @@ The ServiceNow half has never run against a live instance. In priority order:
    this a convention, not a guarantee. Verify before enabling retirement.
 3. **`sys_properties` read access.** `--check` reads one row as a connectivity
    probe, and `itil` does not always carry that grant. A 403 there can be a red
-   herring rather than a real auth problem.
+   herring rather than a real auth problem — the write probe that follows is the
+   one that matters.
 4. **Graph paging at scale.** `@odata.nextLink` handling has never seen a real
    multi-page tenant.
 5. **Vendor prefix.** `x_icsy_intune_cmdb` in `servicenow-app/` is a

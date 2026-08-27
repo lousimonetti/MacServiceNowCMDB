@@ -35,6 +35,11 @@ IDENTIFY_RECONCILE_API = "/api/now/identifyreconcile"
 IDENTIFY_RECONCILE_ENHANCED_API = "/api/now/identifyreconcile/enhanced"
 IDENTIFY_RECONCILE_QUERY_API = "/api/now/identifyreconcile/query"
 
+# Source key for the write-access probe. Deliberately unlike any Intune device
+# GUID, so that even if a future change sent it to a committing endpoint it
+# could not collide with a real CI.
+PROBE_SOURCE_KEY = "intune-cmdb-sync:write-access-probe"
+
 # IRE `operation` values mapped onto the connector's outcome vocabulary.
 _OPERATION_TO_ACTION = {
     "INSERT": "inserted",
@@ -215,6 +220,117 @@ class IdentifyReconcileWriter:
                 )
             )
         return results
+
+
+@dataclass
+class WriteAccessCheck:
+    """Outcome of proving the integration user can write, without writing."""
+
+    verified: bool
+    detail: str
+
+
+def verify_write_access(client: ServiceNowClient, cfg: ServiceNowConfig) -> WriteAccessCheck:
+    """Prove the IRE write path works, without creating anything.
+
+    `--check` previously proved only that ServiceNow was reachable and readable,
+    which leaves the two most common misconfigurations undetected until the
+    first real run: an integration user without `itil`/`asset`, and a discovery
+    source that was never registered as a choice value.
+
+    This posts a synthetic item to `/api/now/identifyreconcile/query`, which runs
+    identification and reports what *would* happen without committing anything.
+    It is safe against production: the endpoint has no write path.
+
+    Raises `ServiceNowError` when the write path is definitively broken. Returns
+    an unverified result when the answer is genuinely unknown, which is not the
+    same thing and must not be reported as success.
+    """
+    if cfg.write_mode != "identify_reconcile":
+        return WriteAccessCheck(
+            verified=False,
+            detail=(
+                f"SNOW_WRITE_MODE={cfg.write_mode} has no simulation endpoint, so write "
+                "access cannot be checked without creating a CI. Verify it manually "
+                "before the first run."
+            ),
+        )
+
+    payload = {
+        "items": [
+            {
+                "className": cfg.default_class or "cmdb_ci_computer",
+                "values": {
+                    "name": "intune-cmdb-sync-write-access-probe",
+                    "serial_number": "INTUNE-CMDB-SYNC-PROBE",
+                },
+                "sys_object_source_info": {
+                    "source_native_key": PROBE_SOURCE_KEY,
+                    "source_name": cfg.discovery_source,
+                },
+            }
+        ],
+        "relations": [],
+    }
+
+    response = client.request(
+        "POST",
+        IDENTIFY_RECONCILE_QUERY_API,
+        params={"sysparm_data_source": cfg.discovery_source},
+        json_body=payload,
+    )
+
+    if response.status_code == 404:
+        # Older releases predate the API. That is a real constraint, not a
+        # permissions problem, and the fallback write mode still works.
+        return WriteAccessCheck(
+            verified=False,
+            detail=(
+                "this instance has no /api/now/identifyreconcile/query endpoint, so write "
+                "access could not be simulated. If the release predates the IRE API, use "
+                "SNOW_WRITE_MODE=cmdb_instance."
+            ),
+        )
+
+    if response.status_code in (401, 403):
+        raise ServiceNowError(
+            f"the integration user cannot use the Identification and Reconciliation API: "
+            f"{describe_error(response)}. It needs the 'itil' or 'asset' role."
+        )
+
+    if not response.is_success:
+        detail = describe_error(response)
+        hint = ""
+        if "data source" in detail.lower():
+            # By far the most common first-run failure, and the message alone
+            # does not say where the value has to be registered.
+            hint = (
+                f" SNOW_DISCOVERY_SOURCE={cfg.discovery_source!r} must exist as a choice "
+                "value on cmdb_ci.discovery_source, matching exactly including case "
+                "(docs/servicenow-setup.md section 5)."
+            )
+        raise ServiceNowError(
+            f"IRE rejected a write-access probe: {detail}"
+            f"{_log_context_suffix(_log_context_id(response))}{hint}"
+        )
+
+    result = (response.json() or {}).get("result") or {}
+    items = result.get("items") or []
+    errors = _collect_item_errors(items[0]) if items else []
+    if errors:
+        raise ServiceNowError(
+            "IRE accepted the request but rejected the probe item: "
+            + "; ".join(errors)
+            + _log_context_suffix(result.get("logContextId"))
+        )
+
+    return WriteAccessCheck(
+        verified=True,
+        detail=(
+            f"IRE simulated a write as {cfg.discovery_source!r} into "
+            f"{cfg.default_class or 'cmdb_ci_computer'}; nothing was committed"
+        ),
+    )
 
 
 class CmdbInstanceWriter:

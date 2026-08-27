@@ -224,6 +224,10 @@ which is the behaviour the whole design rests on.
 
 Then delete the test CI.
 
+`intune-cmdb-sync --check` performs the same simulation automatically, through
+`/api/now/identifyreconcile/query`, and turns each of the failures below into a
+message that names the cause. Run it before scheduling anything.
+
 ### If it fails
 
 | Response | Cause |

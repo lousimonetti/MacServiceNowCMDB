@@ -18,6 +18,7 @@ from .graph import GraphClient
 from .logging_setup import configure_logging
 from .models import RunReport
 from .servicenow.client import ServiceNowClient
+from .servicenow.writers import verify_write_access
 from .storage import build_state_store
 from .sync import SyncRunner
 
@@ -142,9 +143,25 @@ def _write_report(report: RunReport, location: str | None, include_devices: bool
 
 
 def _check(cfg: Config) -> int:
+    """Validate configuration and both connections, writing nothing.
+
+    Read access is the easy half. The failures that actually bite on a new
+    instance -- a missing `itil` role, an unregistered discovery source -- are
+    on the write path, so that is simulated too.
+    """
     with ServiceNowClient(cfg.servicenow) as snow:
         identity = snow.verify_connectivity()
         log.info("ServiceNow reachable", extra={"instance": identity.get("instance")})
+
+        write_access = verify_write_access(snow, cfg.servicenow)
+        if write_access.verified:
+            log.info("ServiceNow write path verified", extra={"detail": write_access.detail})
+        else:
+            # Not proven broken, but not proven working either. Saying "passed"
+            # here would be the whole point of this check, inverted.
+            log.warning(
+                "ServiceNow write path NOT verified", extra={"detail": write_access.detail}
+            )
 
     with GraphClient(cfg.graph) as graph:
         devices = graph.iter_managed_devices()
@@ -156,8 +173,14 @@ def _check(cfg: Config) -> int:
                 "found_any": first is not None,
             },
         )
-    log.info("configuration and connectivity check passed")
-    return EXIT_OK
+    if write_access.verified:
+        log.info("configuration and connectivity check passed")
+        return EXIT_OK
+    log.warning(
+        "configuration and connectivity check passed, except the write path, "
+        "which could not be simulated on this instance"
+    )
+    return EXIT_PARTIAL
 
 
 def main(argv: list[str] | None = None) -> int:

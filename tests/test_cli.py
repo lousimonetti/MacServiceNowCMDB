@@ -112,17 +112,75 @@ class TestRun:
         assert main([]) == EXIT_FAILED
 
 
+IRE_QUERY = f"{IRE}/query"
+
+
 class TestCheck:
-    @respx.mock
-    def test_check_probes_both_systems_without_writing(self, set_env):
-        set_env()
-        mock_snow_plumbing()
+    """`--check` must prove the write path too. Read access is the easy half;
+    the failures that bite on a new instance -- a missing `itil` role, an
+    unregistered discovery source -- are all on the write side."""
+
+    def _graph_ok(self):
         respx.get(DEVICES).mock(
             return_value=httpx.Response(200, json={"value": [make_device(id="d1")]})
         )
-        ire = respx.post(IRE)
+
+    @respx.mock
+    def test_probes_both_systems_without_committing_anything(self, set_env):
+        set_env()
+        mock_snow_plumbing()
+        self._graph_ok()
+        probe = respx.post(IRE_QUERY).mock(
+            return_value=httpx.Response(200, json={"result": {"items": [{"operation": "INSERT"}]}})
+        )
+        committing = respx.post(IRE)
+
         assert main(["--check"]) == EXIT_OK
-        assert ire.call_count == 0
+        assert probe.call_count == 1
+        # The simulation endpoint was used; the one that writes was not.
+        assert committing.call_count == 0
+
+    @respx.mock
+    def test_missing_itil_role_fails_the_check(self, set_env):
+        set_env()
+        mock_snow_plumbing()
+        self._graph_ok()
+        respx.post(IRE_QUERY).mock(return_value=httpx.Response(403, text="insufficient rights"))
+        assert main(["--check"]) == EXIT_FAILED
+
+    @respx.mock
+    def test_unregistered_discovery_source_fails_with_a_pointed_message(self, set_env, capsys):
+        """`Invalid data source` does not say where the value has to be
+        registered, which is the entire difficulty of that error."""
+        set_env()
+        mock_snow_plumbing()
+        self._graph_ok()
+        respx.post(IRE_QUERY).mock(
+            return_value=httpx.Response(400, json={"error": {"message": "Invalid data source"}})
+        )
+        assert main(["--check"]) == EXIT_FAILED
+        # configure_logging replaces the root handlers, so caplog sees nothing;
+        # the JSON goes to stdout.
+        output = capsys.readouterr().out
+        assert "cmdb_ci.discovery_source" in output
+        assert "SNOW_DISCOVERY_SOURCE" in output
+
+    @respx.mock
+    def test_absent_query_endpoint_is_unverified_not_passed(self, set_env):
+        """An older release without the API is not a failure, but reporting it
+        as a pass would defeat the point of the check."""
+        set_env()
+        mock_snow_plumbing()
+        self._graph_ok()
+        respx.post(IRE_QUERY).mock(return_value=httpx.Response(404, text="not found"))
+        assert main(["--check"]) == EXIT_PARTIAL
+
+    @respx.mock
+    def test_cmdb_instance_mode_cannot_be_verified(self, set_env):
+        set_env(SNOW_WRITE_MODE="cmdb_instance")
+        mock_snow_plumbing()
+        self._graph_ok()
+        assert main(["--check"]) == EXIT_PARTIAL
 
     @respx.mock
     def test_check_fails_when_servicenow_rejects_auth(self, set_env):

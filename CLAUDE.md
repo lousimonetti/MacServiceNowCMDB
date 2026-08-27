@@ -104,8 +104,13 @@ than they look.
    IRE is base platform. Then follow `docs/servicenow-setup.md` §2 (grant
    `itil`) and §5 (create the discovery source choice value — skipping it
    produces `Invalid data source`).
-2. **`intune-cmdb-sync --check`.** Connectivity only. Note that `itil` does not
-   always carry `sys_properties` read, so a 403 here can be a red herring.
+2. **`intune-cmdb-sync --check`.** Proves both connections *and* simulates a
+   write through `/api/now/identifyreconcile/query`, which commits nothing — so
+   a missing `itil` role or an unregistered discovery source fails here rather
+   than on the first real run. Exit 4 means the write path could not be
+   simulated (older release, or `cmdb_instance` mode), which is not the same as
+   a pass. Note `itil` does not always carry `sys_properties` read, so a 403 on
+   the connectivity probe can be a red herring.
 3. **`--dry-run --limit 5 --report-devices --report ./run.json`.** Confirm the `operation`
    values IRE actually returns against `_OPERATION_TO_ACTION` in `writers.py`.
    The dry run uses `/identifyreconcile/query`, a *different* endpoint whose

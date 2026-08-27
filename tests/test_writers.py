@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import httpx
 import pytest
@@ -10,10 +11,12 @@ from intune_cmdb_sync.config import Config
 from intune_cmdb_sync.errors import ServiceNowError
 from intune_cmdb_sync.servicenow.client import ServiceNowClient
 from intune_cmdb_sync.servicenow.writers import (
+    PROBE_SOURCE_KEY,
     CiPayload,
     CmdbInstanceWriter,
     IdentifyReconcileWriter,
     build_writer,
+    verify_write_access,
 )
 
 SNOW = "https://acme.service-now.com"
@@ -330,3 +333,76 @@ class TestLogContextId:
             with pytest.raises(ServiceNowError) as exc:
                 writer.write([payload()])
         assert "400" in str(exc.value)
+
+
+class TestVerifyWriteAccess:
+    """Proving the write path works without writing. The probe goes to the
+    query endpoint, which runs identification and commits nothing, so this is
+    safe to point at production."""
+
+    def _probe(self, config, snow_client, response):
+        with respx.mock:
+            respx.post(f"{IRE}/query").mock(return_value=response)
+            return verify_write_access(snow_client, config.servicenow)
+
+    def test_success_is_verified(self, config, snow_client):
+        check = self._probe(config, snow_client, httpx.Response(
+            200, json={"result": {"items": [{"operation": "INSERT"}]}}))
+        assert check.verified
+        assert "nothing was committed" in check.detail
+
+    def test_it_never_touches_the_committing_endpoint(self, config, snow_client):
+        with respx.mock:
+            committing = respx.post(IRE)
+            respx.post(f"{IRE}/query").mock(return_value=httpx.Response(
+                200, json={"result": {"items": [{"operation": "INSERT"}]}}))
+            verify_write_access(snow_client, config.servicenow)
+        assert committing.call_count == 0
+
+    def test_the_probe_cannot_collide_with_a_real_ci(self, config, snow_client):
+        """Even if this were ever sent to a committing endpoint, its source key
+        is nothing like an Intune device GUID."""
+        with respx.mock:
+            route = respx.post(f"{IRE}/query").mock(return_value=httpx.Response(
+                200, json={"result": {"items": [{"operation": "INSERT"}]}}))
+            verify_write_access(snow_client, config.servicenow)
+        sent = json.loads(route.calls[0].request.read())
+        assert sent["items"][0]["sys_object_source_info"]["source_native_key"] == PROBE_SOURCE_KEY
+        # Intune device ids are GUIDs; this deliberately is not one, so it can
+        # never be mistaken for -- or collide with -- a real device's key.
+        guid = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+        assert not guid.match(PROBE_SOURCE_KEY)
+
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_missing_role_raises(self, config, snow_client, status):
+        with pytest.raises(ServiceNowError) as exc:
+            self._probe(config, snow_client, httpx.Response(status, text="insufficient rights"))
+        assert "itil" in str(exc.value)
+
+    def test_invalid_data_source_explains_where_to_register_it(self, config, snow_client):
+        with pytest.raises(ServiceNowError) as exc:
+            self._probe(config, snow_client, httpx.Response(
+                400, json={"error": {"message": "Invalid data source"}}))
+        assert "cmdb_ci.discovery_source" in str(exc.value)
+
+    def test_missing_endpoint_is_unverified_not_a_failure(self, config, snow_client):
+        check = self._probe(config, snow_client, httpx.Response(404, text="not found"))
+        assert not check.verified
+        assert "cmdb_instance" in check.detail
+
+    def test_item_level_rejection_raises(self, config, snow_client):
+        with pytest.raises(ServiceNowError) as exc:
+            self._probe(config, snow_client, httpx.Response(200, json={"result": {
+                "logContextId": "ctx-1",
+                "items": [{"errors": [{"error": "Required_Attribute_Empty",
+                                       "message": "asset_tag"}]}],
+            }}))
+        assert "asset_tag" in str(exc.value)
+        assert "ctx-1" in str(exc.value)
+
+    def test_cmdb_instance_mode_is_honestly_unverified(self, set_env):
+        set_env(SNOW_WRITE_MODE="cmdb_instance")
+        cfg = Config.from_env()
+        check = verify_write_access(ServiceNowClient(cfg.servicenow), cfg.servicenow)
+        assert not check.verified
+        assert "cannot be checked" in check.detail

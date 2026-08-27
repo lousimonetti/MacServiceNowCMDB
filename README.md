@@ -58,7 +58,7 @@ $EDITOR .env                     # tenant, ServiceNow instance, credentials
 
 set -a && . ./.env && set +a
 
-intune-cmdb-sync --check         # prove both systems are reachable
+intune-cmdb-sync --check         # prove both systems work, including writes
 intune-cmdb-sync --dry-run       # run IRE identification, write nothing
 intune-cmdb-sync                 # commit
 ```
