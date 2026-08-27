@@ -32,13 +32,21 @@ used to read Key Vault rather than to reach Graph.
 `deploy.sh` compares the two tenants and refuses `managed_identity` when they
 differ.
 
-If you want a secretless cross-tenant deployment, the supported pattern is a
-multi-tenant app registration plus a user-assigned managed identity **both in
+### Different tenants, no secret — `GRAPH_AUTH_MODE=federated_managed_identity`
+
+A multi-tenant app registration plus a user-assigned managed identity **both in
 the subscription's tenant**, the identity added to the app as a
 [federated identity credential][fic], and the app admin-consented into the
-Intune tenant. That is genuinely secretless and GA, but it needs a
-`ClientAssertionCredential` auth mode this connector does not yet implement —
-and it is a lot of moving parts to avoid rotating one secret.
+Intune tenant. Genuinely secretless, GA, and supported here.
+
+The catch is ordering: the federated credential has to name the managed
+identity, and this template *creates* that identity. So deploy once in
+`client_secret` mode, create the credential against the identity the deploy
+produced, then redeploy in this mode. Its `subject` is the identity's
+**principal (object) id**, not its client id.
+
+Weigh it honestly — it is several moving parts across two directories to avoid
+rotating one Key Vault secret.
 
 [fic]: https://learn.microsoft.com/entra/workload-id/workload-identity-federation-config-app-trust-managed-identity
 
@@ -49,13 +57,14 @@ export SNOW_INSTANCE=acme
 export SNOW_CLIENT_ID=<from the Application Registry entry>
 export SNOW_CLIENT_SECRET=<from the Application Registry entry>
 
-# Cross-tenant (the default): an app registration from the INTUNE tenant.
-export GRAPH_TENANT_ID=<intune tenant id>
-export GRAPH_CLIENT_ID=<app registration client id>
-export GRAPH_CLIENT_SECRET=<app registration secret>
+# Same tenant as Intune (simplest -- no Graph credential exists at all):
+export GRAPH_AUTH_MODE=managed_identity
 
-# Same-tenant instead? Drop the three GRAPH_CLIENT_* lines above and set:
-# export GRAPH_AUTH_MODE=managed_identity
+# Different tenant from Intune instead? Drop the line above and set these,
+# using an app registration from the INTUNE tenant:
+# export GRAPH_TENANT_ID=<intune tenant id>
+# export GRAPH_CLIENT_ID=<app registration client id>
+# export GRAPH_CLIENT_SECRET=<app registration secret>
 
 # optional
 export RESOURCE_GROUP=rg-intune-cmdb-sync
