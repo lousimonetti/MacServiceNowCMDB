@@ -45,6 +45,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--limit",
+        type=int,
+        metavar="N",
+        help=(
+            "Process at most N devices. A testing aid for a first run against a real "
+            "instance: it keeps the write small enough to inspect by hand. Retirement "
+            "is skipped while a limit is set, because a truncated device list makes "
+            "the rest of the fleet look like it disappeared. Overrides "
+            "INTUNE_DEVICE_LIMIT."
+        ),
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Validate configuration and connectivity to both systems, then exit.",
@@ -78,6 +90,8 @@ def _apply_overrides(args: argparse.Namespace) -> None:
         os.environ["LOG_FORMAT"] = args.log_format
     if args.report:
         os.environ["RUN_REPORT_PATH"] = args.report
+    if args.limit is not None:
+        os.environ["INTUNE_DEVICE_LIMIT"] = str(args.limit)
 
 
 def _write_report(report: RunReport, path: Path | None, include_devices: bool) -> None:

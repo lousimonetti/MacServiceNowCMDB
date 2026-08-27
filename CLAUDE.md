@@ -47,13 +47,23 @@ behaviour change, particularly anything altering what gets written to a CI.
   hosting subscription live in different tenants cannot use it — a managed
   identity is single-tenant and there is no cross-tenant consent path.
   `deploy.sh` hard-fails on that combination. `client_secret` is the default.
-- `GRAPH_AUTH_MODE=workload_identity` is accepted by `config.py` but has no
-  deployment surface in `main.bicep`. It is half-wired, not finished.
+- **`federated_managed_identity` is the secretless cross-tenant mode**: a
+  managed identity signs a client assertion for a multi-tenant app consented
+  into the Intune tenant. `GRAPH_CLIENT_ID` is the *app*;
+  `GRAPH_ASSERTION_IDENTITY_CLIENT_ID` is the *identity*. Do not conflate them —
+  the resulting AADSTS error names neither.
+- **`workload_identity` is not that mode.** It needs a projected federated token
+  file, which AKS and GitHub Actions provide and Container Apps does not, which
+  is why `main.bicep` deliberately does not offer it.
+- **`--limit` / `INTUNE_DEVICE_LIMIT` disables retirement.** A truncated device
+  list makes the rest of the fleet look like it vanished, and a small limit makes
+  the missing fraction large enough that the percentage guard is not a reliable
+  backstop. Never remove that short-circuit.
 
 ## State of the work
 
 The Microsoft Graph half is verified against a live tenant. **The ServiceNow
-half has never touched a live instance** — the 269 tests mock at the HTTP
+half has never touched a live instance** — the 278 tests mock at the HTTP
 boundary with `respx`, and those fixtures were written from vendor
 documentation, not observed responses. Green tests are weaker evidence here
 than they look.
@@ -66,15 +76,14 @@ than they look.
    produces `Invalid data source`).
 2. **`intune-cmdb-sync --check`.** Connectivity only. Note that `itil` does not
    always carry `sys_properties` read, so a 403 here can be a red herring.
-3. **`--dry-run --report-devices --report ./run.json`.** Confirm the `operation`
+3. **`--dry-run --limit 5 --report-devices --report ./run.json`.** Confirm the `operation`
    values IRE actually returns against `_OPERATION_TO_ACTION` in `writers.py`.
    The dry run uses `/identifyreconcile/query`, a *different* endpoint whose
    response vocabulary is unconfirmed; an unrecognised operation is a hard
    error by design, so this is where a surprise will surface.
-4. **First real write with `SNOW_RETIRE_MISSING=false`.** Then verify that
-   `install_status=7` actually means retired *in that instance* before enabling
-   retirement — the README calls this a convention, not a guarantee.
-5. **Consider a `--limit` flag.** There is currently no way to restrict a run to
-   a handful of devices; the narrowest blast radius available is
-   `INTUNE_OWNERSHIP`, which is not narrow. Worth adding before the first write
-   against a fleet of any size.
+4. **First real write with `--limit` and `SNOW_RETIRE_MISSING=false`.** Then
+   verify that `install_status=7` actually means retired *in that instance*
+   before enabling retirement — the README calls this a convention, not a
+   guarantee.
+5. **Drop the limit** once the written CIs look right, and only then consider
+   enabling retirement.

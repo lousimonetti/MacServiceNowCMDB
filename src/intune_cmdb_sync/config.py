@@ -165,6 +165,9 @@ class GraphConfig:
     user_select_fields: tuple[str, ...]
     request_timeout: float
     max_retries: int
+    # federated_managed_identity only: the managed identity that signs the
+    # client assertion. None selects the system-assigned identity.
+    assertion_identity_client_id: str | None = None
 
     @property
     def authority_host(self) -> str:
@@ -219,6 +222,9 @@ class RuntimeConfig:
     state_path: str | None
     serial_blocklist: frozenset[str]
     mapping_overrides: dict[str, Any]
+    # Cap on devices processed in one run. A testing aid: it makes the first
+    # write against a real instance small enough to inspect by hand.
+    device_limit: int | None
 
 
 @dataclass(frozen=True)
@@ -232,7 +238,13 @@ class Config:
         return _build_config()
 
 
-VALID_GRAPH_AUTH_MODES = {"client_secret", "managed_identity", "workload_identity", "default"}
+VALID_GRAPH_AUTH_MODES = {
+    "client_secret",
+    "managed_identity",
+    "federated_managed_identity",
+    "workload_identity",
+    "default",
+}
 VALID_SNOW_AUTH_MODES = {"oauth_client_credentials", "oauth_password", "basic"}
 VALID_WRITE_MODES = {"identify_reconcile", "cmdb_instance"}
 VALID_OWNERSHIP = {"company", "personal", "any"}
@@ -287,6 +299,20 @@ def _build_config() -> Config:
             problems.append("GRAPH_CLIENT_SECRET is required when GRAPH_AUTH_MODE=client_secret")
     elif graph_auth_mode == "workload_identity" and not tenant_id:
         problems.append("GRAPH_TENANT_ID is required when GRAPH_AUTH_MODE=workload_identity")
+    elif graph_auth_mode == "federated_managed_identity":
+        # The tenant here is the one the app is consented into (where Intune
+        # lives), which in the cross-tenant case is not the subscription's.
+        if not tenant_id:
+            problems.append(
+                "GRAPH_TENANT_ID is required when GRAPH_AUTH_MODE=federated_managed_identity "
+                "and must be the tenant the app registration is consented into"
+            )
+        if not client_id:
+            problems.append(
+                "GRAPH_CLIENT_ID is required when GRAPH_AUTH_MODE=federated_managed_identity "
+                "and must be the multi-tenant app registration's client ID, not the "
+                "managed identity's"
+            )
 
     ownership = (_env("INTUNE_OWNERSHIP", "company") or "").lower()
     if ownership not in VALID_OWNERSHIP:
@@ -308,6 +334,7 @@ def _build_config() -> Config:
         user_select_fields=_env_csv("GRAPH_USER_SELECT_FIELDS", DEFAULT_USER_SELECT_FIELDS),
         request_timeout=_env_float("GRAPH_TIMEOUT_SECONDS", 60.0, minimum=1.0),
         max_retries=_env_int("GRAPH_MAX_RETRIES", 5, minimum=0, maximum=10),
+        assertion_identity_client_id=_env("GRAPH_ASSERTION_IDENTITY_CLIENT_ID"),
     )
 
     # ---- ServiceNow ------------------------------------------------------
@@ -443,6 +470,8 @@ def _build_config() -> Config:
                 else:
                     problems.append("MAPPING_OVERRIDES_FILE must contain a JSON object")
 
+    device_limit = _env_int("INTUNE_DEVICE_LIMIT", 0, minimum=0) or None
+
     run_report = _env("RUN_REPORT_PATH")
     state_path = _env("STATE_PATH")
 
@@ -459,6 +488,7 @@ def _build_config() -> Config:
         log_format=log_format,
         run_report_path=Path(run_report) if run_report else None,
         state_path=state_path,
+        device_limit=device_limit,
         serial_blocklist=serial_blocklist,
         mapping_overrides=mapping_overrides,
     )

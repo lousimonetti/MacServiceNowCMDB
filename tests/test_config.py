@@ -154,3 +154,42 @@ class TestMappingOverridesFile:
         set_env(MAPPING_OVERRIDES_FILE=str(path))
         with pytest.raises(ConfigError, match="could not be read"):
             Config.from_env()
+
+
+class TestFederatedManagedIdentity:
+    """Secretless cross-tenant auth: a managed identity in the hosting tenant
+    signs a client assertion for a multi-tenant app consented into the Intune
+    tenant. This is the one mode that solves cross-tenant without a secret."""
+
+    def test_accepts_the_mode_without_a_secret(self, set_env):
+        set_env(
+            GRAPH_AUTH_MODE="federated_managed_identity",
+            GRAPH_CLIENT_SECRET=None,
+            GRAPH_ASSERTION_IDENTITY_CLIENT_ID="33333333-3333-3333-3333-333333333333",
+        )
+        cfg = Config.from_env()
+        assert cfg.graph.auth_mode == "federated_managed_identity"
+        assert cfg.graph.client_secret is None
+        assert cfg.graph.assertion_identity_client_id == (
+            "33333333-3333-3333-3333-333333333333"
+        )
+
+    def test_assertion_identity_is_optional(self, set_env):
+        """Omitting it selects the system-assigned identity."""
+        set_env(GRAPH_AUTH_MODE="federated_managed_identity", GRAPH_CLIENT_SECRET=None)
+        assert Config.from_env().graph.assertion_identity_client_id is None
+
+    def test_requires_tenant_and_client_id(self, set_env):
+        set_env(
+            GRAPH_AUTH_MODE="federated_managed_identity",
+            GRAPH_TENANT_ID=None,
+            GRAPH_CLIENT_ID=None,
+            GRAPH_CLIENT_SECRET=None,
+        )
+        with pytest.raises(ConfigError) as exc:
+            Config.from_env()
+        message = str(exc.value)
+        assert "GRAPH_TENANT_ID is required" in message
+        assert "GRAPH_CLIENT_ID is required" in message
+        # The client id is the easiest thing to get wrong here.
+        assert "not the\nmanaged identity's" in message or "managed identity" in message

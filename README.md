@@ -68,6 +68,15 @@ which runs real identification against your real CMDB and reports the `INSERT` /
 `UPDATE` / `NO_CHANGE` each device *would* produce — without committing. Use it
 before every configuration change.
 
+For a first run against a real instance, `--limit N` caps how many devices are
+processed, so the write is small enough to inspect by hand. Retirement is
+skipped whenever a limit is set — a truncated device list makes the rest of the
+fleet look like it disappeared.
+
+```bash
+intune-cmdb-sync --dry-run --limit 5 --report-devices --report ./run.json
+```
+
 Before any of that, both sides need about 30 minutes of setup:
 
 - **[docs/entra-setup.md](docs/entra-setup.md)** — app registration or managed

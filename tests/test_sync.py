@@ -479,3 +479,81 @@ class TestStatePersistenceFailure:
         # But the run is flagged.
         assert any("could not persist sync state" in d for d in report.degraded)
         assert any("could not persist sync state" in w for w in report.warnings)
+
+
+class TestDeviceLimit:
+    """`--limit` / INTUNE_DEVICE_LIMIT caps a run so a first write against a real
+    instance is small enough to inspect by hand."""
+
+    @respx.mock
+    def test_limit_caps_processed_devices(self, set_env, runner_factory):
+        set_env(INTUNE_DEVICE_LIMIT="2")
+        cfg = Config.from_env()
+        respx.get(DEVICES).mock(return_value=httpx.Response(200, json={
+            "value": [make_device(id=f"d{i}", serialNumber=f"SER{i}") for i in range(10)]
+        }))
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        mock_snow_plumbing()
+        ire = respx.post(IRE).mock(return_value=ire_response("INSERT", "INSERT"))
+
+        report = runner_factory(cfg).run()
+
+        assert report.devices_after_ownership_filter == 2
+        assert report.inserted == 2
+        submitted = json.loads(ire.calls[0].request.read())["items"]
+        assert len(submitted) == 2
+
+    @respx.mock
+    def test_limit_is_reported_so_the_run_is_not_mistaken_for_a_full_pass(
+        self, set_env, runner_factory
+    ):
+        set_env(INTUNE_DEVICE_LIMIT="1")
+        cfg = Config.from_env()
+        respx.get(DEVICES).mock(return_value=httpx.Response(200, json={
+            "value": [make_device(id=f"d{i}", serialNumber=f"SER{i}") for i in range(5)]
+        }))
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        mock_snow_plumbing()
+        respx.post(IRE).mock(return_value=ire_response("INSERT"))
+
+        report = runner_factory(cfg).run()
+        assert any("not a full inventory pass" in w for w in report.warnings)
+
+    @respx.mock
+    def test_limit_disables_retirement(self, set_env, runner_factory, tmp_path):
+        """The critical interaction: a truncated device list makes the rest of the
+        fleet look like it vanished. Retiring against that would be catastrophic,
+        and a small limit makes the missing fraction large enough that the
+        percentage guard alone is not a reliable backstop."""
+        state_path = tmp_path / "state.json"
+        seeded = SyncState()
+        for i in range(50):
+            seeded.observe(f"old-{i}", sys_id=f"sys-old-{i}", name=f"OLD-{i}",
+                           class_name="cmdb_ci_computer")
+        seeded.save(LocalStateStore(str(state_path)))
+        set_env(
+            SNOW_RETIRE_MISSING="true",
+            STATE_PATH=str(state_path),
+            SNOW_RETIRE_MAX_FRACTION="1.0",   # guard wide open on purpose
+            INTUNE_DEVICE_LIMIT="1",
+        )
+        cfg = Config.from_env()
+        respx.get(DEVICES).mock(return_value=httpx.Response(200, json={
+            "value": [make_device(id=f"d{i}") for i in range(5)]
+        }))
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        mock_snow_plumbing()
+        respx.post(IRE).mock(return_value=ire_response("UPDATE"))
+        patch = respx.patch(url__startswith=f"{TABLE}/cmdb_ci_computer/")
+
+        report = runner_factory(cfg).run()
+
+        assert patch.call_count == 0
+        assert report.retired == 0
+        assert any("retirement skipped" in w for w in report.warnings)

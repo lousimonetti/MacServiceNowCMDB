@@ -63,12 +63,26 @@ param tenantId string = subscription().tenantId
 
 @description('''
 How the job authenticates to Microsoft Graph.
-Use 'managed_identity' only when Intune is in the same tenant as this
-subscription; a managed identity cannot be granted app roles in another tenant.
+
+'client_secret'              Works everywhere, including cross-tenant. A secret
+                             in Key Vault that someone has to rotate.
+'managed_identity'           No secret at all, but only when Intune is in the
+                             SAME tenant as this subscription -- a managed
+                             identity cannot be granted app roles in another
+                             directory.
+'federated_managed_identity' Secretless AND cross-tenant. This job's managed
+                             identity is registered as a federated credential
+                             on a multi-tenant app registration that has been
+                             admin-consented into the Intune tenant. Requires
+                             that setup to exist first; see docs/entra-setup.md.
+
+'workload_identity' is deliberately absent: it needs a projected federated
+token file, which AKS and GitHub Actions provide and Container Apps does not.
 ''')
 @allowed([
   'client_secret'
   'managed_identity'
+  'federated_managed_identity'
 ])
 param graphAuthMode string = 'client_secret'
 
@@ -103,7 +117,10 @@ param memory string = '1Gi'
 @description('Seconds a single run may take before it is killed. 30 minutes covers very large tenants.')
 param replicaTimeoutSeconds int = 1800
 
+// Both of these authenticate without a Key Vault secret, so neither creates one.
 var useManagedIdentityForGraph = graphAuthMode == 'managed_identity'
+var useFederatedIdentityForGraph = graphAuthMode == 'federated_managed_identity'
+var graphNeedsSecret = graphAuthMode == 'client_secret'
 
 var suffix = uniqueString(resourceGroup().id)
 var identityName = '${namePrefix}-id'
@@ -156,7 +173,7 @@ resource serviceNowSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
 }
 
 resource graphSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' =
-  if (!useManagedIdentityForGraph) {
+  if (graphNeedsSecret) {
     parent: vault
     name: 'graph-client-secret'
     properties: {
@@ -256,7 +273,18 @@ var graphEnvClientSecret = [
   { name: 'GRAPH_CLIENT_SECRET', secretRef: 'graph-client-secret' }
 ]
 
-var graphEnv = useManagedIdentityForGraph ? graphEnvManagedIdentity : graphEnvClientSecret
+// GRAPH_CLIENT_ID is the multi-tenant APP's client ID; the identity that signs
+// the assertion is named separately. Conflating the two is the easiest mistake
+// to make here, and the resulting error does not say which one is wrong.
+var graphEnvFederatedIdentity = [
+  { name: 'GRAPH_AUTH_MODE', value: 'federated_managed_identity' }
+  { name: 'GRAPH_CLIENT_ID', value: graphClientId }
+  { name: 'GRAPH_ASSERTION_IDENTITY_CLIENT_ID', value: identity.properties.clientId }
+]
+
+var graphEnv = useManagedIdentityForGraph
+  ? graphEnvManagedIdentity
+  : (useFederatedIdentityForGraph ? graphEnvFederatedIdentity : graphEnvClientSecret)
 
 var baseEnv = [
   { name: 'SNOW_INSTANCE', value: serviceNowInstance }
@@ -305,15 +333,15 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             identity: identity.id
           }
         ],
-        useManagedIdentityForGraph
-          ? []
-          : [
+        graphNeedsSecret
+          ? [
               {
                 name: 'graph-client-secret'
                 keyVaultUrl: graphSecret!.properties.secretUri
                 identity: identity.id
               }
             ]
+          : []
       )
     }
     template: {

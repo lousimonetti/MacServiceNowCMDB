@@ -182,9 +182,28 @@ If rotating that secret is unacceptable, the supported pattern is:
 4. At runtime, the identity gets a token for `api://AzureADTokenExchange` and
    presents it as a `client_assertion` to the Intune tenant's token endpoint.
 
-This is GA and genuinely secretless. It needs a `ClientAssertionCredential`-based
-auth mode that this connector does not implement yet — open an issue if you want
-it. Weigh it honestly against rotating one Key Vault secret on a calendar.
+This is GA, genuinely secretless, and **implemented** as
+`GRAPH_AUTH_MODE=federated_managed_identity`:
+
+```bash
+GRAPH_AUTH_MODE=federated_managed_identity
+GRAPH_TENANT_ID=<the INTUNE tenant, where the app is consented>
+GRAPH_CLIENT_ID=<the multi-tenant APP registration's client ID>
+GRAPH_ASSERTION_IDENTITY_CLIENT_ID=<the managed IDENTITY's client ID>
+# no GRAPH_CLIENT_SECRET
+```
+
+The last two are the easy mistake: `GRAPH_CLIENT_ID` is the *app*, and
+`GRAPH_ASSERTION_IDENTITY_CLIENT_ID` is the *identity that signs for it*. Swap
+them and the failure is an opaque `AADSTS700213`, which names neither.
+
+`deploy/azure/main.bicep` supports this mode and wires the identity's client ID
+automatically. It cannot create the federated credential or the cross-tenant
+consent for you — those live in two different directories and cannot be done
+from one login.
+
+Still weigh it honestly against rotating one Key Vault secret on a calendar. It
+removes a rotation task and adds a four-step setup spanning two tenants.
 
 [fic]: https://learn.microsoft.com/entra/workload-id/workload-identity-federation-config-app-trust-managed-identity
 

@@ -123,18 +123,30 @@ class SyncRunner:
 
     def _collect_devices(self, report: RunReport) -> list[dict[str, Any]]:
         ownership = self.cfg.graph.ownership
+        limit = self.cfg.runtime.device_limit
         kept: list[dict[str, Any]] = []
         for device in self.graph.iter_managed_devices():
             report.devices_fetched += 1
             if is_corporate(device, ownership):
                 kept.append(device)
+                # Stop pulling pages once the cap is met; the generator is lazy,
+                # so this also saves the Graph calls rather than fetching the
+                # whole tenant and discarding most of it.
+                if limit is not None and len(kept) >= limit:
+                    break
         report.devices_after_ownership_filter = len(kept)
+        if limit is not None:
+            report.warnings.append(
+                f"INTUNE_DEVICE_LIMIT={limit} was in effect: this run processed at most "
+                f"{limit} device(s) and is not a full inventory pass"
+            )
         log.info(
             "fetched Intune devices",
             extra={
                 "fetched": report.devices_fetched,
                 "kept": len(kept),
                 "ownership": ownership,
+                "limit": limit,
             },
         )
         return kept
@@ -341,6 +353,19 @@ class SyncRunner:
     ) -> None:
         cfg = self.cfg.servicenow
         if not cfg.retire_missing:
+            return
+
+        if self.cfg.runtime.device_limit is not None:
+            # The device list was truncated on purpose, so every device beyond
+            # the cap looks like it vanished from Intune. Retiring against that
+            # would be catastrophic and the fraction guard would not necessarily
+            # catch it, since a small limit makes the missing fraction huge.
+            message = (
+                "retirement skipped: INTUNE_DEVICE_LIMIT was in effect, so the device "
+                "list is a deliberate subset rather than the current fleet"
+            )
+            log.warning("skipping retirement under a device limit")
+            report.warnings.append(message)
             return
 
         missing = state.missing_since_last_run(current_ids)

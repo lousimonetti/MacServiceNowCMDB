@@ -75,11 +75,16 @@ NON_DEFAULT_DEVICE_FIELDS = (
 # Microsoft Graph caps JSON batch requests at 20 sub-requests.
 GRAPH_BATCH_LIMIT = 20
 
+# Audience a managed identity requests when it is acting as a federated
+# credential for an app registration. Fixed by Entra, not configurable.
+TOKEN_EXCHANGE_SCOPE = "api://AzureADTokenExchange/.default"
+
 
 def build_credential(cfg: GraphConfig) -> Any:
     """Create an azure-identity credential for the configured auth mode."""
     try:
         from azure.identity import (
+            ClientAssertionCredential,
             ClientSecretCredential,
             DefaultAzureCredential,
             ManagedIdentityCredential,
@@ -101,7 +106,35 @@ def build_credential(cfg: GraphConfig) -> Any:
         # the system-assigned identity.
         return ManagedIdentityCredential(client_id=cfg.client_id) if cfg.client_id \
             else ManagedIdentityCredential()
+    if mode == "federated_managed_identity":
+        # Secretless cross-tenant auth. A managed identity in *this* tenant is
+        # registered as a federated credential on a multi-tenant app that has
+        # been consented into the Intune tenant. The identity gets a token for
+        # the token-exchange audience and presents it as a client assertion, so
+        # no secret exists anywhere.
+        #
+        # This is the piece that a bare managed identity cannot do: an app role
+        # in another directory cannot be granted to a single-tenant identity.
+        assertion_identity = (
+            ManagedIdentityCredential(client_id=cfg.assertion_identity_client_id)
+            if cfg.assertion_identity_client_id
+            else ManagedIdentityCredential()
+        )
+
+        def _assertion() -> str:
+            token = assertion_identity.get_token(TOKEN_EXCHANGE_SCOPE)
+            return str(token.token)
+
+        return ClientAssertionCredential(
+            tenant_id=cfg.tenant_id,
+            client_id=cfg.client_id or "",
+            func=_assertion,
+            authority=cfg.authority_host,
+        )
     if mode == "workload_identity":
+        # Kubernetes/AKS and GitHub Actions OIDC: the platform projects a
+        # federated token into the filesystem. Azure Container Apps does not,
+        # which is why deploy/azure does not offer this mode.
         return WorkloadIdentityCredential(
             tenant_id=cfg.tenant_id,
             client_id=cfg.client_id,
@@ -317,6 +350,7 @@ __all__ = [
     "DEVICE_SELECT_FIELDS",
     "GRAPH_BATCH_LIMIT",
     "NON_DEFAULT_DEVICE_FIELDS",
+    "TOKEN_EXCHANGE_SCOPE",
     "GraphClient",
     "build_credential",
     "is_corporate",

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploy intune-cmdb-sync to Azure Container Apps Jobs.
 #
-# Two topologies, selected by GRAPH_AUTH_MODE:
+# Three topologies, selected by GRAPH_AUTH_MODE:
 #
 #   client_secret     (default) Intune lives in a different tenant from this
 #                     subscription. The job authenticates as an app registration
@@ -12,6 +12,14 @@
 #                     directly and no Graph credential exists. This script
 #                     performs that grant, which ARM cannot do because app-role
 #                     assignments live in Entra rather than in ARM.
+#
+#   federated_managed_identity
+#                     Cross-tenant AND secretless. The job's managed identity is
+#                     a federated credential on a multi-tenant app registration
+#                     that has been admin-consented into the Intune tenant. That
+#                     setup spans two tenants and cannot be automated from a
+#                     single login, so this script verifies rather than creates
+#                     it -- see docs/entra-setup.md for the four steps.
 #
 # Requires: az CLI, logged in to the SUBSCRIPTION's tenant. managed_identity mode
 # additionally needs Privileged Role Administrator, Cloud Application
@@ -56,17 +64,27 @@ case "$GRAPH_AUTH_MODE" in
     require GRAPH_CLIENT_ID
     require GRAPH_CLIENT_SECRET
     ;;
+  federated_managed_identity)
+    require GRAPH_CLIENT_ID
+    if [[ "$GRAPH_TENANT_ID" == "$SUBSCRIPTION_TENANT" ]]; then
+      echo "NOTE: GRAPH_AUTH_MODE=federated_managed_identity works here, but with"
+      echo "      Intune in this same tenant, managed_identity is simpler and needs"
+      echo "      no app registration at all."
+    fi
+    ;;
   managed_identity)
     if [[ "$GRAPH_TENANT_ID" != "$SUBSCRIPTION_TENANT" ]]; then
       die "GRAPH_AUTH_MODE=managed_identity requires Intune and this subscription to
        share a tenant. Intune tenant is ${GRAPH_TENANT_ID}, subscription tenant is
        ${SUBSCRIPTION_TENANT}. A managed identity is single-tenant and cannot be
        granted app roles in another directory. Use GRAPH_AUTH_MODE=client_secret
-       with an app registration from the Intune tenant."
+       with an app registration from the Intune tenant, or
+       GRAPH_AUTH_MODE=federated_managed_identity to stay secretless."
     fi
     ;;
   *)
-    die "GRAPH_AUTH_MODE must be 'client_secret' or 'managed_identity' (got '${GRAPH_AUTH_MODE}')"
+    die "GRAPH_AUTH_MODE must be 'client_secret', 'managed_identity', or
+       'federated_managed_identity' (got '${GRAPH_AUTH_MODE}')"
     ;;
 esac
 
@@ -128,6 +146,17 @@ if [[ "$GRAPH_AUTH_MODE" == "managed_identity" ]]; then
       --body "{\"principalId\":\"${PRINCIPAL_ID}\",\"resourceId\":\"${GRAPH_SP_ID}\",\"appRoleId\":\"${ROLE_ID}\"}" \
       --output none
   done
+elif [[ "$GRAPH_AUTH_MODE" == "federated_managed_identity" ]]; then
+  echo "==> Secretless cross-tenant auth"
+  echo "    App registration ${GRAPH_CLIENT_ID} in tenant ${GRAPH_TENANT_ID} must:"
+  echo "      - be multi-tenant"
+  echo "      - have admin consent for:"
+  printf '          %s\n' "${REQUIRED_ROLES[@]}"
+  echo "      - list managed identity ${CLIENT_ID} as a federated credential"
+  echo "        with audience api://AzureADTokenExchange"
+  echo
+  echo "    None of that is verifiable from this login, because it lives in the"
+  echo "    other tenant. Run the job once before trusting the schedule."
 else
   echo "==> Graph permissions are carried by app registration ${GRAPH_CLIENT_ID}"
   echo "    in tenant ${GRAPH_TENANT_ID}. Confirm it has admin consent for:"

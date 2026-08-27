@@ -141,6 +141,16 @@ not the same thing as the write endpoint's, and it is unverified against a live
 instance. An unrecognised `operation` is a hard error by design in both modes —
 that is where a surprise is meant to surface.
 
+**`--limit` disables retirement.** A truncated device list makes the rest of the
+fleet look like it vanished, and a small limit makes the missing fraction large
+enough that the percentage guard is not a reliable backstop. The limit path
+short-circuits retirement outright rather than relying on it.
+
+**`workload_identity` is not the cross-tenant answer.** It needs a projected
+federated token file, which AKS and GitHub Actions provide and Container Apps
+does not. For secretless cross-tenant use `federated_managed_identity`, which
+signs a client assertion with a managed identity.
+
 **Exit code 4 means degraded, not just device errors.** A tripped retirement
 guard or a failed state write returns 4 even without `--fail-on-error`, because
 both leave the next run unable to reason about the fleet.
@@ -200,14 +210,6 @@ The ServiceNow half has never run against a live instance. In priority order:
 
 ## 8. Open work
 
-- **`--limit` flag.** There is currently no way to restrict a run to a handful
-  of devices. The narrowest blast radius available is `INTUNE_OWNERSHIP`, which
-  is not narrow. Worth adding before any first write against a real fleet.
-- **`workload_identity` deployment surface.** `config.py` accepts and validates
-  the mode, but `main.bicep` allows only `client_secret` and `managed_identity`.
-  It is half-wired.
-- **`ClientAssertionCredential` auth mode.** Needed for the secretless
-  cross-tenant topology documented in [entra-setup.md](entra-setup.md).
 - **Retirement PATCHes are unbatched.** One call per device. The Table API has
   no bulk PATCH, and the mass-retirement guard bounds the volume, so this is
   acceptable rather than good.

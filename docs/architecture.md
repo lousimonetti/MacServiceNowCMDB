@@ -231,10 +231,15 @@ different tenant from the hosting subscription, it cannot be granted Graph app
 roles in that other directory and there is no consent path. `deploy.sh` hard-
 fails on that combination rather than producing a deployment that 403s at 3am.
 
-A secretless cross-tenant option exists (multi-tenant app registration with a
-managed identity as a federated credential) and is documented in
-[entra-setup.md](entra-setup.md). It is not implemented; it needs a
-`ClientAssertionCredential` auth mode.
+`federated_managed_identity` is the option that is both secretless *and*
+cross-tenant: a managed identity in the hosting tenant signs a client assertion
+for a multi-tenant app registration consented into the Intune tenant. It is
+implemented and supported by `main.bicep`, but the two-tenant setup it depends
+on cannot be automated from one login. See [entra-setup.md](entra-setup.md).
+
+`workload_identity` exists for AKS and GitHub Actions OIDC, which project a
+federated token file. Container Apps does not, so `deploy/azure` deliberately
+does not offer it.
 
 ---
 

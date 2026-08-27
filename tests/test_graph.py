@@ -6,7 +6,12 @@ import respx
 
 from intune_cmdb_sync.config import Config
 from intune_cmdb_sync.errors import GraphError
-from intune_cmdb_sync.graph import GraphClient, is_corporate
+from intune_cmdb_sync.graph import (
+    TOKEN_EXCHANGE_SCOPE,
+    GraphClient,
+    build_credential,
+    is_corporate,
+)
 
 from .conftest import make_device
 
@@ -210,3 +215,48 @@ class TestGetUsers:
         respx.post(f"{GRAPH}/$batch").mock(return_value=httpx.Response(401, text="unauth"))
         with pytest.raises(GraphError, match=r"user \$batch failed"):
             graph.get_users(["u1"])
+
+
+class TestCredentialSelection:
+    """`build_credential` maps the configured mode onto an azure-identity type.
+    These assert the wiring, not azure-identity's own behaviour."""
+
+    def test_federated_managed_identity_builds_a_client_assertion(self, set_env):
+        from azure.identity import ClientAssertionCredential
+
+        set_env(
+            GRAPH_AUTH_MODE="federated_managed_identity",
+            GRAPH_CLIENT_SECRET=None,
+            GRAPH_ASSERTION_IDENTITY_CLIENT_ID="33333333-3333-3333-3333-333333333333",
+        )
+        credential = build_credential(Config.from_env().graph)
+        assert isinstance(credential, ClientAssertionCredential)
+
+    def test_the_assertion_targets_the_token_exchange_audience(self, set_env, monkeypatch):
+        """The audience is fixed by Entra. Getting it wrong fails at runtime with
+        an error that does not name the audience, so pin it."""
+        requested: list[str] = []
+
+        class FakeToken:
+            token = "assertion-jwt"
+
+        class FakeIdentity:
+            def __init__(self, *a, **k): ...
+            def get_token(self, *scopes, **kwargs):
+                requested.extend(scopes)
+                return FakeToken()
+
+        monkeypatch.setattr("azure.identity.ManagedIdentityCredential", FakeIdentity)
+        set_env(GRAPH_AUTH_MODE="federated_managed_identity", GRAPH_CLIENT_SECRET=None)
+
+        credential = build_credential(Config.from_env().graph)
+        # ClientAssertionCredential stores the callable; invoke it directly.
+        assert credential._func() == "assertion-jwt"
+        assert requested == [TOKEN_EXCHANGE_SCOPE]
+        assert TOKEN_EXCHANGE_SCOPE == "api://AzureADTokenExchange/.default"
+
+    def test_client_secret_mode_is_unchanged(self, set_env):
+        from azure.identity import ClientSecretCredential
+
+        set_env(GRAPH_AUTH_MODE="client_secret")
+        assert isinstance(build_credential(Config.from_env().graph), ClientSecretCredential)
