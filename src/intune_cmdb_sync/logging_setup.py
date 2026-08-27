@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import uuid
 from typing import Any
 
 # Attributes present on every LogRecord; anything else was attached by the
@@ -18,6 +19,34 @@ _RESERVED = frozenset(
 ) | {"asctime", "message", "taskName"}
 
 _REDACT_KEYS = ("secret", "password", "token", "authorization", "client_secret", "apikey")
+
+# One id per process, stamped on every log record and carried in the run report.
+# Without it there is no way to group a run's lines in a log store that holds
+# weeks of them, or to tie a report back to the run that produced it.
+_run_id: str | None = None
+
+
+def current_run_id() -> str:
+    """The id for this run, generated on first use."""
+    global _run_id
+    if _run_id is None:
+        _run_id = uuid.uuid4().hex[:12]
+    return _run_id
+
+
+def reset_run_id(value: str | None = None) -> str:
+    """Start a new run id. Called at startup, and by tests wanting determinism."""
+    global _run_id
+    _run_id = value or uuid.uuid4().hex[:12]
+    return _run_id
+
+
+class _RunIdFilter(logging.Filter):
+    """Stamps run_id onto every record, including ones from libraries."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.run_id = current_run_id()
+        return True
 
 
 def _redact(key: str, value: Any) -> Any:
@@ -60,6 +89,7 @@ class TextFormatter(logging.Formatter):
 def configure_logging(level: str = "INFO", fmt: str = "json") -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter() if fmt == "json" else TextFormatter())
+    handler.addFilter(_RunIdFilter())
 
     root = logging.getLogger()
     root.handlers.clear()

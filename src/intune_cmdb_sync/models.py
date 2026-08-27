@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from .logging_setup import current_run_id
+
 
 @dataclass(frozen=True)
 class EntraUser:
@@ -87,6 +89,9 @@ class DeviceOutcome:
 class RunReport:
     """Machine-readable summary written at the end of every run."""
 
+    # Same id stamped on every log line for this run, so a report and the logs
+    # that produced it can be joined.
+    run_id: str = field(default_factory=current_run_id)
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime | None = None
     dry_run: bool = False
@@ -138,6 +143,7 @@ class RunReport:
 
     def summary(self) -> dict[str, Any]:
         return {
+            "run_id": self.run_id,
             "started_at": self.started_at.isoformat(),
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "duration_seconds": self.duration_seconds,

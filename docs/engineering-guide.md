@@ -170,7 +170,25 @@ intune-cmdb-sync --dry-run --report-devices --report ./run.json
 
 `--report-devices` writes a per-device outcome list: action, CI sys_id, which
 key the owner matched on, and any error message. That file is the first thing to
-look at when the summary counters look wrong.
+look at when the summary counters look wrong. Both deployments enable it via
+`RUN_REPORT_DEVICES=true`, writing to the state volume (Azure) or the state
+bucket (AWS).
+
+**Every log line carries a `run_id`**, and the report carries the same value.
+That is how you isolate one run in a log store holding weeks of them, and how
+you tie a report back to the run that produced it:
+
+```kusto
+ContainerAppConsoleLogs_CL
+| extend p = parse_json(Log_s)
+| where p.run_id == "<id from the report>"
+| order by TimeGenerated asc
+```
+
+**IRE errors carry ServiceNow's own trace id**, appended as
+`[IRE logContextId=...]`. That is the handle to quote in a ServiceNow support
+case or to look up in the instance's own logs — without it, an investigation on
+their side starts from a timestamp.
 
 Logging is JSON by default so Log Analytics and CloudWatch Insights can query
 fields directly. Anything whose key looks like a credential is redacted before

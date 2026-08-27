@@ -34,6 +34,11 @@ behaviour change, particularly anything altering what gets written to a CI.
 - **Unresolved reference fields are omitted, not blanked.** A failed
   `manufacturer` / `model_id` / `assigned_to` lookup leaves the existing CI
   value alone rather than clearing it. Preserve that property.
+- **Observability is `run_id` + the report.** Every log line is stamped with a
+  `run_id` and the report carries the same value; IRE errors additionally carry
+  ServiceNow's `logContextId`. Do not put a run id on the CI itself — a value
+  that changes every run makes every device an UPDATE every run, the exact churn
+  that dropping `last_discovered` removed.
 - **Exit code 4 means degraded**, not merely "device errors". A tripped
   mass-retirement guard or a failed state write returns 4 even without
   `--fail-on-error`, because both leave the *next* run unable to reason about
@@ -75,6 +80,11 @@ behaviour change, particularly anything altering what gets written to a CI.
   401/403. Note `az account get-access-token` produces a token that passes the
   first two checks and fails the third: it is the Azure CLI's own app, which has
   no Intune permissions.
+- **CLI flags must not outlive the call.** `_apply_overrides` is a context
+  manager that restores the environment afterwards, because `aws_lambda.handler`
+  calls `main()` repeatedly in a warm container and a permanent mutation left
+  one invocation's `dry_run` applying to every later one. Flags stay one-way:
+  absence never clears a value the environment set.
 - **`--limit` / `INTUNE_DEVICE_LIMIT` disables retirement.** A truncated device
   list makes the rest of the fleet look like it vanished, and a small limit makes
   the missing fraction large enough that the percentage guard is not a reliable

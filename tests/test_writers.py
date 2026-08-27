@@ -279,3 +279,54 @@ class TestUnrecognisedOperation:
         )
         assert results[0].action == "dry_run:unchanged"
         assert results[0].errors == []
+
+
+class TestLogContextId:
+    """IRE's logContextId is the only handle tying a request to what ServiceNow
+    recorded on its own side. Without it a support case starts from a timestamp."""
+
+    def test_carried_on_a_failed_batch(self, config, snow_client):
+        # 400, not 500: retryable statuses are retried by the HTTP layer and
+        # never reach the writer's error path.
+        with respx.mock:
+            respx.post(IRE).mock(return_value=httpx.Response(
+                400, json={"result": {"logContextId": "ctx-abc123"}}
+            ))
+            writer = IdentifyReconcileWriter(snow_client, config.servicenow)
+            with pytest.raises(ServiceNowError) as exc:
+                writer.write([payload()])
+        assert "ctx-abc123" in str(exc.value)
+
+    def test_carried_on_a_per_device_error(self, config, snow_client):
+        writer = IdentifyReconcileWriter(snow_client, config.servicenow)
+        results = writer._parse_results([payload()], {
+            "logContextId": "ctx-def456",
+            "items": [{"errors": [{"error": "Required_Attribute_Empty",
+                                   "message": "serial_number"}]}],
+        })
+        assert results[0].action == "error"
+        assert "ctx-def456" in results[0].message
+
+    def test_carried_when_an_item_is_missing_entirely(self, config, snow_client):
+        writer = IdentifyReconcileWriter(snow_client, config.servicenow)
+        results = writer._parse_results(
+            [payload(), payload(intune_id="intune-2")],
+            {"logContextId": "ctx-ghi789", "items": [{"operation": "INSERT", "sysId": "s1"}]},
+        )
+        assert "ctx-ghi789" in results[1].message
+
+    def test_absent_context_id_adds_no_noise(self, config, snow_client):
+        writer = IdentifyReconcileWriter(snow_client, config.servicenow)
+        results = writer._parse_results([payload()], {
+            "items": [{"errors": [{"error": "Boom", "message": "bang"}]}],
+        })
+        assert "logContextId" not in (results[0].message or "")
+
+    def test_non_json_failure_body_does_not_crash(self, config, snow_client):
+        """A 400 from a proxy or WAF is HTML, not an IRE response."""
+        with respx.mock:
+            respx.post(IRE).mock(return_value=httpx.Response(400, text="<html>blocked</html>"))
+            writer = IdentifyReconcileWriter(snow_client, config.servicenow)
+            with pytest.raises(ServiceNowError) as exc:
+                writer.write([payload()])
+        assert "400" in str(exc.value)

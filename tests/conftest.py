@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from intune_cmdb_sync.config import Config
+from intune_cmdb_sync.logging_setup import reset_run_id
 
 BASE_ENV = {
     "GRAPH_TENANT_ID": "11111111-1111-1111-1111-111111111111",
@@ -20,7 +21,14 @@ BASE_ENV = {
 # Every environment variable the connector reads, so a stray value in the
 # developer's shell can never change a test result.
 _MANAGED_PREFIXES = ("GRAPH_", "SNOW_", "INTUNE_", "AZURE_", "LOG_", "SERIAL_")
-_MANAGED_EXACT = ("DRY_RUN", "RUN_REPORT_PATH", "STATE_PATH", "MAPPING_OVERRIDES_FILE")
+_MANAGED_EXACT = (
+    "DRY_RUN",
+    "RUN_REPORT_PATH",
+    "RUN_REPORT_DEVICES",
+    "FAIL_ON_ERROR",
+    "STATE_PATH",
+    "MAPPING_OVERRIDES_FILE",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +36,9 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     for key in list(os.environ):
         if key.startswith(_MANAGED_PREFIXES) or key in _MANAGED_EXACT:
             monkeypatch.delenv(key, raising=False)
+    # The run id is process-global; a fresh one per test keeps report
+    # assertions independent of execution order.
+    reset_run_id()
     yield
 
 

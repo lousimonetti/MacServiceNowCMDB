@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
 import sys
+from collections.abc import Iterator
 from datetime import UTC, datetime
-from pathlib import Path
 
 from . import __version__
 from .config import Config
@@ -17,6 +18,7 @@ from .graph import GraphClient
 from .logging_setup import configure_logging
 from .models import RunReport
 from .servicenow.client import ServiceNowClient
+from .storage import build_state_store
 from .sync import SyncRunner
 
 log = logging.getLogger("intune_cmdb_sync")
@@ -80,32 +82,63 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _apply_overrides(args: argparse.Namespace) -> None:
-    """CLI flags win over environment variables."""
-    if args.dry_run:
-        os.environ["DRY_RUN"] = "true"
-    if args.log_level:
-        os.environ["LOG_LEVEL"] = args.log_level
-    if args.log_format:
-        os.environ["LOG_FORMAT"] = args.log_format
-    if args.report:
-        os.environ["RUN_REPORT_PATH"] = args.report
-    if args.limit is not None:
-        os.environ["INTUNE_DEVICE_LIMIT"] = str(args.limit)
+@contextlib.contextmanager
+def _apply_overrides(args: argparse.Namespace) -> Iterator[None]:
+    """Apply CLI flags as environment overrides, for this call only.
+
+    Configuration is read from the environment, so a flag has to become one. But
+    the change must not outlive the call: `aws_lambda.handler` invokes `main()`
+    repeatedly in a warm container, and a permanent mutation meant one
+    invocation with `dry_run` left every later invocation silently in dry-run
+    mode. Flags stay one-way -- absence never clears a value set by the
+    environment -- so `--dry-run` forces a dry run and its absence defers to
+    DRY_RUN.
+    """
+    previous: dict[str, str | None] = {}
+
+    def override(name: str, value: str | None) -> None:
+        if value is None:
+            return
+        previous[name] = os.environ.get(name)
+        os.environ[name] = value
+
+    override("DRY_RUN", "true" if args.dry_run else None)
+    override("LOG_LEVEL", args.log_level)
+    override("LOG_FORMAT", args.log_format)
+    override("RUN_REPORT_PATH", args.report)
+    override("INTUNE_DEVICE_LIMIT", None if args.limit is None else str(args.limit))
+    override("RUN_REPORT_DEVICES", "true" if args.report_devices else None)
+    override("FAIL_ON_ERROR", "true" if args.fail_on_error else None)
+
+    try:
+        yield
+    finally:
+        for name, old in previous.items():
+            if old is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old
 
 
-def _write_report(report: RunReport, path: Path | None, include_devices: bool) -> None:
-    if path is None:
+def _write_report(report: RunReport, location: str | None, include_devices: bool) -> None:
+    """Persist the run report to a local path or an s3:// URL.
+
+    Routed through storage.py so the AWS deployment can keep reports somewhere
+    that outlives the invocation; a Lambda's filesystem does not.
+    """
+    if not location:
+        return
+    store = build_state_store(location)
+    if store is None:
         return
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(report.as_dict(include_outcomes=include_devices), indent=2),
-            encoding="utf-8",
-        )
-        log.info("wrote run report", extra={"path": str(path)})
-    except OSError as exc:
-        log.error("could not write run report", extra={"path": str(path), "error": str(exc)})
+        store.write(json.dumps(report.as_dict(include_outcomes=include_devices), indent=2))
+        log.info("wrote run report", extra={"path": location, "devices_included": include_devices})
+    except Exception as exc:
+        # Losing the report must not fail a run that otherwise did its job, but
+        # it does mean the diagnostics for this run no longer exist.
+        report.warnings.append(f"could not write run report to {location}: {exc}")
+        log.error("could not write run report", extra={"path": location, "error": str(exc)})
 
 
 def _check(cfg: Config) -> int:
@@ -129,8 +162,11 @@ def _check(cfg: Config) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    _apply_overrides(args)
+    with _apply_overrides(args):
+        return _run(args)
 
+
+def _run(args: argparse.Namespace) -> int:
     try:
         cfg = Config.from_env()
     except ConfigError as exc:
@@ -167,7 +203,9 @@ def main(argv: list[str] | None = None) -> int:
                 partial = runner.report
                 partial.degrade(f"run aborted: {exc}")
                 partial.finished_at = datetime.now(UTC)
-                _write_report(partial, cfg.runtime.run_report_path, args.report_devices)
+                _write_report(
+                    partial, cfg.runtime.run_report_path, cfg.runtime.report_devices
+                )
                 return EXIT_FAILED
     except SyncError as exc:
         # Raised while building the clients, before there is a runner or report.
@@ -177,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("interrupted")
         return EXIT_FAILED
 
-    _write_report(report, cfg.runtime.run_report_path, args.report_devices)
+    _write_report(report, cfg.runtime.run_report_path, cfg.runtime.report_devices)
 
     summary = report.summary()
     log.info("run complete", extra=summary)
@@ -192,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             extra={"conditions": len(report.degraded)},
         )
         return EXIT_PARTIAL
-    if report.errors and args.fail_on_error:
+    if report.errors and cfg.runtime.fail_on_error:
         return EXIT_PARTIAL
     return EXIT_OK
 

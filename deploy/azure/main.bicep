@@ -295,9 +295,20 @@ var baseEnv = [
   { name: 'SNOW_DISCOVERY_SOURCE', value: discoverySource }
   { name: 'SNOW_RETIRE_MISSING', value: string(retireMissingDevices) }
   { name: 'DRY_RUN', value: string(dryRun) }
+  // Without this a run where every device failed still exits 0.
+  { name: 'FAIL_ON_ERROR', value: 'true' }
   { name: 'LOG_FORMAT', value: 'json' }
   { name: 'LOG_LEVEL', value: 'INFO' }
 ]
+
+// The run report is the only per-device record of what happened. It lands on
+// the same persistent share as the state file so it outlives the job replica.
+var reportEnv = enableStatePersistence
+  ? [
+      { name: 'RUN_REPORT_PATH', value: '${stateMountPath}/run-report.json' }
+      { name: 'RUN_REPORT_DEVICES', value: 'true' }
+    ]
+  : []
 
 var stateEnv = enableStatePersistence
   ? [ { name: 'STATE_PATH', value: '${stateMountPath}/state.json' } ]
@@ -353,7 +364,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             cpu: json(cpu)
             memory: memory
           }
-          env: concat(graphEnvCommon, graphEnv, baseEnv, stateEnv)
+          env: concat(graphEnvCommon, graphEnv, baseEnv, stateEnv, reportEnv)
           volumeMounts: enableStatePersistence
             ? [ { volumeName: 'state', mountPath: stateMountPath } ]
             : []

@@ -249,9 +249,12 @@ data "aws_iam_policy_document" "lambda" {
   }
 
   statement {
-    sid       = "StateObject"
-    actions   = ["s3:GetObject", "s3:PutObject"]
-    resources = ["${aws_s3_bucket.state.arn}/state.json"]
+    sid     = "StateObject"
+    actions = ["s3:GetObject", "s3:PutObject"]
+    resources = [
+      "${aws_s3_bucket.state.arn}/state.json",
+      "${aws_s3_bucket.state.arn}/run-report.json",
+    ]
   }
 }
 
@@ -294,6 +297,15 @@ resource "aws_lambda_function" "sync" {
       DRY_RUN    = tostring(var.dry_run)
       LOG_FORMAT = "json"
       LOG_LEVEL  = "INFO"
+
+      # The run report is the only per-device record of what happened, and a
+      # Lambda's filesystem does not outlive the invocation, so it goes to the
+      # same bucket as the state file.
+      RUN_REPORT_PATH    = "s3://${aws_s3_bucket.state.id}/run-report.json"
+      RUN_REPORT_DEVICES = "true"
+
+      # Without this a run where every device failed still exits 0.
+      FAIL_ON_ERROR = "true"
 
       # The connector reads these two at startup from SSM Parameter Store
       # (see src/intune_cmdb_sync/secrets.py). Only the parameter *names* live

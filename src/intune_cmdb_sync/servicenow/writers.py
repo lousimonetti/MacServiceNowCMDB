@@ -130,23 +130,33 @@ class IdentifyReconcileWriter:
             "POST", self._endpoint(), params=params, json_body=self.build_payload(batch)
         )
         if not response.is_success:
+            # IRE returns its log context id even on failure, and it is the only
+            # handle that ties this request to what ServiceNow recorded on its
+            # own side. Without it, a support case starts from a timestamp.
             raise ServiceNowError(
                 f"identifyreconcile ({len(batch)} items) failed: {describe_error(response)}"
+                f"{_log_context_suffix(_log_context_id(response))}"
             )
 
         result = (response.json() or {}).get("result") or {}
+        log_context_id = result.get("logContextId")
+        log.info(
+            "identifyreconcile accepted",
+            extra={"items": len(batch), "log_context_id": log_context_id},
+        )
         return self._parse_results(batch, result)
 
     def _parse_results(
         self, batch: list[CiPayload], result: dict[str, Any]
     ) -> list[WriteResult]:
         items = result.get("items") or []
+        log_context_id = result.get("logContextId")
         if len(items) != len(batch):
             log.warning(
                 "identifyreconcile returned a different item count than submitted; "
                 "correlating by position for the overlap only",
                 extra={"submitted": len(batch), "returned": len(items),
-                       "log_context_id": result.get("logContextId")},
+                       "log_context_id": log_context_id},
             )
 
         results: list[WriteResult] = []
@@ -156,7 +166,10 @@ class IdentifyReconcileWriter:
                     WriteResult(
                         intune_id=payload.intune_id,
                         action="error",
-                        errors=["no IRE result returned for this item"],
+                        errors=[
+                            "no IRE result returned for this item"
+                            + _log_context_suffix(log_context_id)
+                        ],
                     )
                 )
                 continue
@@ -164,6 +177,9 @@ class IdentifyReconcileWriter:
             item = items[index] or {}
             errors = _collect_item_errors(item)
             if errors:
+                # Carry the trace id on the per-device message: this is what an
+                # operator pastes into a ServiceNow case for a single bad CI.
+                errors[-1] += _log_context_suffix(log_context_id)
                 results.append(
                     WriteResult(intune_id=payload.intune_id, action="error", errors=errors)
                 )
@@ -180,7 +196,10 @@ class IdentifyReconcileWriter:
                     WriteResult(
                         intune_id=payload.intune_id,
                         action="error",
-                        errors=[f"unrecognised IRE operation {operation!r}"],
+                        errors=[
+                            f"unrecognised IRE operation {operation!r}"
+                            + _log_context_suffix(log_context_id)
+                        ],
                     )
                 )
                 continue
@@ -256,6 +275,24 @@ class CmdbInstanceWriter:
         updated = attributes.get("sys_updated_on")
         action = "inserted" if created and created == updated else "updated"
         return WriteResult(intune_id=item.intune_id, action=action, sys_id=str(sys_id))
+
+
+def _log_context_id(response: Any) -> str | None:
+    """Pull IRE's logContextId out of a response body that may not be JSON."""
+    try:
+        payload = response.json() or {}
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    result = payload.get("result")
+    if isinstance(result, dict) and result.get("logContextId"):
+        return str(result["logContextId"])
+    return str(payload["logContextId"]) if payload.get("logContextId") else None
+
+
+def _log_context_suffix(log_context_id: str | None) -> str:
+    return f" [IRE logContextId={log_context_id}]" if log_context_id else ""
 
 
 def _collect_item_errors(item: dict[str, Any]) -> list[str]:

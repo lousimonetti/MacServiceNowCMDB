@@ -221,7 +221,14 @@ class RuntimeConfig:
     dry_run: bool
     log_level: str
     log_format: str
-    run_report_path: Path | None
+    # A local path or an s3:// URL, resolved through storage.py the same way
+    # STATE_PATH is -- a Lambda has no writable filesystem worth keeping.
+    run_report_path: str | None
+    # Include the per-device outcome list in the report. Env-settable because a
+    # container deployment passes no CLI arguments.
+    report_devices: bool
+    # Exit non-zero when individual devices failed to write.
+    fail_on_error: bool
     state_path: str | None
     serial_blocklist: frozenset[str]
     mapping_overrides: dict[str, Any]
@@ -501,7 +508,9 @@ def _build_config() -> Config:
         dry_run=_env_bool("DRY_RUN", False),
         log_level=(_env("LOG_LEVEL", "INFO") or "INFO").upper(),
         log_format=log_format,
-        run_report_path=Path(run_report) if run_report else None,
+        run_report_path=run_report or None,
+        report_devices=_env_bool("RUN_REPORT_DEVICES", False),
+        fail_on_error=_env_bool("FAIL_ON_ERROR", False),
         state_path=state_path,
         device_limit=device_limit,
         serial_blocklist=serial_blocklist,

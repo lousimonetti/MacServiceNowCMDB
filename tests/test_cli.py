@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import httpx
 import pytest
@@ -177,3 +178,75 @@ class TestReportOnFailure:
 
         # No --fail-on-error: a degraded run is non-zero on its own.
         assert main([]) == EXIT_PARTIAL
+
+
+class TestOverridesDoNotLeak:
+    """`aws_lambda.handler` calls main() repeatedly in a warm container. A CLI
+    flag that mutated os.environ permanently meant one invocation with dry_run
+    left every later invocation silently in dry-run mode."""
+
+    def test_dry_run_flag_does_not_persist_to_the_next_call(self, set_env, monkeypatch):
+        set_env(DRY_RUN="false")
+        seen: list[bool] = []
+        monkeypatch.setattr(
+            "intune_cmdb_sync.__main__._run",
+            lambda _args: seen.append(os.environ.get("DRY_RUN") == "true") or EXIT_OK,
+        )
+        main(["--dry-run"])
+        main([])
+        assert seen == [True, False], "the flag leaked into the second invocation"
+
+    def test_absent_flag_still_defers_to_the_environment(self, set_env, monkeypatch):
+        """Flags are one-way: absence must not clear a value set by the env."""
+        set_env(DRY_RUN="true")
+        seen: list[str | None] = []
+        monkeypatch.setattr(
+            "intune_cmdb_sync.__main__._run",
+            lambda _args: seen.append(os.environ.get("DRY_RUN")) or EXIT_OK,
+        )
+        main([])
+        assert seen == ["true"]
+
+    def test_environment_is_restored_exactly(self, set_env, monkeypatch):
+        set_env(RUN_REPORT_PATH="/original/path.json")
+        monkeypatch.setattr("intune_cmdb_sync.__main__._run", lambda _args: EXIT_OK)
+        main(["--report", "/override.json", "--limit", "3", "--fail-on-error"])
+        assert os.environ["RUN_REPORT_PATH"] == "/original/path.json"
+        assert "INTUNE_DEVICE_LIMIT" not in os.environ
+        assert "FAIL_ON_ERROR" not in os.environ
+
+
+class TestReportOptionsAreEnvSettable:
+    """A container deployment passes no CLI arguments, so anything only
+    reachable by flag is unreachable in production."""
+
+    @respx.mock
+    def test_fail_on_error_via_environment(self, set_env):
+        set_env(FAIL_ON_ERROR="true")
+        respx.get(DEVICES).mock(
+            return_value=httpx.Response(200, json={"value": [make_device(id="d1")]})
+        )
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        mock_snow_plumbing()
+        respx.post(IRE).mock(return_value=httpx.Response(403, text="denied"))
+        assert main([]) == EXIT_PARTIAL
+
+    @respx.mock
+    def test_report_devices_via_environment(self, set_env, tmp_path):
+        report = tmp_path / "run.json"
+        set_env(RUN_REPORT_PATH=str(report), RUN_REPORT_DEVICES="true")
+        respx.get(DEVICES).mock(
+            return_value=httpx.Response(200, json={"value": [make_device(id="d1")]})
+        )
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        mock_snow_plumbing()
+        respx.post(IRE).mock(return_value=ire_response("INSERT"))
+
+        assert main([]) == EXIT_OK
+        payload = json.loads(report.read_text())
+        assert payload["devices"][0]["intune_id"] == "d1"
+        assert payload["run_id"]
