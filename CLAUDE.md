@@ -67,6 +67,14 @@ behaviour change, particularly anything altering what gets written to a CI.
   assignments *are* the cross-tenant admin consent — there is no separate
   consent call. `az ad app show` against the non-home tenant fails with
   "resource does not exist", which is correct behaviour, not a problem.
+- **`GRAPH_AUTH_MODE=access_token` is local-development only.** It serves a
+  pasted bearer token with no refresh, and is deliberately excluded from the
+  Azure deployment — a scheduled job using it would work until the token expired
+  and then fail every night. `StaticTokenProvider` checks audience, expiry, and
+  Intune permission up front, because all three otherwise surface as an opaque
+  401/403. Note `az account get-access-token` produces a token that passes the
+  first two checks and fails the third: it is the Azure CLI's own app, which has
+  no Intune permissions.
 - **`--limit` / `INTUNE_DEVICE_LIMIT` disables retirement.** A truncated device
   list makes the rest of the fleet look like it vanished, and a small limit makes
   the missing fraction large enough that the percentage guard is not a reliable

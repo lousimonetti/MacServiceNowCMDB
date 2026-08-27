@@ -14,6 +14,9 @@ Endpoints used:
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import logging
 import time
 from collections.abc import Iterable, Iterator, Sequence
@@ -142,6 +145,124 @@ def build_credential(cfg: GraphConfig) -> Any:
     return DefaultAzureCredential()
 
 
+def inspect_access_token(token: str) -> dict[str, Any]:
+    """Read the claims out of a Graph bearer token without verifying it.
+
+    We are not authenticating anything here — Entra already did. The point is to
+    turn the two mistakes that actually happen with a hand-pasted token into an
+    error that names the problem, instead of a 401 an hour later that does not.
+
+    Returns {} for anything that is not a decodable JWT, which is not fatal:
+    the token may still be perfectly good.
+    """
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (IndexError, ValueError, binascii.Error, UnicodeDecodeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+class StaticTokenProvider:
+    """Serves a pre-obtained Graph token. Local development only.
+
+    There is no refresh: when the token expires, the run fails. That is the
+    accepted trade for being able to test against a tenant where you cannot
+    create an app registration.
+    """
+
+    #: Either of these permits reading managedDevices. Held as app roles in an
+    #: application token (`roles`) or as scopes in a delegated one (`scp`).
+    DEVICE_READ_PERMISSIONS = (
+        "DeviceManagementManagedDevices.Read.All",
+        "DeviceManagementManagedDevices.ReadWrite.All",
+    )
+
+    #: Audiences Entra issues for Microsoft Graph.
+    GRAPH_AUDIENCES = frozenset({
+        "https://graph.microsoft.com",
+        "https://graph.microsoft.com/",
+        "00000003-0000-0000-c000-000000000000",
+    })
+
+    def __init__(self, token: str) -> None:
+        self._token = token.strip()
+        if not self._token:
+            raise AuthError("GRAPH_ACCESS_TOKEN is empty")
+        # Some tools copy the header prefix along with the value.
+        if self._token.lower().startswith("bearer "):
+            self._token = self._token[7:].strip()
+        self._validate()
+
+    def _validate(self) -> None:
+        claims = inspect_access_token(self._token)
+        if not claims:
+            log.warning(
+                "GRAPH_ACCESS_TOKEN is not a readable JWT; using it as-is. "
+                "If Graph rejects it, check that it is a Microsoft Graph token."
+            )
+            return
+
+        audience = str(claims.get("aud") or "")
+        if audience and audience not in self.GRAPH_AUDIENCES:
+            raise AuthError(
+                f"GRAPH_ACCESS_TOKEN is for audience {audience!r}, not Microsoft Graph. "
+                "A token for one resource is never valid for another. Get a Graph token "
+                "with: az account get-access-token --resource https://graph.microsoft.com"
+            )
+
+        expires_at = claims.get("exp")
+        if isinstance(expires_at, int | float):
+            remaining = expires_at - time.time()
+            if remaining <= 0:
+                raise AuthError(
+                    "GRAPH_ACCESS_TOKEN expired "
+                    f"{int(-remaining / 60)} minute(s) ago. Tokens are short-lived; "
+                    "fetch a fresh one."
+                )
+            log.warning(
+                "using a static Graph access token: LOCAL DEVELOPMENT ONLY. "
+                "It cannot be refreshed, so a run longer than its remaining life "
+                "will fail partway through.",
+                extra={
+                    "expires_in_minutes": int(remaining / 60),
+                    # Application permissions land in `roles`; a delegated token
+                    # carries `scp` instead and is bounded by the signed-in user.
+                    "app_roles": claims.get("roles"),
+                    "delegated_scopes": claims.get("scp"),
+                },
+            )
+
+        self._warn_if_missing_device_permission(claims)
+
+    def _warn_if_missing_device_permission(self, claims: dict[str, Any]) -> None:
+        """Say why the run is about to 403, before it does.
+
+        Not fatal: the claim set is not always the whole story, and refusing a
+        token that would have worked is worse than a warning that is occasionally
+        redundant. But the common case -- a token from `az account
+        get-access-token`, which carries no Intune permission at all -- otherwise
+        surfaces as a 403 whose text does not mention where the token came from.
+        """
+        granted = set(claims.get("roles") or [])
+        granted.update(str(claims.get("scp") or "").split())
+        if not granted or granted.intersection(self.DEVICE_READ_PERMISSIONS):
+            return
+        log.warning(
+            "this token carries no Intune device-read permission, so listing "
+            "managed devices will fail with 403. It needs one of %s. A token from "
+            "'az account get-access-token' will not have it: that is the Azure CLI's "
+            "own app registration, which has no Intune permissions. Use Graph "
+            "Explorer, or an app registration that has been consented for it.",
+            " or ".join(self.DEVICE_READ_PERMISSIONS),
+            extra={"granted": sorted(granted)},
+        )
+
+    def __call__(self) -> str:
+        return self._token
+
+
 class _CredentialTokenProvider:
     """Adapts an azure-identity credential to the `() -> str` shape the HTTP layer wants."""
 
@@ -160,9 +281,12 @@ class _CredentialTokenProvider:
 class GraphClient:
     def __init__(self, cfg: GraphConfig, *, token_provider: Any = None) -> None:
         self.cfg = cfg
-        provider = token_provider or _CredentialTokenProvider(
-            build_credential(cfg), cfg.scope
-        )
+        if token_provider is None:
+            if cfg.auth_mode == "access_token":
+                token_provider = StaticTokenProvider(cfg.access_token or "")
+            else:
+                token_provider = _CredentialTokenProvider(build_credential(cfg), cfg.scope)
+        provider = token_provider
         self._http = RetryingClient(
             base_url=cfg.base_url,
             token_provider=provider,
@@ -352,6 +476,8 @@ __all__ = [
     "NON_DEFAULT_DEVICE_FIELDS",
     "TOKEN_EXCHANGE_SCOPE",
     "GraphClient",
+    "StaticTokenProvider",
     "build_credential",
+    "inspect_access_token",
     "is_corporate",
 ]

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import logging
+import time
+
 import httpx
 import pytest
 import respx
 
 from intune_cmdb_sync.config import Config
-from intune_cmdb_sync.errors import GraphError
+from intune_cmdb_sync.errors import AuthError, GraphError
 from intune_cmdb_sync.graph import (
     TOKEN_EXCHANGE_SCOPE,
     GraphClient,
+    StaticTokenProvider,
     build_credential,
     is_corporate,
 )
@@ -260,3 +264,121 @@ class TestCredentialSelection:
 
         set_env(GRAPH_AUTH_MODE="client_secret")
         assert isinstance(build_credential(Config.from_env().graph), ClientSecretCredential)
+
+
+def _jwt(**claims) -> str:
+    """Build an unsigned JWT. The connector never verifies signatures — Entra
+    already did — so an unsigned token exercises the same code path."""
+    import base64
+    import json
+
+    def seg(d):
+        raw = json.dumps(d).encode()
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    return f"{seg({'alg': 'none'})}.{seg(claims)}.signature"
+
+
+class TestStaticAccessToken:
+    """GRAPH_AUTH_MODE=access_token: local development against a tenant where you
+    cannot create an app registration. The value is short-lived and cannot be
+    refreshed, so the failure modes have to be named rather than discovered."""
+
+    def _future(self, minutes=55):
+        return int(time.time()) + minutes * 60
+
+    def test_serves_the_token_verbatim(self):
+        token = _jwt(aud="https://graph.microsoft.com", exp=self._future())
+        assert StaticTokenProvider(token)() == token
+
+    def test_strips_a_pasted_bearer_prefix(self):
+        """Copying from a browser's network tab brings the scheme along."""
+        token = _jwt(aud="https://graph.microsoft.com", exp=self._future())
+        assert StaticTokenProvider(f"Bearer {token}")() == token
+
+    def test_rejects_a_token_for_the_wrong_audience(self):
+        """The most common mistake: a token for ARM, not Graph. It looks valid
+        and fails with a 401 that does not mention audience."""
+        token = _jwt(aud="https://management.azure.com", exp=self._future())
+        with pytest.raises(AuthError) as exc:
+            StaticTokenProvider(token)
+        assert "management.azure.com" in str(exc.value)
+        assert "graph.microsoft.com" in str(exc.value)
+
+    def test_rejects_an_already_expired_token(self):
+        token = _jwt(aud="https://graph.microsoft.com", exp=int(time.time()) - 600)
+        with pytest.raises(AuthError) as exc:
+            StaticTokenProvider(token)
+        assert "expired" in str(exc.value).lower()
+
+    def test_rejects_an_empty_token(self):
+        with pytest.raises(AuthError):
+            StaticTokenProvider("   ")
+
+    def test_an_opaque_token_is_a_warning_not_an_error(self, caplog):
+        """We cannot read it, but that is not proof it is bad."""
+        with caplog.at_level(logging.WARNING):
+            assert StaticTokenProvider("not-a-jwt")() == "not-a-jwt"
+        assert any("not a readable JWT" in r.getMessage() for r in caplog.records)
+
+    def test_warns_that_this_is_development_only(self, caplog):
+        token = _jwt(aud="https://graph.microsoft.com", exp=self._future(),
+                     roles=["DeviceManagementManagedDevices.Read.All"])
+        with caplog.at_level(logging.WARNING):
+            StaticTokenProvider(token)
+        assert any("LOCAL DEVELOPMENT ONLY" in r.getMessage() for r in caplog.records)
+
+    def test_accepts_the_app_id_audience_form(self):
+        """Entra issues the Graph app id as the audience for v1 tokens."""
+        token = _jwt(aud="00000003-0000-0000-c000-000000000000", exp=self._future())
+        assert StaticTokenProvider(token)()
+
+    @respx.mock
+    def test_client_uses_the_token_without_touching_azure_identity(self, set_env, monkeypatch):
+        """The whole point: no credential is constructed, so no app registration
+        and no secret are needed."""
+        def explode(_cfg):
+            raise AssertionError("build_credential must not be called in access_token mode")
+        monkeypatch.setattr("intune_cmdb_sync.graph.build_credential", explode)
+
+        token = _jwt(aud="https://graph.microsoft.com", exp=self._future())
+        set_env(GRAPH_AUTH_MODE="access_token", GRAPH_ACCESS_TOKEN=token,
+                GRAPH_CLIENT_SECRET=None)
+
+        route = respx.get(DEVICES).mock(
+            return_value=httpx.Response(200, json={"value": [make_device()]})
+        )
+        client = GraphClient(Config.from_env().graph)
+        assert len(list(client.iter_managed_devices())) == 1
+        assert route.calls[0].request.headers["Authorization"] == f"Bearer {token}"
+
+    def test_warns_when_the_token_lacks_intune_permission(self, caplog):
+        """The az CLI's token is the common case: valid, correct audience, and
+        entirely unable to read managedDevices."""
+        token = _jwt(
+            aud="https://graph.microsoft.com", exp=self._future(),
+            scp="User.Read.All Directory.AccessAsUser.All",
+        )
+        with caplog.at_level(logging.WARNING):
+            StaticTokenProvider(token)
+        messages = " ".join(r.getMessage() for r in caplog.records)
+        assert "no Intune device-read permission" in messages
+        assert "az account get-access-token" in messages
+
+    def test_no_permission_warning_when_the_app_role_is_present(self, caplog):
+        token = _jwt(aud="https://graph.microsoft.com", exp=self._future(),
+                     roles=["DeviceManagementManagedDevices.Read.All"])
+        with caplog.at_level(logging.WARNING):
+            StaticTokenProvider(token)
+        assert "no Intune device-read permission" not in " ".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    def test_readwrite_scope_also_satisfies_the_check(self, caplog):
+        token = _jwt(aud="https://graph.microsoft.com", exp=self._future(),
+                     scp="DeviceManagementManagedDevices.ReadWrite.All")
+        with caplog.at_level(logging.WARNING):
+            StaticTokenProvider(token)
+        assert "no Intune device-read permission" not in " ".join(
+            r.getMessage() for r in caplog.records
+        )

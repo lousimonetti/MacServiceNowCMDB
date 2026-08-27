@@ -168,6 +168,9 @@ class GraphConfig:
     # federated_managed_identity only: the managed identity that signs the
     # client assertion. None selects the system-assigned identity.
     assertion_identity_client_id: str | None = None
+    # access_token only: a pre-obtained Graph bearer token. Local development
+    # against a tenant where you cannot create an app registration.
+    access_token: str | None = None
 
     @property
     def authority_host(self) -> str:
@@ -239,6 +242,7 @@ class Config:
 
 
 VALID_GRAPH_AUTH_MODES = {
+    "access_token",
     "client_secret",
     "managed_identity",
     "federated_managed_identity",
@@ -286,11 +290,21 @@ def _build_config() -> Config:
             f"(got {graph_auth_mode!r})"
         )
 
+    graph_access_token = resolve_secret("GRAPH_ACCESS_TOKEN")
     tenant_id = _env("GRAPH_TENANT_ID") or _env("AZURE_TENANT_ID")
     client_id = _env("GRAPH_CLIENT_ID") or _env("AZURE_CLIENT_ID")
     client_secret = resolve_secret("GRAPH_CLIENT_SECRET") or resolve_secret("AZURE_CLIENT_SECRET")
 
-    if graph_auth_mode == "client_secret":
+    if graph_auth_mode == "access_token":
+        # No tenant or client id needed: the token already encodes both, and
+        # requiring them would only invite a mismatch between the two.
+        if not graph_access_token:
+            problems.append(
+                "GRAPH_ACCESS_TOKEN is required when GRAPH_AUTH_MODE=access_token "
+                "(or GRAPH_ACCESS_TOKEN_FILE). Get one with: az account get-access-token "
+                "--resource https://graph.microsoft.com --query accessToken -o tsv"
+            )
+    elif graph_auth_mode == "client_secret":
         if not tenant_id:
             problems.append("GRAPH_TENANT_ID is required when GRAPH_AUTH_MODE=client_secret")
         if not client_id:
@@ -335,6 +349,7 @@ def _build_config() -> Config:
         request_timeout=_env_float("GRAPH_TIMEOUT_SECONDS", 60.0, minimum=1.0),
         max_retries=_env_int("GRAPH_MAX_RETRIES", 5, minimum=0, maximum=10),
         assertion_identity_client_id=_env("GRAPH_ASSERTION_IDENTITY_CLIENT_ID"),
+        access_token=graph_access_token,
     )
 
     # ---- ServiceNow ------------------------------------------------------

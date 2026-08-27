@@ -22,7 +22,10 @@ DEPLOY_SH = REPO / "deploy" / "azure" / "deploy.sh"
 #   workload_identity  needs a projected federated token file, which AKS and
 #                      GitHub Actions provide and Container Apps does not.
 #   default            DefaultAzureCredential, a local-development convenience.
-NOT_DEPLOYABLE_ON_CONTAINER_APPS = {"workload_identity", "default"}
+#   access_token       a hand-pasted, non-refreshable token. Deploying this on a
+#                      schedule would produce a job that works until the token
+#                      expires and then fails silently every night.
+NOT_DEPLOYABLE_ON_CONTAINER_APPS = {"workload_identity", "default", "access_token"}
 
 
 def _bicep_allowed_modes() -> set[str]:

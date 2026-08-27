@@ -207,6 +207,44 @@ removes a rotation task and adds a four-step setup spanning two tenants.
 
 [fic]: https://learn.microsoft.com/entra/workload-id/workload-identity-federation-config-app-trust-managed-identity
 
+## Local development without an app registration
+
+`GRAPH_AUTH_MODE=access_token` takes a Graph bearer token directly, for trying
+the connector against a tenant where you do not have — or cannot yet get — an
+app registration.
+
+```bash
+GRAPH_AUTH_MODE=access_token
+GRAPH_ACCESS_TOKEN=<paste>          # or GRAPH_ACCESS_TOKEN_FILE=/path
+# no GRAPH_CLIENT_ID, no GRAPH_CLIENT_SECRET, no GRAPH_TENANT_ID needed:
+# the token already encodes all three
+```
+
+Get the token from [Graph Explorer][ge]: sign in, consent
+`DeviceManagementManagedDevices.Read.All`, and copy the access token from the
+**Access token** tab.
+
+**`az account get-access-token` does not work for this.** It mints a token for
+the Azure CLI's own app registration, which has no Intune permissions, so
+`/deviceManagement/managedDevices` returns 403. The connector reads the token's
+claims at startup and tells you this before making the request.
+
+Three ways this mode fails, all reported up front rather than as an opaque 401:
+
+| Problem | What you see |
+| --- | --- |
+| Token for the wrong resource | Names the audience it actually has |
+| Token already expired | Says how long ago |
+| No Intune permission | Names the permission needed, and why an `az` token lacks it |
+
+The token cannot be refreshed, so a run outliving it fails partway through.
+That is the accepted trade — this mode exists to answer "does this work against
+my data at all", not to run anything on a schedule. It is deliberately rejected
+by `deploy/azure/main.bicep`, and `tests/test_deployment_consistency.py` keeps
+it that way.
+
+[ge]: https://developer.microsoft.com/graph/graph-explorer
+
 ### Certificate credentials
 
 If policy forbids client secrets, upload a certificate and use
