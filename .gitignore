@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node (ServiceNow SDK app)
+node_modules/
+servicenow-app/build/
+servicenow-app/.now/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+.terraform.lock.hcl
+
+# Local config and runtime artifacts — never commit real credentials
+.env
+.env.*
+!.env.example
+state.json
+run-report.json
+mapping-overrides.json
+!docs/examples/mapping-overrides.json
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

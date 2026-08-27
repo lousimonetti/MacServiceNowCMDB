@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "Example MAPPING_OVERRIDES_FILE. Every key is optional.",
+    "Custom columns (u_*) must already exist on the target CMDB class -- the",
+    "connector does not create them, and IRE silently drops unknown fields."
+  ],
+
+  "fields": {
+    "u_intune_compliance_state": "complianceState",
+    "u_intune_last_sync": "lastSyncDateTime",
+    "u_intune_enrolled_on": "enrolledDateTime",
+    "u_intune_encrypted": "isEncrypted",
+    "u_intune_supervised": "isSupervised",
+    "u_intune_category": "deviceCategoryDisplayName",
+    "u_intune_enrollment_profile": "enrollmentProfileName",
+    "u_entra_device_id": "azureADDeviceId",
+    "u_owner_department": "user.department",
+    "u_owner_office": "user.office_location",
+    "u_owner_company": "user.company_name"
+  },
+
+  "os_names": {
+    "macos": "Mac OS X",
+    "windows": "Windows"
+  },
+
+  "static": {
+    "u_data_source": "intune-cmdb-sync"
+  },
+
+  "drop": []
+}

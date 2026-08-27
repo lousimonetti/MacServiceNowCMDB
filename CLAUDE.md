@@ -1,0 +1,80 @@
+# CLAUDE.md
+
+Guidance for Claude Code when working in this repository.
+
+## What this is
+
+A connector that syncs corporate-owned Microsoft Intune devices into the
+ServiceNow CMDB through the base-platform Identification and Reconciliation
+Engine (IRE). No Service Graph Connector subscription, no paid plugin.
+
+## Commands
+
+```bash
+python -m venv .venv && .venv/bin/pip install -e ".[dev]"
+
+.venv/bin/pytest -q          # no network, no credentials needed
+.venv/bin/ruff check src/ tests/
+.venv/bin/mypy
+```
+
+All three must pass before any change is considered done. Add a test for any
+behaviour change, particularly anything altering what gets written to a CI.
+
+## Architecture notes that are not obvious from the code
+
+- **The device sync never PATCHes.** It POSTs the full attribute set to
+  `/api/now/identifyreconcile` and lets IRE decide INSERT / UPDATE / NO_CHANGE.
+  There is exactly one PATCH in the codebase — retirement, in `sync.py`.
+- **There is no client-side change detection.** Every field in
+  `DeviceMapper.build_values` is sent every run, so any field whose value moves
+  between runs makes every device an UPDATE. `last_discovered`
+  (`lastSyncDateTime`) is the classic offender; it is dropped via
+  `MAPPING_OVERRIDES_FILE` in local setups. Check that before adding a field.
+- **Unresolved reference fields are omitted, not blanked.** A failed
+  `manufacturer` / `model_id` / `assigned_to` lookup leaves the existing CI
+  value alone rather than clearing it. Preserve that property.
+- **Exit code 4 means degraded**, not merely "device errors". A tripped
+  mass-retirement guard or a failed state write returns 4 even without
+  `--fail-on-error`, because both leave the *next* run unable to reason about
+  the fleet. See `RunReport.degraded`.
+- **Graph data calls are plain REST, deliberately** — `azure-identity` handles
+  tokens, but `msgraph-sdk` is not used. Do not add it.
+
+## Constraints
+
+- **Never assume managed identity for Graph.** Deployments where Intune and the
+  hosting subscription live in different tenants cannot use it — a managed
+  identity is single-tenant and there is no cross-tenant consent path.
+  `deploy.sh` hard-fails on that combination. `client_secret` is the default.
+- `GRAPH_AUTH_MODE=workload_identity` is accepted by `config.py` but has no
+  deployment surface in `main.bicep`. It is half-wired, not finished.
+
+## State of the work
+
+The Microsoft Graph half is verified against a live tenant. **The ServiceNow
+half has never touched a live instance** — the 269 tests mock at the HTTP
+boundary with `respx`, and those fixtures were written from vendor
+documentation, not observed responses. Green tests are weaker evidence here
+than they look.
+
+## Next steps
+
+1. **Get a ServiceNow instance.** A free Personal Developer Instance is enough;
+   IRE is base platform. Then follow `docs/servicenow-setup.md` §2 (grant
+   `itil`) and §5 (create the discovery source choice value — skipping it
+   produces `Invalid data source`).
+2. **`intune-cmdb-sync --check`.** Connectivity only. Note that `itil` does not
+   always carry `sys_properties` read, so a 403 here can be a red herring.
+3. **`--dry-run --report-devices --report ./run.json`.** Confirm the `operation`
+   values IRE actually returns against `_OPERATION_TO_ACTION` in `writers.py`.
+   The dry run uses `/identifyreconcile/query`, a *different* endpoint whose
+   response vocabulary is unconfirmed; an unrecognised operation is a hard
+   error by design, so this is where a surprise will surface.
+4. **First real write with `SNOW_RETIRE_MISSING=false`.** Then verify that
+   `install_status=7` actually means retired *in that instance* before enabling
+   retirement — the README calls this a convention, not a guarantee.
+5. **Consider a `--limit` flag.** There is currently no way to restrict a run to
+   a handful of devices; the narrowest blast radius available is
+   `INTUNE_OWNERSHIP`, which is not narrow. Worth adding before the first write
+   against a fleet of any size.

@@ -1,0 +1,5 @@
+{
+  "scope": "x_icsy_intune_cmdb",
+  "name": "Intune CMDB Sync",
+  "tsconfigPath": "./src/server/tsconfig.json"
+}

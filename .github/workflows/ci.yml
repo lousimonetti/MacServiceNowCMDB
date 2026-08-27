@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    # A credential committed by accident is not fixable by deleting it later:
+    # once pushed, it must be rotated. Catching it here is the cheap path.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # gitleaks scans history, not just the tip
+
+      - name: Scan for committed secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src/ tests/
+
+      - name: Type check
+        run: mypy
+
+      - name: Test
+        # The suite mocks both APIs at the HTTP boundary, so it needs no network
+        # and no credentials.
+        run: pytest -q --cov=intune_cmdb_sync --cov-report=term-missing
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build runtime image
+        run: docker build -t intune-cmdb-sync:ci .
+
+      - name: Build Lambda image
+        run: docker build -f deploy/aws/Dockerfile.lambda -t intune-cmdb-sync:lambda-ci .
+
+      - name: Smoke test the entrypoint
+        # No configuration is supplied, so this must exit 2 (invalid config)
+        # rather than crashing — which proves the package installed and the CLI
+        # is wired up.
+        run: |
+          set +e
+          docker run --rm -e LOG_FORMAT=text intune-cmdb-sync:ci --help
+          docker run --rm -e LOG_FORMAT=text intune-cmdb-sync:ci
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            echo "expected exit code 2 for missing configuration, got $code" >&2
+            exit 1
+          fi
+
+  infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Bicep
+        run: az bicep build --file deploy/azure/main.bicep --stdout > /dev/null
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Validate Terraform
+        working-directory: deploy/aws
+        run: |
+          terraform fmt -check -diff
+          terraform init -backend=false
+          terraform validate
+
+      - name: Check shell scripts
+        run: bash -n deploy/azure/deploy.sh

@@ -1,0 +1,17 @@
+{
+  "name": "intune-cmdb-sync-snow-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ServiceNow scoped application that provisions the platform-side configuration intune-cmdb-sync depends on.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "now-sdk build",
+    "deploy": "now-sdk install",
+    "auth": "now-sdk auth",
+    "pack": "now-sdk pack",
+    "clean": "now-sdk clean"
+  },
+  "devDependencies": {
+    "@servicenow/sdk": "^4.11.0"
+  }
+}

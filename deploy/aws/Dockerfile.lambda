@@ -1,0 +1,20 @@
+# Lambda container image. Built from the repository root:
+#   docker build -f deploy/aws/Dockerfile.lambda -t intune-cmdb-sync:lambda .
+#
+# On Apple Silicon add --platform linux/amd64, or set architectures = ["arm64"]
+# on the Lambda function. A mismatch only surfaces at invoke time.
+
+FROM public.ecr.aws/lambda/python:3.12
+
+COPY pyproject.toml README.md ${LAMBDA_TASK_ROOT}/
+COPY src ${LAMBDA_TASK_ROOT}/src
+
+# The trailing slash keeps pip reading this as a local path with an extra rather
+# than as a package name. boto3 ships in the Lambda runtime, but installing it
+# explicitly means `docker run` behaves identically to the deployed function.
+RUN pip install --no-cache-dir "${LAMBDA_TASK_ROOT}/[aws]" \
+ && rm -rf "${LAMBDA_TASK_ROOT}/src" \
+           "${LAMBDA_TASK_ROOT}/pyproject.toml" \
+           "${LAMBDA_TASK_ROOT}/README.md"
+
+CMD ["intune_cmdb_sync.aws_lambda.handler"]
