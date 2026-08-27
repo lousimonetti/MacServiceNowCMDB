@@ -76,6 +76,16 @@ Before any of that, both sides need about 30 minutes of setup:
   OAuth client, and the `Intune` discovery source. Ends with a copy-pasteable
   curl that proves the write path before you schedule anything.
 
+### Documentation
+
+| Document | Audience |
+| --- | --- |
+| [architecture.md](docs/architecture.md) | How the system is built, and the decisions behind it |
+| [metamodel-mapping.md](docs/metamodel-mapping.md) | CMDB owners: classes, identity, reconciliation |
+| [field-mapping.md](docs/field-mapping.md) | Exactly what lands on a CI, field by field |
+| [engineering-guide.md](docs/engineering-guide.md) | Working on the code |
+| [leadership-brief.md](docs/leadership-brief.md) | Cost, risk, status, decisions |
+
 ---
 
 ## What it does
@@ -295,8 +305,8 @@ src/intune_cmdb_sync/
 servicenow-app/        ServiceNow SDK (Fluent) app: discovery source, role, properties
 deploy/azure/          Bicep + deploy script
 deploy/aws/            Terraform + Lambda Dockerfile
-docs/                  setup guides and the field mapping reference
-tests/                 257 tests, both APIs mocked at the HTTP boundary
+docs/                  setup guides, design documents, field mapping reference
+tests/                 269 tests, both APIs mocked at the HTTP boundary
 ```
 
 The `servicenow-app/` directory ships no runtime logic. It captures the
@@ -313,7 +323,7 @@ covers both.
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
-.venv/bin/pytest -q                 # 257 tests, no network
+.venv/bin/pytest -q                 # 269 tests, no network
 .venv/bin/ruff check src/ tests/
 .venv/bin/mypy
 ```
