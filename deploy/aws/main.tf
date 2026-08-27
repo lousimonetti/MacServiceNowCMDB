@@ -222,14 +222,14 @@ resource "aws_iam_role" "lambda" {
 
 data "aws_iam_policy_document" "lambda" {
   statement {
-    sid     = "Logs"
-    actions = ["logs:CreateLogStream", "logs:PutLogEvents"]
+    sid       = "Logs"
+    actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
     resources = ["${aws_cloudwatch_log_group.lambda.arn}:*"]
   }
 
   statement {
-    sid       = "ReadSecrets"
-    actions   = ["ssm:GetParameter", "ssm:GetParameters"]
+    sid     = "ReadSecrets"
+    actions = ["ssm:GetParameter", "ssm:GetParameters"]
     resources = [
       aws_ssm_parameter.graph_client_secret.arn,
       aws_ssm_parameter.servicenow_client_secret.arn,
@@ -278,10 +278,10 @@ resource "aws_lambda_function" "sync" {
 
   environment {
     variables = {
-      GRAPH_AUTH_MODE   = "client_secret"
-      GRAPH_TENANT_ID   = var.graph_tenant_id
-      GRAPH_CLIENT_ID   = var.graph_client_id
-      INTUNE_OWNERSHIP  = "company"
+      GRAPH_AUTH_MODE  = "client_secret"
+      GRAPH_TENANT_ID  = var.graph_tenant_id
+      GRAPH_CLIENT_ID  = var.graph_client_id
+      INTUNE_OWNERSHIP = "company"
 
       SNOW_INSTANCE         = var.servicenow_instance
       SNOW_AUTH_MODE        = "oauth_client_credentials"

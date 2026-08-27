@@ -1,0 +1,29 @@
+# gitleaks configuration.
+#
+# The CI `secrets` job scans full history on every push. This file exists only
+# to suppress specific, verified false positives — never to widen the net.
+#
+# Rule for adding an entry: the value must be a published constant or a
+# documented placeholder, and the comment must say which. If you cannot state
+# that in one line, it is not a false positive.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+description = "Generic API Key"
+regex = '''(?i)(?:key|api|token|secret|client|passwd|password|auth|access)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|']|[\s|"]){0,3}(?:=|>|:{1,3}=|\|\||:|<=|=>|:=)(?:'|\"|\s|=|\x60){0,5}([0-9a-z\-_.=]{10,150})(?:['|\"|\n|\r|\s|\x60|;]|$)'''
+keywords = ["key", "api", "token", "secret", "client", "passwd", "password", "auth", "access"]
+
+  [rules.allowlist]
+  regexTarget = "match"
+  regexes = [
+    # Azure built-in role definition ID for "Key Vault Secrets User". A public,
+    # documented Microsoft constant, identical in every tenant.
+    # https://learn.microsoft.com/azure/role-based-access-control/built-in-roles
+    '''4633458b-17de-408a-b874-0445c86b69e6''',
+    # Microsoft Graph's own first-party service principal app ID. Also a public
+    # constant, the same in every tenant.
+    '''00000003-0000-0000-c000-000000000000''',
+  ]
