@@ -55,6 +55,18 @@ behaviour change, particularly anything altering what gets written to a CI.
 - **`workload_identity` is not that mode.** It needs a projected federated token
   file, which AKS and GitHub Actions provide and Container Apps does not, which
   is why `main.bicep` deliberately does not offer it.
+- **The federated credential can only be created after the first deploy.**
+  `main.bicep` creates the user-assigned managed identity at deploy time, so
+  there is nothing for the app registration to trust until that has run once.
+  Order is: deploy with `client_secret` → create the FIC against the identity
+  the deploy produced → redeploy with `graphAuthMode=federated_managed_identity`.
+  No code changes at any step. The FIC's `subject` is the identity's
+  **principal (object) ID**, not its client ID.
+- **A multi-tenant app is only queryable from its home tenant.** Its service
+  principal is projected into the other tenant, and that SP's app-role
+  assignments *are* the cross-tenant admin consent — there is no separate
+  consent call. `az ad app show` against the non-home tenant fails with
+  "resource does not exist", which is correct behaviour, not a problem.
 - **`--limit` / `INTUNE_DEVICE_LIMIT` disables retirement.** A truncated device
   list makes the rest of the fleet look like it vanished, and a small limit makes
   the missing fraction large enough that the percentage guard is not a reliable
@@ -87,3 +99,8 @@ than they look.
    guarantee.
 5. **Drop the limit** once the written CIs look right, and only then consider
    enabling retirement.
+6. **Optional, later: move off the client secret.** The multi-tenant app for
+   `federated_managed_identity` already exists and is consented into the Intune
+   tenant; only the federated credential is outstanding, and it needs a deployed
+   managed identity first (see Constraints). This saves a secret rotation and
+   nothing else — it is not on the critical path.
