@@ -90,3 +90,60 @@ def test_deploy_script_refuses_managed_identity_across_tenants():
         text,
     )
     assert guard, "deploy.sh no longer refuses managed_identity when tenants differ"
+
+
+# ---------------------------------------------------------------------------
+# Alerting
+#
+# A job that stops running is invisible: there is no failure to notice, just a
+# CMDB that quietly goes stale. These assert the alarms stay deployed, and that
+# the two settings which decide whether they can fire at all survive edits.
+# ---------------------------------------------------------------------------
+
+TERRAFORM = REPO / "deploy" / "aws" / "main.tf"
+
+
+def test_azure_deploys_both_alert_rules():
+    text = BICEP.read_text()
+    assert "Microsoft.Insights/actionGroups" in text
+    assert text.count("Microsoft.Insights/scheduledQueryRules") == 2, (
+        "expected a no-successful-run rule and a device-errors rule"
+    )
+    assert "no-successful-run" in text and "device-errors" in text
+
+
+def test_azure_absence_rule_can_actually_detect_absence():
+    """`summarize` with no `by` returns a row of 0 when nothing matched. Add a
+    `by` clause, or drop the summarize, and the query returns no rows at all --
+    so the rule silently never fires."""
+    text = BICEP.read_text()
+    rule = text[text.index("no-successful-run"):text.index("device-errors")]
+    summarize = [ln.strip() for ln in rule.splitlines() if ln.strip().startswith("| summarize")]
+    assert summarize == ["| summarize completed = count()"], (
+        f"the absence query's summarize must have no `by` clause, got {summarize}"
+    )
+    assert "'LessThan'" in rule and "threshold: 1" in rule
+
+
+def test_aws_deploys_both_alarms():
+    text = TERRAFORM.read_text()
+    assert 'resource "aws_cloudwatch_metric_alarm" "no_successful_run"' in text
+    assert 'resource "aws_cloudwatch_metric_alarm" "device_errors"' in text
+    assert 'resource "aws_sns_topic" "alerts"' in text
+
+
+def test_aws_absence_alarm_treats_missing_data_as_breaching():
+    """The whole point of this alarm is the case where nothing was logged, which
+    produces no datapoints. With the default handling it sits in
+    INSUFFICIENT_DATA forever and never fires -- exactly when it is needed."""
+    text = TERRAFORM.read_text()
+    alarm = text[text.index('"aws_cloudwatch_metric_alarm" "no_successful_run"'):]
+    alarm = alarm[: alarm.index("resource ", 10)]
+    assert 'treat_missing_data = "breaching"' in alarm
+
+
+def test_alerting_is_optional_but_not_accidentally_disabled():
+    """Both templates gate alerting on an address being supplied, so a deploy
+    without one is not silently unmonitored-looking-monitored."""
+    assert "param alertEmail string = ''" in BICEP.read_text()
+    assert 'variable "alert_email"' in TERRAFORM.read_text()

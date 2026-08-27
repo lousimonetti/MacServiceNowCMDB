@@ -128,6 +128,12 @@ variable "timeout_seconds" {
   }
 }
 
+variable "alert_email" {
+  description = "Email for alerts. Empty disables alerting entirely."
+  type        = string
+  default     = ""
+}
+
 variable "log_retention_days" {
   description = "CloudWatch log retention."
   type        = number
@@ -400,4 +406,112 @@ output "log_group" {
 output "manual_invoke_command" {
   description = "Run the sync immediately, without waiting for the schedule."
   value       = "aws lambda invoke --function-name ${aws_lambda_function.sync.function_name} --cli-binary-format raw-in-base64-out --payload '{\"dry_run\":true}' /dev/stdout"
+}
+
+# ---------------------------------------------------------------------------
+# Alerting
+#
+# Log-based rather than metric-based: the run summary is a structured JSON line,
+# and what is worth alerting on -- did it run at all, did devices fail -- lives
+# in its fields rather than in Lambda's platform metrics. Lambda's own Errors
+# metric would not fire here anyway: the handler returns a summary rather than
+# raising, so a failed sync is a successful invocation.
+# ---------------------------------------------------------------------------
+
+locals {
+  enable_alerts = var.alert_email != ""
+}
+
+resource "aws_sns_topic" "alerts" {
+  count = local.enable_alerts ? 1 : 0
+  name  = "${var.name}-alerts"
+}
+
+resource "aws_sns_topic_subscription" "alerts_email" {
+  count     = local.enable_alerts ? 1 : 0
+  topic_arn = aws_sns_topic.alerts[0].arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+  # AWS emails a confirmation link; the subscription is inert until clicked.
+}
+
+resource "aws_cloudwatch_log_metric_filter" "run_complete" {
+  count          = local.enable_alerts ? 1 : 0
+  name           = "${var.name}-run-complete"
+  log_group_name = aws_cloudwatch_log_group.lambda.name
+  pattern        = "{ $.msg = \"run complete\" }"
+
+  metric_transformation {
+    name          = "RunsCompleted"
+    namespace     = "IntuneCmdbSync"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_log_metric_filter" "device_errors" {
+  count          = local.enable_alerts ? 1 : 0
+  name           = "${var.name}-device-errors"
+  log_group_name = aws_cloudwatch_log_group.lambda.name
+  pattern        = "{ $.msg = \"run complete\" && $.errors > 0 }"
+
+  metric_transformation {
+    name          = "DeviceErrors"
+    namespace     = "IntuneCmdbSync"
+    value         = "$.errors"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "no_successful_run" {
+  count             = local.enable_alerts ? 1 : 0
+  alarm_name        = "${var.name}-no-successful-run"
+  alarm_description = <<-DESC
+    No completed run in the last 24 hours. Either the schedule stopped firing or
+    every attempt failed before finishing. Nothing else will tell you: the CMDB
+    simply goes stale.
+  DESC
+
+  namespace           = "IntuneCmdbSync"
+  metric_name         = "RunsCompleted"
+  statistic           = "Sum"
+  period              = 86400
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "LessThanThreshold"
+
+  # The point of this alarm is the case where nothing was logged at all, which
+  # produces no datapoints. Without this the alarm sits in INSUFFICIENT_DATA
+  # forever and never fires -- precisely when it is most needed.
+  treat_missing_data = "breaching"
+
+  alarm_actions = [aws_sns_topic.alerts[0].arn]
+  ok_actions    = [aws_sns_topic.alerts[0].arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "device_errors" {
+  count             = local.enable_alerts ? 1 : 0
+  alarm_name        = "${var.name}-device-errors"
+  alarm_description = <<-DESC
+    A run finished but individual devices failed to write. Read the per-device
+    outcomes in run-report.json in the state bucket; error_samples in the
+    summary line carries the first twenty.
+  DESC
+
+  namespace           = "IntuneCmdbSync"
+  metric_name         = "DeviceErrors"
+  statistic           = "Sum"
+  period              = 21600
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+
+  # A quiet period here genuinely means no errors were reported.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.alerts[0].arn]
+}
+
+output "alerts_enabled" {
+  value = local.enable_alerts
 }

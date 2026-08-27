@@ -142,28 +142,33 @@ aws logs filter-log-events \
 
 ### Alerting
 
-```bash
-aws cloudwatch put-metric-alarm \
-  --alarm-name intune-cmdb-sync-failures \
-  --metric-name Errors --namespace AWS/Lambda \
-  --dimensions Name=FunctionName,Value=intune-cmdb-sync \
-  --statistic Sum --period 86400 --evaluation-periods 1 \
-  --threshold 0 --comparison-operator GreaterThanThreshold
+Set `alert_email` and the alarms are created for you, with an SNS topic:
+
+```hcl
+alert_email = "ops@example.com"
 ```
 
-That catches a crashed invocation. It does **not** catch a run that completed
-with device-level errors — the handler returns a non-zero `exit_code` rather than
-raising, so the scheduler does not retry a partial sync against a healthy
-instance. For that, add a metric filter on the structured log:
+| Alarm | Fires when |
+| --- | --- |
+| `<name>-no-successful-run` | no `run complete` line in 24 hours |
+| `<name>-device-errors` | a run finished with `errors > 0` |
 
-```bash
-aws logs put-metric-filter \
-  --log-group-name /aws/lambda/intune-cmdb-sync \
-  --filter-name device-errors \
-  --filter-pattern '{ $.msg = "run complete" && $.errors > 0 }' \
-  --metric-transformations \
-      metricName=IntuneCmdbSyncDeviceErrors,metricNamespace=IntuneCmdbSync,metricValue=1
-```
+Leave it unset and no alerting resources are created — deliberately, so a
+deployment is never *almost* monitored. AWS emails a subscription confirmation
+link; the topic delivers nothing until it is clicked.
+
+Two details worth knowing, because both are easy to get wrong by hand:
+
+**The absence alarm sets `treat_missing_data = "breaching"`.** Its entire
+purpose is the case where nothing was logged, which produces no datapoints.
+With CloudWatch's default handling the alarm sits in `INSUFFICIENT_DATA`
+forever and never fires — precisely when you need it.
+
+**Lambda's own `Errors` metric will not fire for a failed sync.** The handler
+returns a summary rather than raising, so that the scheduler does not retry a
+partial sync against a healthy instance — which means a failed run is a
+*successful* invocation as far as Lambda is concerned. Both alarms are therefore
+driven by metric filters over the structured log, not by platform metrics.
 
 ## Teardown
 

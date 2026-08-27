@@ -48,6 +48,18 @@ param containerImage string = 'ghcr.io/your-org/intune-cmdb-sync:latest'
 @description('Cron schedule in UTC. Default: 03:15 every day.')
 param cronExpression string = '15 3 * * *'
 
+@description('''
+Email address for alerts. Leave empty to skip creating alert rules entirely.
+
+Two rules are created when set:
+  - no successful run in the last 24 hours
+  - a run finished with device-level errors
+
+The first matters more. A job that stops running is otherwise invisible: there
+is no failure to notice, just a CMDB that quietly goes stale.
+''')
+param alertEmail string = ''
+
 @description('ServiceNow instance: short name, host, or full https URL.')
 param serviceNowInstance string
 
@@ -129,6 +141,8 @@ var storageName = take('${namePrefix}st${suffix}', 24)
 var workspaceName = '${namePrefix}-logs'
 var environmentName = '${namePrefix}-env'
 var jobName = '${namePrefix}-job'
+var actionGroupName = '${namePrefix}-alerts'
+var enableAlerts = !empty(alertEmail)
 var shareName = 'state'
 var storageMountName = 'statemount'
 var stateMountPath = '/var/lib/intune-cmdb-sync'
@@ -392,6 +406,126 @@ Client ID of the managed identity. In managed_identity mode this is the identity
 that must hold the Graph application permissions. In client_secret mode it is
 only used to read Key Vault.
 ''')
+// ---------------------------------------------------------------------------
+// Alerting
+//
+// Log-based rather than metric-based: the run summary is a structured JSON line,
+// and the things worth alerting on (did it run at all, did devices fail) are
+// fields in it rather than platform metrics.
+// ---------------------------------------------------------------------------
+
+resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = if (enableAlerts) {
+  name: actionGroupName
+  location: 'global'
+  properties: {
+    groupShortName: take(namePrefix, 12)
+    enabled: true
+    emailReceivers: [
+      {
+        name: 'primary'
+        emailAddress: alertEmail
+        useCommonAlertSchema: true
+      }
+    ]
+  }
+}
+
+resource noRunAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' =
+  if (enableAlerts) {
+    name: '${namePrefix}-no-successful-run'
+    location: location
+    properties: {
+      displayName: '${jobName}: no successful run in 24 hours'
+      description: '''
+The job has not logged a completed run in the last 24 hours. Either the schedule
+stopped firing, or every attempt failed before finishing. The CMDB is going
+stale and nothing else will tell you.
+'''
+      severity: 1
+      enabled: true
+      scopes: [ workspace.id ]
+      // Checked hourly over a 24h window. A daily 03:15 schedule always has a
+      // completed run inside a 24h window when healthy, so a miss is real.
+      evaluationFrequency: 'PT1H'
+      windowSize: 'P1D'
+      criteria: {
+        allOf: [
+          {
+            // summarize with no `by` yields a row of 0 when nothing matched,
+            // which is what makes absence detectable at all.
+            query: '''
+ContainerAppConsoleLogs_CL
+| where ContainerJobName_s == '${jobName}'
+| extend p = parse_json(Log_s)
+| where tostring(p.msg) == 'run complete'
+| summarize completed = count()
+'''
+            timeAggregation: 'Total'
+            metricMeasureColumn: 'completed'
+            operator: 'LessThan'
+            threshold: 1
+            failingPeriods: {
+              numberOfEvaluationPeriods: 1
+              minFailingPeriodsToAlert: 1
+            }
+          }
+        ]
+      }
+      autoMitigate: true
+      actions: {
+        actionGroups: [ actionGroup!.id ]
+      }
+    }
+  }
+
+resource deviceErrorAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' =
+  if (enableAlerts) {
+    name: '${namePrefix}-device-errors'
+    location: location
+    properties: {
+      displayName: '${jobName}: run completed with device errors'
+      description: '''
+A run finished but individual devices failed to write. Read the per-device
+outcomes in run-report.json on the state share; error_samples in the summary
+line carries the first twenty.
+'''
+      severity: 2
+      enabled: true
+      scopes: [ workspace.id ]
+      evaluationFrequency: 'PT1H'
+      windowSize: 'PT6H'
+      criteria: {
+        allOf: [
+          {
+            query: '''
+ContainerAppConsoleLogs_CL
+| where ContainerJobName_s == '${jobName}'
+| extend p = parse_json(Log_s)
+| where tostring(p.msg) == 'run complete'
+| extend failed = toint(p.errors)
+| where failed > 0
+| summarize failed = sum(failed)
+'''
+            timeAggregation: 'Total'
+            metricMeasureColumn: 'failed'
+            operator: 'GreaterThan'
+            threshold: 0
+            failingPeriods: {
+              numberOfEvaluationPeriods: 1
+              minFailingPeriodsToAlert: 1
+            }
+          }
+        ]
+      }
+      autoMitigate: true
+      actions: {
+        actionGroups: [ actionGroup!.id ]
+      }
+    }
+  }
+
+output alertsEnabled bool = enableAlerts
+
 output managedIdentityClientId string = identity.properties.clientId
 
 @description('Object ID of the managed identity service principal. Used for the app-role grant.')

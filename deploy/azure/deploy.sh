@@ -114,6 +114,7 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
       serviceNowClientSecret="$SNOW_CLIENT_SECRET" \
       retireMissingDevices="${RETIRE_MISSING:-false}" \
       dryRun="${DRY_RUN:-false}" \
+      alertEmail="${ALERT_EMAIL:-}" \
   --query properties.outputs \
   --output json)
 
@@ -173,6 +174,7 @@ Deployed.
   Schedule         ${CRON} (UTC)
   Graph auth       ${GRAPH_AUTH_MODE}
   Intune tenant    ${GRAPH_TENANT_ID}
+  Alerts           ${ALERT_EMAIL:-NONE - set ALERT_EMAIL to be told when runs stop}
 
 Verify the whole path end to end before trusting the schedule:
 

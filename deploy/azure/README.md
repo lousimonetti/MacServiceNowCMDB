@@ -155,7 +155,29 @@ az monitor log-analytics query --workspace "$WORKSPACE" --analytics-query "
 
 ### Alerting
 
-Because logs are structured JSON, the run summary is directly queryable:
+Set `ALERT_EMAIL` before `./deploy.sh` and two alert rules are deployed with an
+action group:
+
+| Rule | Fires when | Severity |
+| --- | --- | --- |
+| `<prefix>-no-successful-run` | no `run complete` line in 24 hours | 1 |
+| `<prefix>-device-errors` | a run finished with `errors > 0` | 2 |
+
+```bash
+export ALERT_EMAIL=ops@example.com
+./deploy.sh
+```
+
+Leave it unset and no alert resources are created at all — deliberately, so a
+deployment is never *almost* monitored.
+
+The first rule is the one that matters. A job that stops firing produces no
+error to notice; the CMDB just goes quietly stale. Its query ends in
+`summarize completed = count()` with **no `by` clause**, which is what makes
+absence detectable: that form returns a row of `0` when nothing matched, where a
+grouped form would return no rows and the rule would never fire.
+
+Because logs are structured JSON, the run summary is also directly queryable:
 
 ```kusto
 ContainerAppConsoleLogs_CL
@@ -169,7 +191,15 @@ ContainerAppConsoleLogs_CL
           unresolved_users = toint(p.users_unresolved)
 ```
 
-Alert when `errors > 0`, or when no `run complete` line appears in 26 hours.
+Both deployed rules use exactly this shape. Filter by `run_id` to isolate a
+single run:
+
+```kusto
+ContainerAppConsoleLogs_CL
+| extend p = parse_json(Log_s)
+| where p.run_id == "<id from run-report.json>"
+| order by TimeGenerated asc
+```
 
 ## Changing configuration
 
