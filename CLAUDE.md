@@ -89,28 +89,44 @@ behaviour change, particularly anything altering what gets written to a CI.
   list makes the rest of the fleet look like it vanished, and a small limit makes
   the missing fraction large enough that the percentage guard is not a reliable
   backstop. Never remove that short-circuit.
+- **`403 Access to unscoped api is not allowed` is not a role problem.** It is
+  the *OAuth client* being refused the API at the gate, before any ACL, role, or
+  payload check: a Zurich Application Registry entry with **Scope Restriction =
+  Securely Scoped** may only call REST APIs that have a REST API Auth Scope
+  linked to it, bound per API *and per HTTP method*. Adding `itil` changes
+  nothing. The tell is in the run report — `users_resolved > 0` with real
+  sys_ids means the same credential already reads the Table API fine, and the
+  403 carries `X-Is-Logged-In: true`. **`SNOW_WRITE_MODE=cmdb_instance` is not a
+  workaround**: `/api/now/cmdb/instance/…` is a global-scope `/api/now/` API
+  behind the same gate, confirmed refused identically. The fix is a REST API
+  Auth Scope for `POST` on both `/api/now/identifyreconcile` and
+  `/api/now/identifyreconcile/query`, or Scope Restriction = Broadly Scoped.
 
 ## State of the work
 
-The Microsoft Graph half is verified against a live tenant. **The ServiceNow
-half has never touched a live instance** — the 278 tests mock at the HTTP
-boundary with `respx`, and those fixtures were written from vendor
-documentation, not observed responses. Green tests are weaker evidence here
-than they look.
+The Microsoft Graph half is verified against a live tenant. On the ServiceNow
+half, **reads are now verified against a live instance and writes are not**: as
+of 2026-08-28 a `--dry-run --limit 5` reached the instance, resolved real
+`sys_user` sys_ids, and was then refused on every write by the unscoped-api gate
+described under Constraints. Nothing has ever been written to a live CMDB, and
+the 278 tests mock at the HTTP boundary with `respx` from vendor documentation,
+not observed responses. Green tests are weaker evidence here than they look.
 
 ## Next steps
 
-1. **Get a ServiceNow instance.** A free Personal Developer Instance is enough;
-   IRE is base platform. Then follow `docs/servicenow-setup.md` §2 (grant
-   `itil`) and §5 (create the discovery source choice value — skipping it
-   produces `Invalid data source`).
+1. **Blocked: get the OAuth client authorized for the IRE API.** The instance
+   exists and reads work; every write is refused by the unscoped-api gate (see
+   Constraints). This is with the ServiceNow admin. Until it clears, nothing
+   below can run — `SNOW_AUTH_MODE=basic` sidesteps it for local testing only,
+   since the restriction is on the OAuth entity rather than the user.
 2. **`intune-cmdb-sync --check`.** Proves both connections *and* simulates a
    write through `/api/now/identifyreconcile/query`, which commits nothing — so
    a missing `itil` role or an unregistered discovery source fails here rather
    than on the first real run. Exit 4 means the write path could not be
    simulated (older release, or `cmdb_instance` mode), which is not the same as
    a pass. Note `itil` does not always carry `sys_properties` read, so a 403 on
-   the connectivity probe can be a red herring.
+   the connectivity probe can be a red herring — as is the message this check
+   prints on 403, which blames `itil` for what is usually the OAuth scope gate.
 3. **`--dry-run --limit 5 --report-devices --report ./run.json`.** Confirm the `operation`
    values IRE actually returns against `_OPERATION_TO_ACTION` in `writers.py`.
    The dry run uses `/identifyreconcile/query`, a *different* endpoint whose

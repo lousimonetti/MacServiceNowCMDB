@@ -40,6 +40,19 @@ IDENTIFY_RECONCILE_QUERY_API = "/api/now/identifyreconcile/query"
 # could not collide with a real CI.
 PROBE_SOURCE_KEY = "intune-cmdb-sync:write-access-probe"
 
+# ServiceNow refuses an OAuth client that is not authorised for a global-scope
+# API *before* it looks at roles or ACLs, and the response says only "User Not
+# Authorized". Left unexplained that reads as a missing `itil` role, which is
+# the one thing that cannot fix it.
+_UNSCOPED_API_MARKER = "unscoped api"
+_UNSCOPED_API_HINT = (
+    " This is the OAuth client being refused the API at the gate, not a missing role: "
+    "the Application Registry entry is Securely Scoped and has no REST API Auth Scope "
+    "linked for POST on this API. Adding 'itil' will not change it, and "
+    "SNOW_WRITE_MODE=cmdb_instance is behind the same gate. "
+    "See docs/servicenow-setup.md."
+)
+
 # IRE `operation` values mapped onto the connector's outcome vocabulary.
 _OPERATION_TO_ACTION = {
     "INSERT": "inserted",
@@ -138,8 +151,10 @@ class IdentifyReconcileWriter:
             # IRE returns its log context id even on failure, and it is the only
             # handle that ties this request to what ServiceNow recorded on its
             # own side. Without it, a support case starts from a timestamp.
+            detail = describe_error(response)
             raise ServiceNowError(
-                f"identifyreconcile ({len(batch)} items) failed: {describe_error(response)}"
+                f"identifyreconcile ({len(batch)} items) failed: {detail}"
+                f"{_unscoped_api_suffix(detail)}"
                 f"{_log_context_suffix(_log_context_id(response))}"
             )
 
@@ -293,9 +308,15 @@ def verify_write_access(client: ServiceNowClient, cfg: ServiceNowConfig) -> Writ
         )
 
     if response.status_code in (401, 403):
+        detail = describe_error(response)
+        if _unscoped_api_suffix(detail):
+            raise ServiceNowError(
+                f"the Identification and Reconciliation API is not available to these "
+                f"credentials: {detail}.{_unscoped_api_suffix(detail)}"
+            )
         raise ServiceNowError(
             f"the integration user cannot use the Identification and Reconciliation API: "
-            f"{describe_error(response)}. It needs the 'itil' or 'asset' role."
+            f"{detail}. It needs the 'itil' or 'asset' role."
         )
 
     if not response.is_success:
@@ -365,8 +386,11 @@ class CmdbInstanceWriter:
             return WriteResult(intune_id=item.intune_id, action="error", errors=[str(exc)])
 
         if not response.is_success:
+            detail = describe_error(response)
             return WriteResult(
-                intune_id=item.intune_id, action="error", errors=[describe_error(response)]
+                intune_id=item.intune_id,
+                action="error",
+                errors=[f"{detail}{_unscoped_api_suffix(detail)}"],
             )
 
         result = (response.json() or {}).get("result") or {}
@@ -391,6 +415,16 @@ class CmdbInstanceWriter:
         updated = attributes.get("sys_updated_on")
         action = "inserted" if created and created == updated else "updated"
         return WriteResult(intune_id=item.intune_id, action=action, sys_id=str(sys_id))
+
+
+def _unscoped_api_suffix(detail: str) -> str:
+    """Explain a "User Not Authorized / Access to unscoped api" refusal.
+
+    Confirmed live on 2026-08-28 against both `/api/now/identifyreconcile` and
+    `/api/now/cmdb/instance/{class}`, on a credential whose Table API reads were
+    working in the same run.
+    """
+    return _UNSCOPED_API_HINT if _UNSCOPED_API_MARKER in detail.lower() else ""
 
 
 def _log_context_id(response: Any) -> str | None:

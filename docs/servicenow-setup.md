@@ -234,6 +234,7 @@ message that names the cause. Run it before scheduling anything.
 | --- | --- |
 | `401 User Not Authenticated` | The OAuth Application User field on the Application Registry entry is empty. |
 | `403` / `insufficient rights` | The integration user lacks `itil` or `asset`. |
+| `403 Access to unscoped api is not allowed` | Not a role. The OAuth client is refused the API at the gate: its Application Registry entry is **Securely Scoped** and has no **REST API Auth Scope** linked for `POST` on this API. Link one covering both `/api/now/identifyreconcile` and `/api/now/identifyreconcile/query`, or set **Scope Restriction = Broadly Scoped**. `SNOW_WRITE_MODE=cmdb_instance` is behind the same gate and is not a workaround; `SNOW_AUTH_MODE=basic` sidesteps it for local testing, because the restriction is on the OAuth entity rather than the user. Reads keep working throughout, so a run report with `users_resolved > 0` and every device in error is the signature. |
 | `Invalid data source` | Step 5 was skipped, or `SNOW_DISCOVERY_SOURCE` does not match the choice value exactly. |
 | `Required_Attribute_Empty` | The identification rule for the class requires an attribute the payload omits. Check **CI Class Manager > Identification/Reconciliation** for `cmdb_ci_computer`. |
 | `404` on `/api/now/identifyreconcile` | The release predates the IRE API. Fall back to `SNOW_WRITE_MODE=cmdb_instance`. |
