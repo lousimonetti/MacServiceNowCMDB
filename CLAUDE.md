@@ -43,6 +43,15 @@ behaviour change, particularly anything altering what gets written to a CI.
   mass-retirement guard or a failed state write returns 4 even without
   `--fail-on-error`, because both leave the *next* run unable to reason about
   the fleet. See `RunReport.degraded`.
+- **`intune-cmdb-query` is the read-only half.** `cmdb_report.py` + `query_cli.py`
+  issue `GET /api/now/table/...` and nothing else, so they run against an
+  instance whose write path is still blocked by the unscoped-api gate. It reads
+  with `sysparm_display_value=all` because `manufacturer` / `model_id` /
+  `assigned_to` are references whose raw value is a sys_id; `query_table` keeps
+  asking for raw values because the resolvers depend on that, so the reader
+  issues its own request rather than adding a mode to a shared method. Keep it
+  write-free — that property is what makes it safe to point at production.
+
 - **Graph data calls are plain REST, deliberately** — `azure-identity` handles
   tokens, but `msgraph-sdk` is not used. Do not add it.
 

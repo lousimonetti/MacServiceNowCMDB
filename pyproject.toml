@@ -39,6 +39,7 @@ dev = [
 
 [project.scripts]
 intune-cmdb-sync = "intune_cmdb_sync.__main__:main"
+intune-cmdb-query = "intune_cmdb_sync.query_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/your-org/intune-cmdb-sync"

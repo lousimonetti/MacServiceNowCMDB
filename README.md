@@ -61,6 +61,8 @@ set -a && . ./.env && set +a
 intune-cmdb-sync --check         # prove both systems work, including writes
 intune-cmdb-sync --dry-run       # run IRE identification, write nothing
 intune-cmdb-sync                 # commit
+
+intune-cmdb-query                # read back what landed on the CIs
 ```
 
 `--dry-run` is not a simulation. It posts to `/api/now/identifyreconcile/query`,
@@ -248,6 +250,38 @@ credential model, not cost. Full workings are in the deployment READMEs.
 
 ## Operating it
 
+### Inspecting the CMDB
+
+`intune-cmdb-query` reads CIs back and reports what is on them. It only ever
+issues `GET /api/now/table/...` — no IRE post, no PATCH — so it is safe to point
+at production, and it works even where the write path does not.
+
+```bash
+intune-cmdb-query                                   # every CI on SNOW_DISCOVERY_SOURCE
+intune-cmdb-query --serial C02XY1234 --format detail
+intune-cmdb-query --intune-id <device-guid>         # by correlation field
+intune-cmdb-query --format json --output ./cmdb.json
+```
+
+Selectors are AND-ed. Reference fields are fetched with display values, so
+`model_id` reads `MacBook Pro (16-inch, 2023)` rather than a sys_id — with the
+sys_id still shown in `detail` and `json`. Results page automatically, and a
+read that hits `--limit` says so rather than quietly under-reporting the fleet.
+
+It also flags the conditions that mean the mapping landed wrong:
+
+| Finding | What it means |
+| --- | --- |
+| `missing_serial` | IRE cannot identify the CI by hardware; a re-run may insert a duplicate |
+| `duplicate_serial_number` | Two CIs on one serial — IRE is one payload away from collapsing them |
+| `unresolved_manufacturer` / `unresolved_model_id` | The reference lookup found no match, so the field was omitted |
+| `unassigned` | `SNOW_ASSIGN_USER` is on but no `sys_user` matched |
+| `unexpected_install_status` | Not the configured active value; the retirement value means it was retired |
+| `missing_correlation` | No Intune device id on the CI — matched on serial alone, or predates the connector |
+
+Findings are advisory and exit 0 by default. `--fail-on-findings` exits 4 for
+use in a scheduled check; `--no-findings` skips the checks entirely.
+
 ### Run report
 
 `--report` writes a machine-readable summary suitable for alerting:
@@ -306,6 +340,8 @@ src/intune_cmdb_sync/
   servicenow/
     auth.py            client_credentials / password / basic
     writers.py         the two CMDB write paths
+  cmdb_report.py       read-only CMDB queries + CI validation checks
+  query_cli.py         `intune-cmdb-query` entry point
   sync.py              orchestration
   state.py             Intune id → CI sys_id, for retirement
   storage.py           state on local disk or S3
@@ -315,7 +351,7 @@ servicenow-app/        ServiceNow SDK (Fluent) app: discovery source, role, prop
 deploy/azure/          Bicep + deploy script
 deploy/aws/            Terraform + Lambda Dockerfile
 docs/                  setup guides, design documents, field mapping reference
-tests/                 269 tests, both APIs mocked at the HTTP boundary
+tests/                 362 tests, both APIs mocked at the HTTP boundary
 ```
 
 The `servicenow-app/` directory ships no runtime logic. It captures the
