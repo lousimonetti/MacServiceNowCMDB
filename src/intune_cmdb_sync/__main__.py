@@ -19,7 +19,7 @@ from .logging_setup import configure_logging
 from .models import RunReport
 from .servicenow.client import ServiceNowClient
 from .servicenow.probe import format_report, probe_endpoints
-from .servicenow.writers import verify_write_access
+from .servicenow.writers import register_discovery_source, verify_write_access
 from .storage import build_state_store
 from .sync import SyncRunner
 
@@ -75,6 +75,17 @@ def build_parser() -> argparse.ArgumentParser:
             "cannot create a CI even when fully authorized) and does not touch Graph. Run "
             "this when a run fails with 'User Not Authorized'. Exits 3 if the endpoint the "
             "configured write mode uses is refused."
+        ),
+    )
+    parser.add_argument(
+        "--register-discovery-source",
+        action="store_true",
+        help=(
+            "Create SNOW_DISCOVERY_SOURCE as a choice value on cmdb_ci.discovery_source, "
+            "then exit. Every CMDB write is rejected until that value exists, and this is "
+            "the same row a ServiceNow admin would add by hand. Writes one configuration "
+            "record and no CI data; if the credential lacks the role, it prints the record "
+            "for someone who has it. Never runs as part of a sync."
         ),
     )
     parser.add_argument("--log-level", help="Override LOG_LEVEL (DEBUG, INFO, WARNING, ERROR).")
@@ -153,6 +164,19 @@ def _write_report(report: RunReport, location: str | None, include_devices: bool
         # it does mean the diagnostics for this run no longer exist.
         report.warnings.append(f"could not write run report to {location}: {exc}")
         log.error("could not write run report", extra={"path": location, "error": str(exc)})
+
+
+def _register_discovery_source(cfg: Config) -> int:
+    """Create the discovery-source choice value, on explicit request only.
+
+    Kept off every other path on purpose: this writes to a configuration table,
+    and a connector that edited choice lists as a side effect of syncing devices
+    would be a much worse thing to operate than one that waits to be asked.
+    """
+    with ServiceNowClient(cfg.servicenow) as snow:
+        detail = register_discovery_source(snow, cfg.servicenow)
+    log.info("%s", detail)
+    return EXIT_OK
 
 
 def _check_api(cfg: Config) -> int:
@@ -261,6 +285,9 @@ def _run(args: argparse.Namespace) -> int:
     )
 
     try:
+        if args.register_discovery_source:
+            return _register_discovery_source(cfg)
+
         if args.check_api:
             return _check_api(cfg)
 

@@ -69,7 +69,12 @@ behaviour change, particularly anything altering what gets written to a CI.
   `sys_choice` holds one row per language, so a listing is duplicated noise that
   cannot prove absence past its row limit either. A determined absence **fails**
   the check (exit 3), including a case-only near-miss; only an unreadable
-  `sys_choice` is a caveat.
+  `sys_choice` is a caveat. On dpsnowdev (2026-09-04) nothing resembling
+  "Intune" is registered at all. `--register-discovery-source` creates the row
+  via `POST /api/now/table/sys_choice` — which `--check-api` says this
+  credential may call — and prints the record for an admin when ACLs refuse.
+  Keep it on its own flag: a connector that edited choice lists as a side
+  effect of syncing devices would be far worse to operate.
 
 - **The CMDB Instance API takes strings only.** `POST
   /api/now/cmdb/instance/{class}` deserialises `attributes` as String->String

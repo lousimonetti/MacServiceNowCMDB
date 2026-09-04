@@ -121,6 +121,54 @@ class TestRun:
         assert main([]) == EXIT_OK
 
 
+class TestRegisterDiscoverySourceCli:
+    """A configuration write, so it must happen only when explicitly asked."""
+
+    CHOICE = "https://acme.service-now.com/api/now/table/sys_choice"
+
+    @respx.mock
+    def test_the_flag_creates_the_choice_and_exits_zero(self, set_env, capsys):
+        set_env()
+        respx.get(self.CHOICE).mock(
+            side_effect=[
+                httpx.Response(200, json={"result": []}),
+                httpx.Response(200, json={"result": [{"value": "Intune"}]}),
+            ]
+        )
+        create = respx.post(self.CHOICE).mock(
+            return_value=httpx.Response(201, json={"result": {"sys_id": "choice-1"}})
+        )
+
+        assert main(["--register-discovery-source"]) == EXIT_OK
+        assert create.call_count == 1
+        assert "registered 'Intune'" in capsys.readouterr().out
+
+    @respx.mock
+    def test_a_refusal_exits_three(self, set_env):
+        set_env()
+        respx.get(self.CHOICE).mock(return_value=httpx.Response(200, json={"result": []}))
+        respx.post(self.CHOICE).mock(return_value=httpx.Response(403, text="no rights"))
+        assert main(["--register-discovery-source"]) == EXIT_FAILED
+
+    @respx.mock
+    def test_no_other_invocation_touches_sys_choice_writes(self, set_env):
+        """A connector that edited choice lists while syncing devices would be a
+        far worse thing to operate than one that waits to be asked."""
+        set_env()
+        respx.get(DEVICES).mock(
+            return_value=httpx.Response(200, json={"value": [make_device(id="d1")]})
+        )
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        mock_snow_plumbing()
+        respx.post(IRE).mock(return_value=ire_response("INSERT"))
+        create = respx.post(self.CHOICE)
+
+        assert main([]) == EXIT_OK
+        assert create.call_count == 0
+
+
 class TestTotalWriteFailure:
     """Observed live 2026-09-04: 17 of 17 devices failed on a malformed payload
     and the run exited 0, because "some devices failed" is an ordinary outcome.

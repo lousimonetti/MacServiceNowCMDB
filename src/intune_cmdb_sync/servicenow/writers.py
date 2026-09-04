@@ -29,7 +29,7 @@ from typing import Any, Protocol
 from ..config import ServiceNowConfig
 from ..errors import ServiceNowError
 from ..http import describe_error
-from .client import CMDB_INSTANCE_API, ServiceNowClient
+from .client import CMDB_INSTANCE_API, TABLE_API, ServiceNowClient
 
 log = logging.getLogger(__name__)
 
@@ -461,6 +461,94 @@ def _verify_cmdb_instance_access(
     )
 
 
+DISCOVERY_SOURCE_CHOICE = {"name": "cmdb_ci", "element": "discovery_source"}
+
+
+def similar_discovery_sources(client: ServiceNowClient, cfg: ServiceNowConfig) -> list[str]:
+    """Registered `cmdb_ci.discovery_source` values resembling the configured one.
+
+    `valueLIKE` matches a substring case-insensitively, so "Intune" finds
+    "Microsoft Intune" and vice versa. Deduplicated, because `sys_choice` holds
+    one row per language, and filtered to active choices, because a disabled one
+    is present without being usable.
+    """
+    rows = client.query_table(
+        "sys_choice",
+        query=(
+            f"name={DISCOVERY_SOURCE_CHOICE['name']}"
+            f"^element={DISCOVERY_SOURCE_CHOICE['element']}"
+            f"^valueLIKE{cfg.discovery_source}"
+        ),
+        fields=("value", "inactive"),
+        limit=100,
+    )
+    values: list[str] = []
+    for row in rows:
+        value = str(row.get("value") or "")
+        if not value or str(row.get("inactive") or "").lower() in ("true", "1"):
+            continue
+        if value not in values:
+            values.append(value)
+    return values
+
+
+def register_discovery_source(client: ServiceNowClient, cfg: ServiceNowConfig) -> str:
+    """Create the `cmdb_ci.discovery_source` choice value this run needs.
+
+    Adding a choice value is normally a ServiceNow admin action through System
+    Definition > Choice Lists, and on an instance where the admin team is the
+    bottleneck that is a wait for a single row. `POST /api/now/table/sys_choice`
+    is the same operation, and `--check-api` reports whether this credential may
+    call it -- the 2026-09-04 probe says it may.
+
+    Deliberately behind its own CLI flag and never part of a sync: it writes to
+    a configuration table, and a connector that quietly edited choice lists
+    while syncing devices would be a much worse thing to own. Refusal on ACL
+    grounds is a normal outcome, not a bug -- `sys_choice` writes usually want
+    `admin` or `personalize_choices` -- so the failure path prints the exact
+    record for someone who has it.
+    """
+    if cfg.discovery_source in similar_discovery_sources(client, cfg):
+        return f"{cfg.discovery_source!r} is already a registered choice value; nothing to do"
+
+    record = {
+        **DISCOVERY_SOURCE_CHOICE,
+        "value": cfg.discovery_source,
+        "label": cfg.discovery_source,
+        "inactive": "false",
+        "language": "en",
+    }
+    response = client.request("POST", f"{TABLE_API}/sys_choice", json_body=record)
+
+    if not response.is_success:
+        detail = describe_error(response)
+        raise ServiceNowError(
+            f"could not create the choice value: {detail}"
+            f"{_unscoped_api_suffix(detail, path=f'{TABLE_API}/sys_choice')}"
+            " Writing sys_choice usually needs the 'admin' or 'personalize_choices' role, "
+            "which an integration user does not normally carry. Ask a ServiceNow admin to "
+            "create exactly this record (System Definition > Choice Lists > New): "
+            + ", ".join(f"{k}={v!r}" for k, v in record.items())
+        )
+
+    # Read it back rather than trusting the 201: a business rule or data policy
+    # can accept the insert and store something else, and the next thing that
+    # happens is a device write that has to match this value exactly.
+    confirmed = similar_discovery_sources(client, cfg)
+    if cfg.discovery_source not in confirmed:
+        raise ServiceNowError(
+            f"the choice value was submitted but {cfg.discovery_source!r} is still not "
+            f"readable on cmdb_ci.discovery_source (found: {confirmed or 'nothing similar'}). "
+            "Check for a business rule or data policy on sys_choice before writing devices."
+        )
+
+    sys_id = ((response.json() or {}).get("result") or {}).get("sys_id")
+    return (
+        f"registered {cfg.discovery_source!r} as a choice value on "
+        f"cmdb_ci.discovery_source (sys_choice sys_id={sys_id}); writes will now be accepted"
+    )
+
+
 def _discovery_source_caveats(client: ServiceNowClient, cfg: ServiceNowConfig) -> list[str]:
     """Check `SNOW_DISCOVERY_SOURCE` against the registered choice values.
 
@@ -476,28 +564,14 @@ def _discovery_source_caveats(client: ServiceNowClient, cfg: ServiceNowConfig) -
     outcomes distinguishable: registered, registered under a different
     spelling, or genuinely absent.
     """
-    query = f"name=cmdb_ci^element=discovery_source^valueLIKE{cfg.discovery_source}"
     try:
-        rows = client.query_table(
-            "sys_choice", query=query, fields=("value", "inactive"), limit=100
-        )
+        candidates = similar_discovery_sources(client, cfg)
     except ServiceNowError as exc:
         return [
             f"could not read sys_choice to confirm SNOW_DISCOVERY_SOURCE="
             f"{cfg.discovery_source!r} is registered ({exc}); an unregistered value is "
             "rejected on every write"
         ]
-
-    # sys_choice carries one row per language, so the same value comes back
-    # several times; and an inactive choice is not usable even though it is
-    # present.
-    candidates: list[str] = []
-    for row in rows:
-        value = str(row.get("value") or "")
-        if not value or str(row.get("inactive") or "").lower() in ("true", "1"):
-            continue
-        if value not in candidates:
-            candidates.append(value)
 
     if cfg.discovery_source in candidates:
         return []
