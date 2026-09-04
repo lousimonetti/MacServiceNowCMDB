@@ -64,8 +64,12 @@ behaviour change, particularly anything altering what gets written to a CI.
   exactly including case. It failed all 17 devices of the second 2026-09-04 run.
   The CMDB Instance API returns that inside an IRE result envelope, so the
   message is past the point where a raw body snippet truncates — `_ire_item_error`
-  in `writers.py` parses it out. `--check` reads the whole choice list so it can
-  name the registered values, and flags a case-only near-miss.
+  in `writers.py` parses it out. `--check` queries `valueLIKE<configured>`
+  rather than listing the choice list — a stock instance has 200+ sources and
+  `sys_choice` holds one row per language, so a listing is duplicated noise that
+  cannot prove absence past its row limit either. A determined absence **fails**
+  the check (exit 3), including a case-only near-miss; only an unreadable
+  `sys_choice` is a caveat.
 
 - **The CMDB Instance API takes strings only.** `POST
   /api/now/cmdb/instance/{class}` deserialises `attributes` as String->String

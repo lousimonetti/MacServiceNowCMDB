@@ -495,11 +495,79 @@ class TestCmdbInstanceErrorReporting:
 
 
 class TestDiscoverySourceCaveat:
-    """`--check` reads the whole choice list so a miss can name the
-    alternatives: "Intune is not registered" sends someone to a ServiceNow
-    admin, the list is often solvable in the terminal."""
+    """A stock instance carries 200+ discovery sources. Listing the first
+    twenty alphabetically answers nothing -- the live 2026-09-04 check returned
+    'ACC-Visibility' nine times over and never mentioned anything like Intune --
+    and a bounded read cannot prove absence either. So this asks for values
+    resembling the configured one instead."""
 
-    def _caveats(self, set_env, rows: list[dict]) -> list[str]:
+    def _caveats(self, set_env, rows: list[dict], *, source: str = "Intune") -> list[str]:
+        """Returns caveats; raises ServiceNowError when the value is absent."""
+        set_env(SNOW_WRITE_MODE="cmdb_instance", SNOW_DISCOVERY_SOURCE=source)
+        cfg = Config.from_env()
+        client = ServiceNowClient(cfg.servicenow)
+        client.auth._token = "snow-token"
+        client.auth._expires_at = float("inf")
+        respx.post(url__startswith=f"{SNOW}/api/now/cmdb/instance/").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "Invalid class"}})
+        )
+        self.route = respx.get(f"{SNOW}/api/now/table/sys_choice").mock(
+            return_value=httpx.Response(200, json={"result": rows})
+        )
+        return verify_write_access(client, cfg.servicenow).caveats
+
+    @respx.mock
+    def test_asks_only_for_values_resembling_the_configured_one(self, set_env):
+        self._caveats(set_env, [{"value": "Intune"}])
+        query = self.route.calls[0].request.url.params["sysparm_query"]
+        assert "valueLIKEIntune" in query
+
+    @respx.mock
+    def test_a_registered_value_produces_no_caveat(self, set_env):
+        caveats = self._caveats(set_env, [{"value": "Intune"}, {"value": "Intune Connector"}])
+        assert not any("discovery_source" in c for c in caveats)
+
+    @respx.mock
+    def test_duplicate_language_rows_are_collapsed(self, set_env):
+        """sys_choice holds one row per language, so the live check printed
+        'ACC-Visibility' seven times and 'Altiris' nine."""
+        with pytest.raises(ServiceNowError) as exc:
+            self._caveats(set_env, [{"value": "Microsoft Intune"}] * 9)
+        assert str(exc.value).count("Microsoft Intune") == 1
+
+    @respx.mock
+    def test_an_inactive_choice_is_not_offered(self, set_env):
+        """Present but unusable is not the same as registered."""
+        with pytest.raises(ServiceNowError, match="not a choice value"):
+            self._caveats(set_env, [{"value": "Intune", "inactive": "true"}])
+
+    @respx.mock
+    def test_a_case_only_difference_is_called_out_on_its_own(self, set_env):
+        """The field matches exactly, and this is the one case where the fix is
+        a config edit rather than a ServiceNow admin ticket."""
+        with pytest.raises(ServiceNowError) as exc:
+            self._caveats(set_env, [{"value": "intune"}])
+        assert "differs only by case" in str(exc.value)
+        assert "'intune' IS registered" in str(exc.value)
+
+    @respx.mock
+    def test_a_different_spelling_is_suggested(self, set_env):
+        with pytest.raises(ServiceNowError) as exc:
+            self._caveats(set_env, [{"value": "Microsoft Intune"}])
+        assert "'Microsoft Intune'" in str(exc.value)
+        assert "resemble it" in str(exc.value)
+
+    @respx.mock
+    def test_nothing_resembling_it_says_so_and_names_the_action(self, set_env):
+        with pytest.raises(ServiceNowError) as exc:
+            self._caveats(set_env, [])
+        assert "No registered value contains" in str(exc.value)
+        assert "ServiceNow admin action" in str(exc.value)
+
+    @respx.mock
+    def test_an_unreadable_choice_list_stays_a_caveat(self, set_env):
+        """Not knowing is different from knowing it is wrong, and only the
+        second should fail the check."""
         set_env(SNOW_WRITE_MODE="cmdb_instance")
         cfg = Config.from_env()
         client = ServiceNowClient(cfg.servicenow)
@@ -509,34 +577,11 @@ class TestDiscoverySourceCaveat:
             return_value=httpx.Response(400, json={"error": {"message": "Invalid class"}})
         )
         respx.get(f"{SNOW}/api/now/table/sys_choice").mock(
-            return_value=httpx.Response(200, json={"result": rows})
+            return_value=httpx.Response(403, text="no read on sys_choice")
         )
-        return verify_write_access(client, cfg.servicenow).caveats
-
-    @respx.mock
-    def test_lists_the_registered_values_when_the_configured_one_is_missing(self, set_env):
-        caveats = self._caveats(
-            set_env, [{"value": "ServiceNow"}, {"value": "SCCM"}, {"value": "JAMF"}]
-        )
-        text = " ".join(caveats)
-        assert "'SCCM'" in text and "'ServiceNow'" in text
-        assert "INVALID_INPUT_DATA" in text
-
-    @respx.mock
-    def test_calls_out_a_case_only_difference(self, set_env):
-        """This field matches exactly, and 'intune' vs 'Intune' is easy to stare
-        past in a list of twenty."""
-        caveats = self._caveats(set_env, [{"value": "intune"}, {"value": "SCCM"}])
-        assert "differs from the configured value only by case" in " ".join(caveats)
-
-    @respx.mock
-    def test_an_empty_choice_list_is_said_plainly(self, set_env):
-        assert "no choice values at all" in " ".join(self._caveats(set_env, []))
-
-    @respx.mock
-    def test_a_registered_value_produces_no_caveat(self, set_env):
-        caveats = self._caveats(set_env, [{"value": "Intune"}, {"value": "SCCM"}])
-        assert not any("discovery_source" in c for c in caveats)
+        check = verify_write_access(client, cfg.servicenow)
+        assert check.verified
+        assert any("could not read sys_choice" in c for c in check.caveats)
 
 
 class TestCmdbInstanceAbortGuard:
@@ -848,16 +893,16 @@ class TestVerifyCmdbInstanceAccess:
         assert not check.verified
 
     @respx.mock
-    def test_an_unregistered_discovery_source_is_a_caveat(self, set_env):
-        """It does not make the endpoint uncallable, but it does make the first
-        write fail, and the error alone never says where to register it."""
+    def test_an_unregistered_discovery_source_fails_the_check(self, set_env):
+        """The endpoint is still callable, but every write will be rejected.
+        Reporting that as a pass with a note attached -- which is what the live
+        2026-09-04 check did -- defeats the point of checking."""
         client, cfg = self._client(set_env)
         self._probe_route(400, json={"error": {"message": "Invalid class"}})
         self._source_registered(rows=())
 
-        check = verify_write_access(client, cfg.servicenow)
-        assert check.verified
-        assert any("cmdb_ci.discovery_source" in c for c in check.caveats)
+        with pytest.raises(ServiceNowError, match=re.escape("cmdb_ci.discovery_source")):
+            verify_write_access(client, cfg.servicenow)
 
     @respx.mock
     def test_identification_rules_are_always_flagged_as_unproven(self, set_env):

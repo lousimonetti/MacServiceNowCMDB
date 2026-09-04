@@ -422,6 +422,10 @@ def _verify_cmdb_instance_access(
             ),
         )
 
+    # Raises when the discovery source is positively absent: that is not a
+    # caveat but a determined failure, and `--check` reporting "passed" while
+    # knowing every write will be rejected is the exact thing this check exists
+    # to prevent.
     caveats = _discovery_source_caveats(client, cfg)
     caveats.append(
         "the CMDB Instance API has no simulation endpoint, so whether the identification "
@@ -460,19 +464,22 @@ def _verify_cmdb_instance_access(
 def _discovery_source_caveats(client: ServiceNowClient, cfg: ServiceNowConfig) -> list[str]:
     """Check `SNOW_DISCOVERY_SOURCE` against the registered choice values.
 
-    Reads the whole choice list rather than querying for the configured value,
-    so that a miss can name the alternatives. "Intune is not registered" sends
-    someone to a ServiceNow admin; "Intune is not registered, these eleven are"
-    is often solvable without leaving the terminal -- and it catches the
-    case-and-spacing near-misses this field is prone to, since the value must
-    match exactly.
+    Queries for values *resembling* the configured one rather than listing the
+    whole choice list. A stock instance carries 200+ discovery sources, so a
+    dump of the first twenty is alphabetical noise ("ACC-Visibility",
+    "AgentClientCollector", "Altiris"...) that answers nothing, and a bounded
+    read cannot even prove absence -- a registered value past the row limit
+    would be reported as missing.
+
+    `valueLIKE` matches case-insensitively on a substring, so it finds
+    "Microsoft Intune" for "Intune" and vice versa. That makes the three
+    outcomes distinguishable: registered, registered under a different
+    spelling, or genuinely absent.
     """
+    query = f"name=cmdb_ci^element=discovery_source^valueLIKE{cfg.discovery_source}"
     try:
         rows = client.query_table(
-            "sys_choice",
-            query="name=cmdb_ci^element=discovery_source",
-            fields=("value", "label"),
-            limit=200,
+            "sys_choice", query=query, fields=("value", "inactive"), limit=100
         )
     except ServiceNowError as exc:
         return [
@@ -481,31 +488,49 @@ def _discovery_source_caveats(client: ServiceNowClient, cfg: ServiceNowConfig) -
             "rejected on every write"
         ]
 
-    registered = [str(row.get("value") or "") for row in rows]
-    if cfg.discovery_source in registered:
+    # sys_choice carries one row per language, so the same value comes back
+    # several times; and an inactive choice is not usable even though it is
+    # present.
+    candidates: list[str] = []
+    for row in rows:
+        value = str(row.get("value") or "")
+        if not value or str(row.get("inactive") or "").lower() in ("true", "1"):
+            continue
+        if value not in candidates:
+            candidates.append(value)
+
+    if cfg.discovery_source in candidates:
         return []
 
-    caveat = (
+    # Every write will be rejected. That is known, not suspected, so it fails
+    # the check rather than being filed as something to bear in mind.
+    problem = (
         f"SNOW_DISCOVERY_SOURCE={cfg.discovery_source!r} is not a choice value on "
         "cmdb_ci.discovery_source, so every write will be rejected with "
-        "INVALID_INPUT_DATA. Register it (docs/servicenow-setup.md section 5) or use one "
-        "of the registered values"
+        "INVALID_INPUT_DATA (docs/servicenow-setup.md section 5)."
     )
-    near = [v for v in registered if v.strip().lower() == cfg.discovery_source.strip().lower()]
-    if near:
-        # The field matches exactly, so a case difference is a real failure and
-        # an easy one to stare past.
-        caveat += (
-            f". Note {near[0]!r} is registered and differs from the configured value only "
-            "by case or spacing; this field matches exactly"
+    case_only = [
+        v for v in candidates if v.strip().lower() == cfg.discovery_source.strip().lower()
+    ]
+    if case_only:
+        # The field matches exactly, so a case or spacing difference is a real
+        # failure and an easy one to stare past -- and the only variant fixable
+        # without a ServiceNow admin.
+        raise ServiceNowError(
+            f"{problem} {case_only[0]!r} IS registered and differs only by case or "
+            "spacing — set SNOW_DISCOVERY_SOURCE to exactly that."
         )
-    elif registered:
-        caveat += ": " + ", ".join(repr(v) for v in sorted(registered)[:20])
-        if len(registered) > 20:
-            caveat += f", and {len(registered) - 20} more"
-    else:
-        caveat += ", but cmdb_ci.discovery_source has no choice values at all"
-    return [caveat]
+    if candidates:
+        raise ServiceNowError(
+            f"{problem} These registered values resemble it: "
+            + ", ".join(repr(v) for v in candidates[:10])
+            + ". Use one of them, or have the configured value registered."
+        )
+    raise ServiceNowError(
+        f"{problem} No registered value contains {cfg.discovery_source!r} either, so it "
+        "needs adding under System Definition > Choice Lists (table cmdb_ci, element "
+        "discovery_source) — a ServiceNow admin action."
+    )
 
 
 class CmdbInstanceWriter:
