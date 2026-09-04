@@ -97,6 +97,26 @@ class SyncRunner:
         for batch in _chunks(payloads, self.cfg.servicenow.batch_size):
             self._write_batch(batch, outcome_index, report, state)
 
+        if payloads and not (report.inserted or report.updated or report.unchanged):
+            # Every device that had a payload failed. Without this the run exits
+            # 0 unless --fail-on-error is set, because "some devices failed" is
+            # an ordinary outcome -- but "no device succeeded" is not data
+            # quality, it is the run not working. Observed live 2026-09-04: 17
+            # of 17 devices failed on a malformed payload and the run reported
+            # success.
+            report.degrade(
+                f"no device was written: all {report.errors} attempted write(s) failed. "
+                "The CMDB holds nothing from this run."
+            )
+
+        aborted = getattr(self.writer, "aborted", None)
+        if aborted:
+            # The writer stopped early because every write was failing. Devices
+            # it never attempted are already recorded as errors, but a run that
+            # covered part of the fleet must not exit 0 -- and the next run's
+            # state is now missing whatever was not written.
+            report.degrade(f"write run stopped early: {aborted}")
+
         report.unresolved_references = self.references.unresolved
         if any(report.unresolved_references.values()):
             log.info(

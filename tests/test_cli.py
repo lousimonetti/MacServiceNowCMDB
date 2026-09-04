@@ -90,6 +90,44 @@ class TestRun:
 
     @respx.mock
     def test_fail_on_error_exits_four(self, set_env):
+        """One device of two fails: a partial failure, which is an ordinary
+        outcome unless the flag says otherwise. A run where *nothing* was
+        written is a different thing and degrades on its own -- see
+        TestTotalWriteFailure."""
+        set_env()
+        respx.get(DEVICES).mock(
+            return_value=httpx.Response(
+                200,
+                json={"value": [make_device(id="d1", serialNumber="SN1"),
+                                make_device(id="d2", serialNumber="SN2")]},
+            )
+        )
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        mock_snow_plumbing()
+        respx.post(IRE).mock(
+            return_value=httpx.Response(
+                200,
+                json={"result": {"items": [
+                    {"operation": "INSERT", "sysId": "ci-1"},
+                    {"errors": [{"error": "Required_Attribute_Empty", "message": "asset_tag"}]},
+                ]}},
+            )
+        )
+
+        assert main(["--fail-on-error"]) == EXIT_PARTIAL
+        # Without the flag a partial failure is still a completed run.
+        assert main([]) == EXIT_OK
+
+
+class TestTotalWriteFailure:
+    """Observed live 2026-09-04: 17 of 17 devices failed on a malformed payload
+    and the run exited 0, because "some devices failed" is an ordinary outcome.
+    No device succeeding is not data quality -- it is the run not working."""
+
+    @respx.mock
+    def test_every_device_failing_exits_four_without_any_flag(self, set_env, capsys):
         set_env()
         respx.get(DEVICES).mock(
             return_value=httpx.Response(200, json={"value": [make_device(id="d1")]})
@@ -100,9 +138,8 @@ class TestRun:
         mock_snow_plumbing()
         respx.post(IRE).mock(return_value=httpx.Response(403, text="denied"))
 
-        assert main(["--fail-on-error"]) == EXIT_PARTIAL
-        # Without the flag a partial failure is still a completed run.
-        assert main([]) == EXIT_OK
+        assert main([]) == EXIT_PARTIAL
+        assert "no device was written" in capsys.readouterr().out
 
     @respx.mock
     def test_graph_failure_exits_three(self, set_env):

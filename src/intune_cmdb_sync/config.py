@@ -196,6 +196,9 @@ class ServiceNowConfig:
     default_class: str | None
     batch_size: int
     concurrency: int
+    # Stop a per-CI write run once this many writes have failed with none
+    # having succeeded. 0 disables it.
+    abort_after_errors: int
     request_timeout: float
     max_retries: int
     extra_attributes: dict[str, Any]
@@ -447,6 +450,7 @@ def _build_config() -> Config:
         default_class=default_class,
         batch_size=_env_int("SNOW_BATCH_SIZE", 100, minimum=1, maximum=1000),
         concurrency=_env_int("SNOW_CONCURRENCY", 4, minimum=1, maximum=32),
+        abort_after_errors=_env_int("SNOW_ABORT_AFTER_ERRORS", 10, minimum=0, maximum=10000),
         request_timeout=_env_float("SNOW_TIMEOUT_SECONDS", 60.0, minimum=1.0),
         max_retries=_env_int("SNOW_MAX_RETRIES", 5, minimum=0, maximum=10),
         extra_attributes=_env_json_object("SNOW_EXTRA_ATTRIBUTES"),

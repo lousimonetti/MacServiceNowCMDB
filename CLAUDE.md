@@ -57,6 +57,16 @@ behaviour change, particularly anything altering what gets written to a CI.
 
 ## Constraints
 
+- **The CMDB Instance API takes strings only.** `POST
+  /api/now/cmdb/instance/{class}` deserialises `attributes` as String->String
+  and throws `HTTP 500 - class java.lang.Double cannot be cast to class
+  java.lang.String` on a JSON number or boolean, before any validation worth
+  reading. It failed all 17 devices of the 2026-09-04 run; the culprit was
+  `disk_space` (`bytes_to_gb` returns a rounded float), with `ram` (int) and
+  `virtual` (bool) behind it. `stringify_attributes` in `writers.py` coerces the
+  whole payload at that writer. **Do not apply it to IRE** —
+  `/api/now/identifyreconcile` accepts typed values, and that path is unchanged.
+
 - **Never assume managed identity for Graph.** Deployments where Intune and the
   hosting subscription live in different tenants cannot use it — a managed
   identity is single-tenant and there is no cross-tenant consent path.

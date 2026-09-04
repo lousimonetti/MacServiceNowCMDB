@@ -454,6 +454,110 @@ class TestDryRunUnderCmdbInstance:
         assert any("prediction, not a simulation" in w for w in report.warnings)
 
 
+class TestTwoHundredDevicesThroughCmdbInstance:
+    """The run this mode exists for on an instance that refuses the IRE API:
+    a bounded first write, one POST per CI, no retirement."""
+
+    def _devices(self, count: int) -> list[dict]:
+        return [
+            make_device(
+                id=f"d{i}",
+                deviceName=f"HOST-{i}",
+                serialNumber=f"SN{i:05d}",
+            )
+            for i in range(count)
+        ]
+
+    @respx.mock
+    def test_writes_two_hundred_cis_one_request_each(self, set_env, runner_factory):
+        set_env(SNOW_WRITE_MODE="cmdb_instance", INTUNE_DEVICE_LIMIT="200")
+        cfg = Config.from_env()
+        respx.get(DEVICES).mock(
+            return_value=httpx.Response(200, json={"value": self._devices(250)})
+        )
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        mock_snow_plumbing()
+        write = respx.post(f"{SNOW}/api/now/cmdb/instance/cmdb_ci_computer").mock(
+            return_value=httpx.Response(
+                201,
+                json={"result": {"attributes": {
+                    "sys_id": "ci-1", "sys_created_on": "x", "sys_updated_on": "x"}}},
+            )
+        )
+
+        report = runner_factory(cfg).run()
+
+        # One request per CI -- the defining property of this write mode, and
+        # what SNOW_BATCH_SIZE does *not* change here.
+        assert write.call_count == 200
+        assert report.inserted == 200
+        assert report.errors == 0
+        # The limit stopped Graph short rather than fetching all 250 and
+        # discarding 50.
+        assert report.devices_after_ownership_filter == 200
+        assert not report.degraded
+
+    @respx.mock
+    def test_the_limit_keeps_retirement_off(self, set_env, runner_factory, tmp_path):
+        """200 of a larger fleet makes every other device look like it vanished."""
+        set_env(
+            SNOW_WRITE_MODE="cmdb_instance",
+            INTUNE_DEVICE_LIMIT="200",
+            SNOW_RETIRE_MISSING="true",
+            STATE_PATH=str(tmp_path / "state.json"),
+        )
+        cfg = Config.from_env()
+        respx.get(DEVICES).mock(
+            return_value=httpx.Response(200, json={"value": self._devices(200)})
+        )
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        mock_snow_plumbing()
+        respx.post(f"{SNOW}/api/now/cmdb/instance/cmdb_ci_computer").mock(
+            return_value=httpx.Response(
+                201,
+                json={"result": {"attributes": {
+                    "sys_id": "ci-1", "sys_created_on": "x", "sys_updated_on": "x"}}},
+            )
+        )
+        retire = respx.patch(url__startswith=f"{TABLE}/")
+
+        report = runner_factory(cfg).run()
+
+        assert retire.call_count == 0
+        assert report.retired == 0
+        assert any("retirement skipped" in w for w in report.warnings)
+
+    @respx.mock
+    def test_a_systematic_failure_stops_early_and_degrades_the_run(
+        self, set_env, runner_factory
+    ):
+        """Without the guard this is 200 identical failed POSTs at a production
+        instance, and an exit code that says only "some devices failed"."""
+        set_env(SNOW_WRITE_MODE="cmdb_instance", INTUNE_DEVICE_LIMIT="200")
+        cfg = Config.from_env()
+        respx.get(DEVICES).mock(
+            return_value=httpx.Response(200, json={"value": self._devices(200)})
+        )
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        mock_snow_plumbing()
+        write = respx.post(f"{SNOW}/api/now/cmdb/instance/cmdb_ci_computer").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "Invalid data source"}})
+        )
+
+        report = runner_factory(cfg).run()
+
+        assert write.call_count < 30
+        assert report.errors == 200
+        # Degraded, not merely "some devices failed": the fleet was not covered.
+        assert report.degraded
+
+
 class TestStatePersistenceFailure:
     """CMDB writes succeeding while the state file is lost is a partial success,
     not a clean run: the next run cannot retire anything it can no longer see."""

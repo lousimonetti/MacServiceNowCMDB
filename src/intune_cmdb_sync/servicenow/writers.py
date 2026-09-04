@@ -20,6 +20,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -94,6 +96,10 @@ class WriteResult:
 
 class Writer(Protocol):
     mode: str
+    # Set when the writer stopped early because writing was failing
+    # systematically. A run that stopped early is not a complete run, so the
+    # report has to be able to see it.
+    aborted: str | None
 
     def write(self, batch: list[CiPayload]) -> list[WriteResult]: ...
 
@@ -107,6 +113,10 @@ class IdentifyReconcileWriter:
         self._client = client
         self._cfg = cfg
         self._dry_run = dry_run
+        # This writer submits a whole batch per request, so a systematic
+        # failure already surfaces as one error rather than hundreds. Declared
+        # to satisfy the Writer protocol; never set.
+        self.aborted: str | None = None
 
     def _endpoint(self) -> str:
         if self._dry_run:
@@ -483,6 +493,16 @@ class CmdbInstanceWriter:
         self._client = client
         self._cfg = cfg
         self._dry_run = dry_run
+        self.aborted: str | None = None
+        # A per-CI writer turns one systematic problem -- an unregistered
+        # discovery source, a mandatory attribute the payload omits, an ACL on
+        # one field -- into one failed POST per device. IRE fails such a run
+        # once; this one would fail it 200 times against a production instance.
+        # The guard only trips while *nothing* has succeeded, so a fleet with a
+        # handful of genuinely bad devices still runs to completion.
+        self._lock = threading.Lock()
+        self._failures = 0
+        self._successes = 0
 
     def write(self, batch: list[CiPayload]) -> list[WriteResult]:
         if not batch:
@@ -493,6 +513,33 @@ class CmdbInstanceWriter:
         workers = min(self._cfg.concurrency, len(batch))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             return list(pool.map(self._write_one, batch))
+
+    def _record(self, result: WriteResult) -> WriteResult:
+        """Track outcomes and trip the guard once failure looks systematic."""
+        threshold = self._cfg.abort_after_errors
+        with self._lock:
+            if result.action == "error":
+                self._failures += 1
+            else:
+                self._successes += 1
+            if (
+                threshold
+                and self.aborted is None
+                and self._successes == 0
+                and self._failures >= threshold
+            ):
+                self.aborted = (
+                    f"stopped after {self._failures} consecutive write failures with no "
+                    f"successes; the first {self._failures} devices all failed the same "
+                    f"way, so this is a configuration problem rather than bad data. Last "
+                    f"error: {result.message}. Raise SNOW_ABORT_AFTER_ERRORS or set it to "
+                    "0 to write the whole batch anyway."
+                )
+                log.error(
+                    "aborting per-CI writes: every write is failing",
+                    extra={"failures": self._failures, "threshold": threshold},
+                )
+        return result
 
     def _preview(self, batch: list[CiPayload]) -> list[WriteResult]:
         """Predict insert vs update using reads only.
@@ -581,23 +628,37 @@ class CmdbInstanceWriter:
         return by_serial, by_name
 
     def _write_one(self, item: CiPayload) -> WriteResult:
-        body = {"attributes": item.values, "source": self._cfg.discovery_source}
+        if self.aborted is not None:
+            # Not "skipped": these devices were meant to be written and were
+            # not, and a run report that called that a skip would look clean.
+            return WriteResult(
+                intune_id=item.intune_id,
+                action="error",
+                errors=[f"not attempted: {self.aborted}"],
+            )
+
+        body = {
+            "attributes": stringify_attributes(item.values),
+            "source": self._cfg.discovery_source,
+        }
         try:
             response = self._client.request(
                 "POST", f"{CMDB_INSTANCE_API}/{item.class_name}", json_body=body
             )
         except Exception as exc:  # one failing device must not sink the whole run
-            return WriteResult(intune_id=item.intune_id, action="error", errors=[str(exc)])
+            return self._record(
+                WriteResult(intune_id=item.intune_id, action="error", errors=[str(exc)])
+            )
 
         if not response.is_success:
             detail = describe_error(response)
-            return WriteResult(
-                intune_id=item.intune_id,
-                action="error",
-                errors=[
-                    f"{detail}"
-                    f"{_unscoped_api_suffix(detail, path=f'{CMDB_INSTANCE_API}/{item.class_name}')}"
-                ],
+            api_path = f"{CMDB_INSTANCE_API}/{item.class_name}"
+            return self._record(
+                WriteResult(
+                    intune_id=item.intune_id,
+                    action="error",
+                    errors=[f"{detail}{_unscoped_api_suffix(detail, path=api_path)}"],
+                )
             )
 
         result = (response.json() or {}).get("result") or {}
@@ -605,14 +666,18 @@ class CmdbInstanceWriter:
         error = result.get("error")
         if error:
             detail = error.get("message") or error.get("detail") or str(error)
-            return WriteResult(intune_id=item.intune_id, action="error", errors=[str(detail)])
+            return self._record(
+                WriteResult(intune_id=item.intune_id, action="error", errors=[str(detail)])
+            )
 
         sys_id = attributes.get("sys_id")
         if not sys_id:
-            return WriteResult(
-                intune_id=item.intune_id,
-                action="error",
-                errors=["CMDB Instance API response contained no sys_id"],
+            return self._record(
+                WriteResult(
+                    intune_id=item.intune_id,
+                    action="error",
+                    errors=["CMDB Instance API response contained no sys_id"],
+                )
             )
 
         # This endpoint reports no INSERT/UPDATE distinction, so treat every
@@ -621,7 +686,45 @@ class CmdbInstanceWriter:
         created = attributes.get("sys_created_on")
         updated = attributes.get("sys_updated_on")
         action = "inserted" if created and created == updated else "updated"
-        return WriteResult(intune_id=item.intune_id, action=action, sys_id=str(sys_id))
+        return self._record(
+            WriteResult(intune_id=item.intune_id, action=action, sys_id=str(sys_id))
+        )
+
+
+def stringify_attributes(values: Mapping[str, Any]) -> dict[str, str]:
+    """Render every attribute as a string, as this API requires.
+
+    `POST /api/now/cmdb/instance/{class}` deserialises `attributes` as a
+    map of String to String, and a JSON number or boolean makes it throw before
+    it reaches any validation the connector could learn from:
+
+        HTTP 500 - class java.lang.Double cannot be cast to class java.lang.String
+
+    Observed live 2026-09-04, where it failed every device in the run. The
+    culprit was `disk_space` (`bytes_to_gb` returns a rounded float), but `ram`
+    (int) and `virtual` (bool) would have thrown the same way with a different
+    class name, so this coerces the whole payload rather than that one field.
+
+    IRE is deliberately left alone: `/api/now/identifyreconcile` accepts typed
+    values, and narrowing them to strings there would be a change to a working
+    payload made for another endpoint's benefit.
+    """
+    rendered: dict[str, str] = {}
+    for key, value in values.items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            # Python's str() gives "True"/"False"; ServiceNow's boolean fields
+            # want the JSON spelling.
+            rendered[key] = "true" if value else "false"
+        elif isinstance(value, float):
+            # 128.0 as "128" rather than "128.0": the field is a decimal, but a
+            # value that moves between runs makes every device an update, and
+            # "128" is what the same number looks like from any other source.
+            rendered[key] = str(int(value)) if value.is_integer() else repr(value)
+        else:
+            rendered[key] = str(value)
+    return rendered
 
 
 def _query_safe(value: str | None) -> str | None:

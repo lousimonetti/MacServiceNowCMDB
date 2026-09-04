@@ -155,6 +155,7 @@ documents all of them; these are the ones that matter most.
 | `SNOW_CLASS_MAP` | `windows=cmdb_ci_computer;macos=cmdb_ci_computer` | Unmapped OSes are skipped, not guessed. |
 | `SNOW_USER_MATCH_ORDER` | `employee_number,email,user_name` | Owner match keys, in order. |
 | `SNOW_RETIRE_MISSING` | `false` | Needs `STATE_PATH`. |
+| `SNOW_ABORT_AFTER_ERRORS` | `10` | `cmdb_instance` only: stop once this many writes have failed with none succeeding. `0` disables. |
 | `DRY_RUN` | `false` | |
 
 ### Write modes
@@ -193,6 +194,24 @@ now rather than a workaround for the same block — with these consequences:
 - **Retirement is a separate API again.** It PATCHes the Table API, which has
   its own auth scope; `--check-api`'s `table_update` row is what tells you
   whether it will work.
+- **A systematic failure stops the run.** One bad setting means one failed POST
+  *per device* in this mode, so the run stops once `SNOW_ABORT_AFTER_ERRORS`
+  (default 10) writes have failed with none succeeding, and exits 4. Devices it
+  never attempted are reported as errors, not skips. A run that is mostly
+  working never trips it.
+
+A bounded first run:
+
+```bash
+SNOW_WRITE_MODE=cmdb_instance intune-cmdb-sync \
+  --limit 200 --report-devices --report ./run.json
+```
+
+One `POST /api/now/cmdb/instance/cmdb_ci_computer` per device, four at a time
+(`SNOW_CONCURRENCY`); `SNOW_BATCH_SIZE` does not change that in this mode.
+`--limit` stops pulling Graph pages at 200 rather than fetching the tenant and
+discarding the rest, and disables retirement for the run. Check `run.json` for
+the per-device `sys_id`s before dropping the limit.
 
 ---
 

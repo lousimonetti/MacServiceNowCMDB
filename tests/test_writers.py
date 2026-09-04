@@ -335,6 +335,167 @@ class TestCmdbInstanceDryRun:
         assert "nameINLOU-MBP16" in query
 
 
+class TestCmdbInstanceAttributeTypes:
+    """`POST /api/now/cmdb/instance/{class}` deserialises `attributes` as
+    String->String and throws HTTP 500 on anything else, before any validation
+    the connector could learn from. Observed live 2026-09-04:
+
+        class java.lang.Double cannot be cast to class java.lang.String
+
+    from `disk_space`, which is a rounded float. It failed all 17 devices."""
+
+    def _sent(self, snow_client, config: Config, values: dict) -> dict:
+        route = respx.post(f"{SNOW}/api/now/cmdb/instance/cmdb_ci_computer").mock(
+            return_value=httpx.Response(
+                201,
+                json={"result": {"attributes": {
+                    "sys_id": "ci-1", "sys_created_on": "x", "sys_updated_on": "x"}}},
+            )
+        )
+        CmdbInstanceWriter(snow_client, config.servicenow).write([payload(values=values)])
+        return json.loads(route.calls[0].request.content)["attributes"]
+
+    @respx.mock
+    def test_a_float_is_sent_as_a_string(self, snow_client, config: Config):
+        # bytes_to_gb(256060514304) -> 238.47
+        assert self._sent(snow_client, config, {"disk_space": 238.47})["disk_space"] == "238.47"
+
+    @respx.mock
+    def test_a_whole_float_drops_its_decimal(self, snow_client, config: Config):
+        """"128" rather than "128.0": the same number as any other source would
+        write, and a value that differs between runs makes every device an
+        update."""
+        assert self._sent(snow_client, config, {"disk_space": 128.0})["disk_space"] == "128"
+
+    @respx.mock
+    def test_an_int_is_sent_as_a_string(self, snow_client, config: Config):
+        """`ram` would have thrown the same way, naming Integer instead."""
+        assert self._sent(snow_client, config, {"ram": 16384})["ram"] == "16384"
+
+    @respx.mock
+    def test_a_bool_uses_the_json_spelling(self, snow_client, config: Config):
+        """`virtual` is a bool; Python's str() would send "False"."""
+        assert self._sent(snow_client, config, {"virtual": False})["virtual"] == "false"
+
+    @respx.mock
+    def test_every_value_sent_is_a_string(self, snow_client, config: Config):
+        """The whole payload is coerced, not the fields known to have broken:
+        an override mapping can put any JSON type on the payload."""
+        sent = self._sent(
+            snow_client,
+            config,
+            {"name": "HOST-1", "ram": 16384, "disk_space": 238.47, "virtual": False,
+             "u_score": 0.5, "install_status": 1},
+        )
+        assert all(isinstance(v, str) for v in sent.values())
+
+    @respx.mock
+    def test_a_none_is_dropped_rather_than_stringified(self, snow_client, config: Config):
+        """"None" as a field value would overwrite a real CMDB value with the
+        word None."""
+        sent = self._sent(snow_client, config, {"name": "HOST-1", "asset_tag": None})
+        assert "asset_tag" not in sent
+
+    def test_ire_payloads_keep_their_types(self, snow_client, config: Config):
+        """The fix belongs to this one endpoint. IRE accepts typed values, and
+        narrowing them there would change a working payload for another API's
+        benefit."""
+        writer = IdentifyReconcileWriter(snow_client, config.servicenow)
+        body = writer.build_payload([payload(values={"disk_space": 238.47, "virtual": False})])
+        assert body["items"][0]["values"] == {"disk_space": 238.47, "virtual": False}
+
+
+class TestCmdbInstanceAbortGuard:
+    """A per-CI writer turns one systematic problem into one failed POST per
+    device. A 200-device run against a production instance would issue 200
+    identical failures before anyone saw the first."""
+
+    def _writer(self, snow_client, cfg) -> CmdbInstanceWriter:
+        return CmdbInstanceWriter(snow_client, cfg)
+
+    def _batch(self, count: int) -> list[CiPayload]:
+        return [
+            payload(
+                intune_id=f"d{i}",
+                serial_number=f"SN{i}",
+                device_name=f"HOST-{i}",
+                values={"name": f"HOST-{i}", "serial_number": f"SN{i}"},
+            )
+            for i in range(count)
+        ]
+
+    @respx.mock
+    def test_stops_once_every_write_has_failed(self, snow_client, config: Config):
+        route = respx.post(url__startswith=f"{SNOW}/api/now/cmdb/instance").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "Invalid data source"}})
+        )
+        writer = self._writer(snow_client, config.servicenow)
+
+        results = writer.write(self._batch(200))
+
+        # Default SNOW_ABORT_AFTER_ERRORS=10. Concurrency means a few extra
+        # requests can be in flight when the guard trips, so assert the order
+        # of magnitude rather than an exact count.
+        assert route.call_count < 30
+        assert writer.aborted is not None
+        assert "Invalid data source" in writer.aborted
+        assert len(results) == 200
+        assert all(r.action == "error" for r in results)
+        assert any("not attempted" in (r.message or "") for r in results)
+
+    @respx.mock
+    def test_a_few_bad_devices_do_not_stop_a_working_run(self, snow_client, config: Config):
+        """The guard trips only while *nothing* has succeeded, so a fleet with
+        genuinely bad records still writes the good ones."""
+        def respond(request):
+            body = json.loads(request.content)
+            # Every 20th device, offset so successes land first: the guard must
+            # see a success before the failure count reaches the threshold.
+            if int(body["attributes"]["serial_number"].removeprefix("SN")) % 20 == 7:
+                return httpx.Response(400, json={"error": {"message": "bad record"}})
+            return httpx.Response(
+                201,
+                json={"result": {"attributes": {
+                    "sys_id": "ci-x", "sys_created_on": "a", "sys_updated_on": "b"}}},
+            )
+
+        route = respx.post(url__startswith=f"{SNOW}/api/now/cmdb/instance").mock(
+            side_effect=respond
+        )
+        writer = self._writer(snow_client, config.servicenow)
+
+        results = writer.write(self._batch(200))
+
+        assert writer.aborted is None
+        assert route.call_count == 200
+        assert sum(1 for r in results if r.action == "error") == 10
+        assert sum(1 for r in results if r.action == "updated") == 190
+
+    @respx.mock
+    def test_the_guard_can_be_disabled(self, set_env, snow_client):
+        set_env(SNOW_WRITE_MODE="cmdb_instance", SNOW_ABORT_AFTER_ERRORS="0")
+        cfg = Config.from_env()
+        route = respx.post(url__startswith=f"{SNOW}/api/now/cmdb/instance").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "no"}})
+        )
+        writer = self._writer(snow_client, cfg.servicenow)
+        writer.write(self._batch(50))
+        assert writer.aborted is None
+        assert route.call_count == 50
+
+    @respx.mock
+    def test_the_guard_persists_across_batches(self, snow_client, config: Config):
+        """SNOW_BATCH_SIZE chunks the run, and the writer outlives a chunk."""
+        route = respx.post(url__startswith=f"{SNOW}/api/now/cmdb/instance").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "no"}})
+        )
+        writer = self._writer(snow_client, config.servicenow)
+        writer.write(self._batch(100))
+        calls_after_first = route.call_count
+        writer.write(self._batch(100))
+        assert route.call_count == calls_after_first
+
+
 class TestBuildWriter:
     def test_defaults_to_identify_reconcile(self, snow_client, config: Config):
         assert build_writer(snow_client, config.servicenow).mode == "identify_reconcile"
