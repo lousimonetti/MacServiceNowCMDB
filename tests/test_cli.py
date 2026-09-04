@@ -169,6 +169,89 @@ class TestRegisterDiscoverySourceCli:
         assert create.call_count == 0
 
 
+class TestListClasses:
+    """"Which class should macOS use?" is a question about the instance, so it
+    should be answerable from the instance."""
+
+    TABLES = "https://acme.service-now.com/api/now/table/sys_db_object"
+
+    @respx.mock
+    def test_prints_the_classes_and_exits_zero(self, set_env, capsys):
+        set_env()
+        respx.get(self.TABLES).mock(
+            return_value=httpx.Response(
+                200,
+                json={"result": [
+                    {"name": "cmdb_ci_computer", "label": "Computer"},
+                    {"name": "cmdb_ci_msd", "label": "Mobile Device"},
+                ]},
+            )
+        )
+        assert main(["--list-classes"]) == EXIT_OK
+        output = capsys.readouterr().out
+        assert "cmdb_ci_computer" in output and "cmdb_ci_msd" in output
+
+    @respx.mock
+    def test_a_pattern_is_passed_through(self, set_env):
+        set_env()
+        route = respx.get(self.TABLES).mock(
+            return_value=httpx.Response(200, json={"result": []})
+        )
+        assert main(["--list-classes", "mac"]) == EXIT_OK
+        assert "LIKEmac" in route.calls[0].request.url.params["sysparm_query"]
+
+    @respx.mock
+    def test_it_writes_nothing(self, set_env):
+        set_env()
+        respx.get(self.TABLES).mock(return_value=httpx.Response(200, json={"result": []}))
+        writes = respx.post(url__startswith="https://acme.service-now.com/api/now")
+        main(["--list-classes"])
+        assert writes.call_count == 0
+
+
+class TestCheckValidatesTheClassMap:
+    @respx.mock
+    def test_a_class_the_instance_does_not_have_fails_the_check(self, set_env, capsys):
+        """It looks configured and fails every device of that OS at write time."""
+        set_env(SNOW_CLASS_MAP="windows=cmdb_ci_computer;macos=cmdb_ci_nonexistent")
+        mock_snow_plumbing()
+        respx.get("https://acme.service-now.com/api/now/table/sys_db_object").mock(
+            side_effect=lambda request: httpx.Response(
+                200,
+                json={"result": [{"name": "cmdb_ci_computer"}]
+                      if "cmdb_ci_computer" in request.url.params["sysparm_query"] else []},
+            )
+        )
+        respx.get(DEVICES).mock(
+            return_value=httpx.Response(200, json={"value": [make_device(id="d1")]})
+        )
+        respx.post(IRE_QUERY).mock(
+            return_value=httpx.Response(200, json={"result": {"items": [{"operation": "INSERT"}]}})
+        )
+
+        assert main(["--check"]) == EXIT_FAILED
+        assert "cmdb_ci_nonexistent" in capsys.readouterr().out
+
+    @respx.mock
+    def test_an_operating_system_dropped_from_the_map_is_called_out(self, set_env, capsys):
+        """Setting SNOW_CLASS_MAP replaces the built-in default rather than
+        extending it, so macos goes missing by omission and the run reports the
+        same line it would for a deliberate skip."""
+        set_env(SNOW_CLASS_MAP="windows=cmdb_ci_computer")
+        mock_snow_plumbing()
+        respx.get(DEVICES).mock(
+            return_value=httpx.Response(200, json={"value": [make_device(id="d1")]})
+        )
+        respx.post(IRE_QUERY).mock(
+            return_value=httpx.Response(200, json={"result": {"items": [{"operation": "INSERT"}]}})
+        )
+
+        assert main(["--check"]) == EXIT_OK
+        output = capsys.readouterr().out
+        assert "macos" in output
+        assert "replaces the built-in default" in output
+
+
 class TestTotalWriteFailure:
     """Observed live 2026-09-04: 17 of 17 devices failed on a malformed payload
     and the run exited 0, because "some devices failed" is an ordinary outcome.

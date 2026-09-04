@@ -57,6 +57,15 @@ behaviour change, particularly anything altering what gets written to a CI.
 
 ## Constraints
 
+- **`SNOW_CLASS_MAP` replaces the built-in default, it does not extend it.**
+  `_env_kv_map` returns the parsed value or the default, never a merge, so a map
+  set as `windows=cmdb_ci_computer` silently drops the built-in
+  `macos=cmdb_ci_computer` — which is why every 2026-09-04 run skipped both
+  macOS devices with the same line it prints for a deliberately unmapped iOS.
+  `--check` now warns on common OSes with no entry and **fails** on a mapped
+  class the instance does not have; `--list-classes [PATTERN]` reads
+  `sys_db_object` so the right class is discoverable rather than guessed.
+
 - **`SNOW_DISCOVERY_SOURCE` must be a registered choice value before any write
   succeeds.** `cmdb_ci.discovery_source` is a choice list, and an unregistered
   value is rejected per device with

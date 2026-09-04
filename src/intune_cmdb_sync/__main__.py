@@ -17,6 +17,12 @@ from .errors import ConfigError, SyncError
 from .graph import GraphClient
 from .logging_setup import configure_logging
 from .models import RunReport
+from .servicenow.classes import (
+    format_classes,
+    list_ci_classes,
+    unmapped_os_note,
+    verify_class_map,
+)
 from .servicenow.client import ServiceNowClient
 from .servicenow.probe import format_report, probe_endpoints
 from .servicenow.writers import register_discovery_source, verify_write_access
@@ -86,6 +92,18 @@ def build_parser() -> argparse.ArgumentParser:
             "the same row a ServiceNow admin would add by hand. Writes one configuration "
             "record and no CI data; if the credential lacks the role, it prints the record "
             "for someone who has it. Never runs as part of a sync."
+        ),
+    )
+    parser.add_argument(
+        "--list-classes",
+        nargs="?",
+        const="",
+        metavar="PATTERN",
+        help=(
+            "List the CMDB classes on this instance, then exit, optionally filtered by a "
+            "substring of the table name or label (e.g. --list-classes mac). Read-only. "
+            "Use it to fill in SNOW_CLASS_MAP for an operatingSystem the run reports as "
+            "'no CMDB class mapped'."
         ),
     )
     parser.add_argument("--log-level", help="Override LOG_LEVEL (DEBUG, INFO, WARNING, ERROR).")
@@ -166,6 +184,15 @@ def _write_report(report: RunReport, location: str | None, include_devices: bool
         log.error("could not write run report", extra={"path": location, "error": str(exc)})
 
 
+def _list_classes(cfg: Config, pattern: str) -> int:
+    """Answer "which class should this OS use?" from the instance itself."""
+    with ServiceNowClient(cfg.servicenow) as snow:
+        classes = list_ci_classes(snow, pattern or None)
+    # stdout, not the logger: a list to read and pick from.
+    print(format_classes(classes, cfg.servicenow))
+    return EXIT_OK
+
+
 def _register_discovery_source(cfg: Config) -> int:
     """Create the discovery-source choice value, on explicit request only.
 
@@ -222,6 +249,14 @@ def _check(cfg: Config) -> int:
         identity = snow.verify_connectivity()
         log.info("ServiceNow reachable", extra={"instance": identity.get("instance")})
 
+        class_problems = verify_class_map(snow, cfg.servicenow)
+        for problem in class_problems:
+            log.error("class map problem", extra={"detail": problem})
+
+        note = unmapped_os_note(cfg.servicenow)
+        if note:
+            log.warning("unmapped operating systems", extra={"detail": note})
+
         write_access = verify_write_access(snow, cfg.servicenow)
         if write_access.verified:
             log.info("ServiceNow write path verified", extra={"detail": write_access.detail})
@@ -247,6 +282,15 @@ def _check(cfg: Config) -> int:
                 "found_any": first is not None,
             },
         )
+    if class_problems:
+        # A class that does not exist fails every device of that OS at write
+        # time while looking correctly configured until then.
+        log.error(
+            "configuration check failed: SNOW_CLASS_MAP names a class this instance "
+            "does not have",
+            extra={"problems": len(class_problems)},
+        )
+        return EXIT_FAILED
     if write_access.verified:
         log.info("configuration and connectivity check passed")
         return EXIT_OK
@@ -285,6 +329,9 @@ def _run(args: argparse.Namespace) -> int:
     )
 
     try:
+        if args.list_classes is not None:
+            return _list_classes(cfg, args.list_classes)
+
         if args.register_discovery_source:
             return _register_discovery_source(cfg)
 

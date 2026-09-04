@@ -61,6 +61,7 @@ set -a && . ./.env && set +a
 intune-cmdb-sync --check         # prove both systems work, including writes
 intune-cmdb-sync --check-api     # which ServiceNow endpoints this client may call, and why not
 intune-cmdb-sync --register-discovery-source   # add SNOW_DISCOVERY_SOURCE to the choice list
+intune-cmdb-sync --list-classes mac            # which CMDB classes this instance has
 intune-cmdb-sync --dry-run       # run IRE identification, write nothing
 intune-cmdb-sync                 # commit
 
@@ -153,7 +154,7 @@ documents all of them; these are the ones that matter most.
 | `SNOW_CLIENT_ID` / `SNOW_CLIENT_SECRET` | — | From the Application Registry entry. |
 | `SNOW_WRITE_MODE` | `identify_reconcile` | Or `cmdb_instance`. See below. |
 | `SNOW_DISCOVERY_SOURCE` | `Intune` | Must match the `cmdb_ci.discovery_source` choice exactly. |
-| `SNOW_CLASS_MAP` | `windows=cmdb_ci_computer;macos=cmdb_ci_computer` | Unmapped OSes are skipped, not guessed. |
+| `SNOW_CLASS_MAP` | `windows=cmdb_ci_computer;macos=cmdb_ci_computer` | Unmapped OSes are skipped, not guessed. **Setting this replaces the default rather than extending it** — include `macos=` explicitly or Macs are dropped. `--list-classes` shows what the instance has; `--check` fails on a class it does not. |
 | `SNOW_USER_MATCH_ORDER` | `employee_number,email,user_name` | Owner match keys, in order. |
 | `SNOW_RETIRE_MISSING` | `false` | Needs `STATE_PATH`. |
 | `SNOW_ABORT_AFTER_ERRORS` | `10` | `cmdb_instance` only: stop once this many writes have failed with none succeeding. `0` disables. |

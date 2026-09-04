@@ -39,6 +39,10 @@ def mock_snow_plumbing(*, sys_user_rows=None, company_rows=None, model_rows=None
     respx.get(f"{TABLE}/cmdb_model").mock(
         return_value=httpx.Response(200, json={"result": model_rows or []})
     )
+    # --check confirms every class in SNOW_CLASS_MAP is a real table.
+    respx.get(f"{TABLE}/sys_db_object").mock(
+        return_value=httpx.Response(200, json={"result": [{"name": "cmdb_ci_computer"}]})
+    )
 
 
 def ire_response(*operations: str) -> httpx.Response:
