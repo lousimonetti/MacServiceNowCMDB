@@ -405,6 +405,140 @@ class TestCmdbInstanceAttributeTypes:
         assert body["items"][0]["values"] == {"disk_space": 238.47, "virtual": False}
 
 
+# The verbatim body this endpoint returns when the discovery source is not a
+# registered choice value, captured live 2026-09-04. The message sits behind
+# enough identification bookkeeping that a 400-character snippet of the raw
+# body cuts off mid-sentence.
+INVALID_DATA_SOURCE = {
+    "result": {
+        "items": [
+            {
+                "identifierEntrySysId": "Unknown",
+                "identificationAttempts": [],
+                "info": [],
+                "errorCount": 1,
+                "markers": [],
+                "warningCount": 0,
+                "inputIndices": [0],
+                "mergedPayloadIds": [],
+                "className": "cmdb_ci_computer",
+                "sysId": "Unknown",
+                "errors": [
+                    {
+                        "error": "INVALID_INPUT_DATA",
+                        "message": (
+                            "In payload invalid data source [Intune] exist. You need to "
+                            "provide a valid choice value from field [discovery_source] "
+                            "in table [cmdb_ci]"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+}
+
+
+class TestCmdbInstanceErrorReporting:
+    """This endpoint runs through IRE, so a rejected write comes back as an IRE
+    result envelope rather than a plain error. Reporting the raw body truncates
+    away the only sentence worth reading."""
+
+    def _error(self, snow_client, config: Config, response: httpx.Response) -> str:
+        respx.post(f"{SNOW}/api/now/cmdb/instance/cmdb_ci_computer").mock(
+            return_value=response
+        )
+        result = CmdbInstanceWriter(snow_client, config.servicenow).write([payload()])[0]
+        assert result.action == "error"
+        return result.message
+
+    @respx.mock
+    def test_the_structured_error_is_reported_not_the_raw_body(
+        self, snow_client, config: Config
+    ):
+        message = self._error(
+            snow_client, config, httpx.Response(400, json=INVALID_DATA_SOURCE)
+        )
+        assert "INVALID_INPUT_DATA" in message
+        # The whole sentence survives, including the table the field lives on --
+        # which is past the truncation point of the raw body.
+        assert "in table [cmdb_ci]" in message
+        assert "identificationAttempts" not in message
+
+    @respx.mock
+    def test_it_says_where_the_discovery_source_has_to_be_registered(
+        self, snow_client, config: Config
+    ):
+        """The API names the field but not that the value is a choice list entry
+        somebody has to add."""
+        message = self._error(
+            snow_client, config, httpx.Response(400, json=INVALID_DATA_SOURCE)
+        )
+        assert "cmdb_ci.discovery_source" in message
+        assert "SNOW_DISCOVERY_SOURCE" in message
+
+    @respx.mock
+    def test_an_unstructured_error_still_falls_back_to_the_body(
+        self, snow_client, config: Config
+    ):
+        """Not every failure carries an IRE envelope; those must not be lost."""
+        message = self._error(
+            snow_client, config, httpx.Response(400, text="Bad Request, no envelope")
+        )
+        assert "Bad Request, no envelope" in message
+        assert "POST /api/now/cmdb/instance/cmdb_ci_computer" in message
+
+    @respx.mock
+    def test_the_oauth_gate_explanation_survives(self, snow_client, config: Config):
+        message = self._error(snow_client, config, httpx.Response(403, json=UNSCOPED_403))
+        assert "REST API Auth Scope" in message
+
+
+class TestDiscoverySourceCaveat:
+    """`--check` reads the whole choice list so a miss can name the
+    alternatives: "Intune is not registered" sends someone to a ServiceNow
+    admin, the list is often solvable in the terminal."""
+
+    def _caveats(self, set_env, rows: list[dict]) -> list[str]:
+        set_env(SNOW_WRITE_MODE="cmdb_instance")
+        cfg = Config.from_env()
+        client = ServiceNowClient(cfg.servicenow)
+        client.auth._token = "snow-token"
+        client.auth._expires_at = float("inf")
+        respx.post(url__startswith=f"{SNOW}/api/now/cmdb/instance/").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "Invalid class"}})
+        )
+        respx.get(f"{SNOW}/api/now/table/sys_choice").mock(
+            return_value=httpx.Response(200, json={"result": rows})
+        )
+        return verify_write_access(client, cfg.servicenow).caveats
+
+    @respx.mock
+    def test_lists_the_registered_values_when_the_configured_one_is_missing(self, set_env):
+        caveats = self._caveats(
+            set_env, [{"value": "ServiceNow"}, {"value": "SCCM"}, {"value": "JAMF"}]
+        )
+        text = " ".join(caveats)
+        assert "'SCCM'" in text and "'ServiceNow'" in text
+        assert "INVALID_INPUT_DATA" in text
+
+    @respx.mock
+    def test_calls_out_a_case_only_difference(self, set_env):
+        """This field matches exactly, and 'intune' vs 'Intune' is easy to stare
+        past in a list of twenty."""
+        caveats = self._caveats(set_env, [{"value": "intune"}, {"value": "SCCM"}])
+        assert "differs from the configured value only by case" in " ".join(caveats)
+
+    @respx.mock
+    def test_an_empty_choice_list_is_said_plainly(self, set_env):
+        assert "no choice values at all" in " ".join(self._caveats(set_env, []))
+
+    @respx.mock
+    def test_a_registered_value_produces_no_caveat(self, set_env):
+        caveats = self._caveats(set_env, [{"value": "Intune"}, {"value": "SCCM"}])
+        assert not any("discovery_source" in c for c in caveats)
+
+
 class TestCmdbInstanceAbortGuard:
     """A per-CI writer turns one systematic problem into one failed POST per
     device. A 200-device run against a production instance would issue 200

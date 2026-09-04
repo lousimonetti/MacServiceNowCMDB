@@ -57,6 +57,16 @@ behaviour change, particularly anything altering what gets written to a CI.
 
 ## Constraints
 
+- **`SNOW_DISCOVERY_SOURCE` must be a registered choice value before any write
+  succeeds.** `cmdb_ci.discovery_source` is a choice list, and an unregistered
+  value is rejected per device with
+  `INVALID_INPUT_DATA - In payload invalid data source [X] exist`, matched
+  exactly including case. It failed all 17 devices of the second 2026-09-04 run.
+  The CMDB Instance API returns that inside an IRE result envelope, so the
+  message is past the point where a raw body snippet truncates — `_ire_item_error`
+  in `writers.py` parses it out. `--check` reads the whole choice list so it can
+  name the registered values, and flags a case-only near-miss.
+
 - **The CMDB Instance API takes strings only.** `POST
   /api/now/cmdb/instance/{class}` deserialises `attributes` as String->String
   and throws `HTTP 500 - class java.lang.Double cannot be cast to class

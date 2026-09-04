@@ -458,30 +458,54 @@ def _verify_cmdb_instance_access(
 
 
 def _discovery_source_caveats(client: ServiceNowClient, cfg: ServiceNowConfig) -> list[str]:
-    """Check `SNOW_DISCOVERY_SOURCE` against the registered choice values."""
+    """Check `SNOW_DISCOVERY_SOURCE` against the registered choice values.
+
+    Reads the whole choice list rather than querying for the configured value,
+    so that a miss can name the alternatives. "Intune is not registered" sends
+    someone to a ServiceNow admin; "Intune is not registered, these eleven are"
+    is often solvable without leaving the terminal -- and it catches the
+    case-and-spacing near-misses this field is prone to, since the value must
+    match exactly.
+    """
     try:
         rows = client.query_table(
             "sys_choice",
-            query=(
-                "name=cmdb_ci^element=discovery_source^value="
-                f"{cfg.discovery_source}"
-            ),
-            fields=("value",),
-            limit=1,
+            query="name=cmdb_ci^element=discovery_source",
+            fields=("value", "label"),
+            limit=200,
         )
     except ServiceNowError as exc:
         return [
             f"could not read sys_choice to confirm SNOW_DISCOVERY_SOURCE="
             f"{cfg.discovery_source!r} is registered ({exc}); an unregistered value is "
-            "rejected on the first write"
+            "rejected on every write"
         ]
-    if not rows:
-        return [
-            f"SNOW_DISCOVERY_SOURCE={cfg.discovery_source!r} is not a choice value on "
-            "cmdb_ci.discovery_source. Register it (docs/servicenow-setup.md section 5) "
-            "or the first write will be rejected."
-        ]
-    return []
+
+    registered = [str(row.get("value") or "") for row in rows]
+    if cfg.discovery_source in registered:
+        return []
+
+    caveat = (
+        f"SNOW_DISCOVERY_SOURCE={cfg.discovery_source!r} is not a choice value on "
+        "cmdb_ci.discovery_source, so every write will be rejected with "
+        "INVALID_INPUT_DATA. Register it (docs/servicenow-setup.md section 5) or use one "
+        "of the registered values"
+    )
+    near = [v for v in registered if v.strip().lower() == cfg.discovery_source.strip().lower()]
+    if near:
+        # The field matches exactly, so a case difference is a real failure and
+        # an easy one to stare past.
+        caveat += (
+            f". Note {near[0]!r} is registered and differs from the configured value only "
+            "by case or spacing; this field matches exactly"
+        )
+    elif registered:
+        caveat += ": " + ", ".join(repr(v) for v in sorted(registered)[:20])
+        if len(registered) > 20:
+            caveat += f", and {len(registered) - 20} more"
+    else:
+        caveat += ", but cmdb_ci.discovery_source has no choice values at all"
+    return [caveat]
 
 
 class CmdbInstanceWriter:
@@ -651,13 +675,22 @@ class CmdbInstanceWriter:
             )
 
         if not response.is_success:
-            detail = describe_error(response)
             api_path = f"{CMDB_INSTANCE_API}/{item.class_name}"
+            # A 4xx from this endpoint usually carries a structured IRE result,
+            # not a plain error: the useful part is result.items[].errors[]. The
+            # raw body is ~800 characters of identification bookkeeping with the
+            # message near the end, so reporting it verbatim truncates away the
+            # only sentence worth reading.
+            detail = _ire_item_error(response) or describe_error(response)
             return self._record(
                 WriteResult(
                     intune_id=item.intune_id,
                     action="error",
-                    errors=[f"{detail}{_unscoped_api_suffix(detail, path=api_path)}"],
+                    errors=[
+                        f"{detail}"
+                        f"{_unscoped_api_suffix(detail, path=api_path)}"
+                        f"{_data_source_hint(detail, self._cfg)}"
+                    ],
                 )
             )
 
@@ -689,6 +722,59 @@ class CmdbInstanceWriter:
         return self._record(
             WriteResult(intune_id=item.intune_id, action=action, sys_id=str(sys_id))
         )
+
+
+def _ire_item_error(response: Any) -> str | None:
+    """Pull the per-item IRE errors out of a failed CMDB Instance response.
+
+    That endpoint runs through IRE, so a rejected write comes back as an IRE
+    result envelope rather than a simple `{"error": ...}`. Observed live
+    2026-09-04:
+
+        {"result":{"items":[{"identifierEntrySysId":"Unknown",
+         "identificationAttempts":[],...,"errors":[{"error":"INVALID_INPUT_DATA",
+         "message":"In payload invalid data source [Intune] exist..."}]}]}}
+
+    The message sits behind enough bookkeeping that the body's first 400
+    characters -- what `describe_error` shows -- cut off mid-sentence.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    result = payload.get("result")
+    items = result.get("items") if isinstance(result, dict) else None
+    if not isinstance(items, list) or not items:
+        return None
+    first = items[0]
+    if not isinstance(first, dict):
+        return None
+    errors = _collect_item_errors(first)
+    if not errors:
+        return None
+    return f"HTTP {response.status_code}: " + "; ".join(errors)
+
+
+def _data_source_hint(detail: str, cfg: ServiceNowConfig) -> str:
+    """Say where `SNOW_DISCOVERY_SOURCE` has to be registered.
+
+    `INVALID_INPUT_DATA - In payload invalid data source [X] exist` names the
+    field but not the table, and never says that the value is a choice list
+    entry someone has to add. It failed every device of the 2026-09-04 run.
+    """
+    lowered = detail.lower()
+    if "data source" not in lowered and "discovery_source" not in lowered:
+        return ""
+    return (
+        f" SNOW_DISCOVERY_SOURCE={cfg.discovery_source!r} must exist as a choice value on "
+        "cmdb_ci.discovery_source before any write is accepted, matching exactly including "
+        "case. Add it under System Definition > Choice Lists (table cmdb_ci, element "
+        "discovery_source), or set SNOW_DISCOVERY_SOURCE to a value already registered — "
+        "`intune-cmdb-sync --check` lists the registered ones. See "
+        "docs/servicenow-setup.md section 5."
+    )
 
 
 def stringify_attributes(values: Mapping[str, Any]) -> dict[str, str]:
