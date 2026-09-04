@@ -20,6 +20,7 @@ from intune_cmdb_sync.servicenow.probe import (
     DENIED_BY_ROLE,
     NOT_FOUND,
     PROBE_CLASS,
+    PROBE_SYS_ID,
     UNAUTHENTICATED,
     build_probes,
     diagnose,
@@ -49,6 +50,18 @@ def snow_client(config: Config) -> ServiceNowClient:
 def mock_all(*, reads: httpx.Response, writes: httpx.Response) -> None:
     respx.get(url__startswith=f"{SNOW}/api/now").mock(return_value=reads)
     respx.post(url__startswith=f"{SNOW}/api/now").mock(return_value=writes)
+    respx.patch(url__startswith=f"{SNOW}/api/now").mock(return_value=writes)
+
+
+def mock_reads_ok() -> None:
+    respx.get(url__startswith=f"{SNOW}/api/now").mock(
+        return_value=httpx.Response(200, json={"result": []})
+    )
+
+
+def mock_writes(response: httpx.Response) -> None:
+    respx.post(url__startswith=f"{SNOW}/api/now").mock(return_value=response)
+    respx.patch(url__startswith=f"{SNOW}/api/now").mock(return_value=response)
 
 
 class TestProbeSafety:
@@ -70,9 +83,17 @@ class TestProbeSafety:
             assert probe.path.endswith(PROBE_CLASS)
             assert probe.json_body == {}
 
-    def test_every_probe_is_a_get_or_a_post(self, config: Config):
-        # A PATCH or DELETE probe could not be made harmless.
-        assert {p.method for p in build_probes(config.servicenow)} <= {"GET", "POST"}
+    def test_the_only_patch_probe_cannot_reach_a_record(self, config: Config):
+        """Retirement PATCHes the Table API, so that method has to be probed.
+        It is made harmless twice over: a sys_id no record can have, and an
+        empty body that would change nothing even if one did."""
+        patches = [p for p in build_probes(config.servicenow) if p.method == "PATCH"]
+        assert len(patches) == 1
+        assert patches[0].path.endswith(PROBE_SYS_ID)
+        assert patches[0].json_body == {}
+
+    def test_no_probe_can_delete(self, config: Config):
+        assert {p.method for p in build_probes(config.servicenow)} <= {"GET", "POST", "PATCH"}
 
 
 class TestClassification:
@@ -85,6 +106,9 @@ class TestClassification:
             return_value=httpx.Response(403, json=UNSCOPED_403, headers={"X-Is-Logged-In": "true"})
         )
         respx.post(url__startswith=f"{SNOW}/api/now").mock(
+            return_value=httpx.Response(403, text="insufficient rights: itil")
+        )
+        respx.patch(url__startswith=f"{SNOW}/api/now").mock(
             return_value=httpx.Response(403, text="insufficient rights: itil")
         )
 
@@ -123,6 +147,9 @@ class TestClassification:
         respx.get(url__startswith=f"{SNOW}/api/now").mock(
             return_value=httpx.Response(200, json={"result": []})
         )
+        respx.patch(url__startswith=f"{SNOW}/api/now").mock(
+            return_value=httpx.Response(404, json={"error": {"message": "No Record found"}})
+        )
         respx.post(url__startswith=f"{SNOW}/api/now/cmdb/instance").mock(
             return_value=httpx.Response(
                 404, json={"error": {"message": f"No such class {PROBE_CLASS}"}}
@@ -132,7 +159,14 @@ class TestClassification:
         # URL either way, so only the body can tell the two apart.
         respx.post(url__startswith=f"{SNOW}/api/now").mock(
             return_value=httpx.Response(
-                404, json={"error": {"message": "Requested URI does not represent any resource"}}
+                404,
+                json={
+                    "error": {
+                        "message": "Requested URI does not represent any resource",
+                        "detail": None,
+                    },
+                    "status": "failure",
+                },
             )
         )
         report = probe_endpoints(snow_client, config.servicenow)
@@ -163,9 +197,7 @@ class TestDiagnosis:
         respx.get(url__startswith=f"{SNOW}/api/now").mock(
             return_value=httpx.Response(200, json={"result": []})
         )
-        respx.post(url__startswith=f"{SNOW}/api/now").mock(
-            return_value=httpx.Response(403, json=UNSCOPED_403)
-        )
+        mock_writes(httpx.Response(403, json=UNSCOPED_403))
         report = probe_endpoints(snow_client, config.servicenow)
         assert any("per-method" in line for line in diagnose(report))
 
@@ -177,11 +209,54 @@ class TestDiagnosis:
         respx.post(f"{SNOW}/api/now/v1/identifyreconcile").mock(
             return_value=httpx.Response(200, json={"result": {"items": []}})
         )
+        mock_writes(httpx.Response(403, json=UNSCOPED_403))
+        report = probe_endpoints(snow_client, config.servicenow)
+        assert any("API version" in line for line in diagnose(report))
+
+    @respx.mock
+    def test_names_the_open_write_path_when_the_configured_one_is_shut(
+        self, snow_client, config: Config
+    ):
+        """The live case on 2026-09-04: every identifyreconcile variant refused
+        at the gate, the CMDB Instance API not. Leaving the operator to spot
+        that in a wall of 403s is the difference between waiting on the
+        ServiceNow team and running the same day."""
+        mock_reads_ok()
+        respx.patch(url__startswith=f"{SNOW}/api/now").mock(
+            return_value=httpx.Response(404, json={"error": {"message": "No Record found"}})
+        )
+        respx.post(url__startswith=f"{SNOW}/api/now/cmdb/instance").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "Invalid class"}})
+        )
+        respx.post(url__startswith=f"{SNOW}/api/now/v1/cmdb/instance").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "Invalid class"}})
+        )
         respx.post(url__startswith=f"{SNOW}/api/now").mock(
             return_value=httpx.Response(403, json=UNSCOPED_403)
         )
         report = probe_endpoints(snow_client, config.servicenow)
-        assert any("API version" in line for line in diagnose(report))
+        text = " ".join(diagnose(report))
+        assert "SNOW_WRITE_MODE=cmdb_instance works on this instance" in text
+        # ...and never as a free lunch.
+        assert "serial correction duplicates a CI" in text
+
+    @respx.mock
+    def test_warns_when_retirement_is_shut_in_every_mode(self, snow_client, config: Config):
+        mock_reads_ok()
+        respx.patch(url__startswith=f"{SNOW}/api/now").mock(
+            return_value=httpx.Response(403, json=UNSCOPED_403)
+        )
+        respx.post(url__startswith=f"{SNOW}/api/now/cmdb/instance").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "Invalid class"}})
+        )
+        respx.post(url__startswith=f"{SNOW}/api/now/v1/cmdb/instance").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "Invalid class"}})
+        )
+        respx.post(url__startswith=f"{SNOW}/api/now").mock(
+            return_value=httpx.Response(403, json=UNSCOPED_403)
+        )
+        report = probe_endpoints(snow_client, config.servicenow)
+        assert any("SNOW_RETIRE_MISSING=false" in line for line in diagnose(report))
 
     @respx.mock
     def test_a_clean_pass_points_at_the_next_step(self, snow_client, config: Config):
@@ -204,9 +279,7 @@ class TestDiagnosis:
         respx.post(url__startswith=f"{SNOW}/api/now/cmdb/instance").mock(
             return_value=httpx.Response(403, json=UNSCOPED_403)
         )
-        respx.post(url__startswith=f"{SNOW}/api/now").mock(
-            return_value=httpx.Response(200, json={"result": {"items": []}})
-        )
+        mock_writes(httpx.Response(200, json={"result": {"items": []}}))
         report = probe_endpoints(snow_client, cfg)
         assert report.by_name("ire_write").verdict == AUTHORIZED
         assert report.write_path_ok is False

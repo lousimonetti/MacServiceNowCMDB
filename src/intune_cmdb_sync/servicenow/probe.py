@@ -46,19 +46,27 @@ from .writers import (
     IDENTIFY_RECONCILE_API,
     IDENTIFY_RECONCILE_ENHANCED_API,
     IDENTIFY_RECONCILE_QUERY_API,
+    NO_SUCH_API_MARKER,
+    PROBE_CLASS,
     unscoped_api_refusal,
 )
 
 log = logging.getLogger(__name__)
 
-# A class name that cannot exist, so a POST to the CMDB Instance API has
-# nowhere to write even if every permission in front of it is open. The API
-# rejects it *after* the REST gate has already made its decision.
-PROBE_CLASS = "cmdb_ci_intune_cmdb_sync_probe_no_such_class"
-
 # Empty payload for the identifyreconcile probes: zero items to identify means
 # zero records IRE could create.
 EMPTY_IRE_BODY: dict[str, Any] = {"items": [], "relations": []}
+
+# A table that cannot exist, for probing Table API inserts.
+PROBE_TABLE = "u_intune_cmdb_sync_probe_no_such_table"
+
+# A sys_id no record can have, for probing Table API updates. Paired with an
+# empty body, so the request cannot modify anything even if it did resolve.
+PROBE_SYS_ID = "0" * 32
+
+# `PROBE_CLASS` (a class that cannot exist, so the CMDB Instance API has
+# nowhere to write) and `NO_SUCH_API_MARKER` are defined in writers.py, which
+# uses both for the same purpose in `--check`.
 
 # Verdicts, ordered from "working" to "broken".
 AUTHORIZED = "authorized"
@@ -96,6 +104,11 @@ class EndpointProbe:
     # from the URL actually called. The CMDB Instance probes put a throwaway
     # class in the path; telling an admin to scope *that* would be wrong.
     api: str | None = None
+    # True when the probe deliberately names a table, class, or record that
+    # cannot exist. For those, a 404 from the API is a *pass*: it means the
+    # request reached the API, which then reported the obvious. Only a 404 that
+    # says the URI routes nowhere is a genuine absence.
+    missing_target: bool = False
     # False for probes that only add context (versioned aliases), so a failure
     # on them does not read as a blocker.
     required: bool = True
@@ -226,6 +239,7 @@ def build_probes(cfg: ServiceNowConfig) -> list[EndpointProbe]:
             path=f"{CMDB_INSTANCE_API}/{PROBE_CLASS}",
             json_body={},
             api=f"{CMDB_INSTANCE_API}/{{className}}",
+            missing_target=True,
             proves="SNOW_WRITE_MODE=cmdb_instance can run",
             required=cfg.write_mode == "cmdb_instance",
         ),
@@ -235,7 +249,27 @@ def build_probes(cfg: ServiceNowConfig) -> list[EndpointProbe]:
             path=_versioned(f"{CMDB_INSTANCE_API}/{PROBE_CLASS}"),
             json_body={},
             api=_versioned(f"{CMDB_INSTANCE_API}/{{className}}"),
+            missing_target=True,
             proves="whether the versioned CMDB Instance path is scoped differently",
+            required=False,
+        ),
+        EndpointProbe(
+            name="table_update",
+            method="PATCH",
+            path=f"{TABLE_API}/{ci_class}/{PROBE_SYS_ID}",
+            json_body={},
+            api=f"{TABLE_API}/{{tableName}}/{{sys_id}}",
+            missing_target=True,
+            proves="retirement can run (it PATCHes install_status through the Table API)",
+        ),
+        EndpointProbe(
+            name="table_insert",
+            method="POST",
+            path=f"{TABLE_API}/{PROBE_TABLE}",
+            json_body={},
+            api=f"{TABLE_API}/{{tableName}}",
+            missing_target=True,
+            proves="the Table API accepts writes, the last-resort fallback",
             required=False,
         ),
     ]
@@ -267,7 +301,7 @@ def _body(response: Any) -> str:
         return ""
 
 
-def classify(response: Any) -> tuple[str, str]:
+def classify(response: Any, probe: EndpointProbe) -> tuple[str, str]:
     """Turn one HTTP response into (verdict, detail).
 
     A 4xx from the API's own validation is a **pass**: the probes are built to
@@ -286,11 +320,14 @@ def classify(response: Any) -> tuple[str, str]:
             return BLOCKED_AT_GATE, detail
         return DENIED_BY_ROLE, detail
     if status == 404:
-        # The CMDB Instance probes aim at a class that does not exist, so a 404
-        # whose *body* names the class is the API answering -- a pass. A 404 for
-        # the API itself is not.
-        if PROBE_CLASS in _body(response):
-            return AUTHORIZED, f"HTTP {status} (reached the API; probe class rejected as expected)"
+        body = _body(response)
+        if NO_SUCH_API_MARKER in body.lower():
+            return NOT_FOUND, detail
+        if PROBE_CLASS in body or probe.missing_target:
+            return AUTHORIZED, (
+                f"HTTP {status} (reached the API; the probe names a "
+                "table/class/record that does not exist, as intended)"
+            )
         return NOT_FOUND, detail
     if status in (400, 405, 422, 500):
         # Reached the API and it complained about the request, which is what a
@@ -315,7 +352,7 @@ def probe_endpoints(client: ServiceNowClient, cfg: ServiceNowConfig) -> ProbeRep
             )
             continue
 
-        verdict, detail = classify(response)
+        verdict, detail = classify(response, probe)
         result = ProbeResult(
             probe=probe,
             verdict=verdict,
@@ -407,6 +444,31 @@ def diagnose(report: ProbeReport) -> list[str]:
                 "The auth scope is bound to one API version and not the other; scope both, "
                 "or call the one that is scoped."
             )
+
+    if not report.write_path_ok:
+        # The most useful thing the matrix can produce: the configured write
+        # path is shut, and a different one is open. Without this the operator
+        # reads a wall of 403s and waits on the ServiceNow team.
+        alternative = report.by_name(
+            "ire_write" if report.write_mode == "cmdb_instance" else "cmdb_instance_write"
+        )
+        if alternative and alternative.ok:
+            mode = "identify_reconcile" if report.write_mode == "cmdb_instance" else (
+                "cmdb_instance"
+            )
+            lines.append(
+                f"You can run today: {alternative.probe.label} is allowed, so "
+                f"SNOW_WRITE_MODE={mode} works on this instance without waiting for the "
+                "auth scope above. It is a different API, not a way around the same gate. "
+                "Read what it costs first — identification falls back to serial number "
+                "then name, so a serial correction duplicates a CI (README, 'Write modes')."
+            )
+            retire = report.by_name("table_update")
+            if retire and not retire.ok:
+                lines.append(
+                    f"...but {retire.probe.label} is {retire.label}, so retirement cannot "
+                    "run in any write mode. Keep SNOW_RETIRE_MISSING=false."
+                )
 
     if report.write_path_ok:
         lines.append(

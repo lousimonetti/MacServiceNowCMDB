@@ -105,11 +105,20 @@ behaviour change, particularly anything altering what gets written to a CI.
   linked to it, bound per API *and per HTTP method*. Adding `itil` changes
   nothing. The tell is in the run report — `users_resolved > 0` with real
   sys_ids means the same credential already reads the Table API fine, and the
-  403 carries `X-Is-Logged-In: true`. **`SNOW_WRITE_MODE=cmdb_instance` is not a
-  workaround**: `/api/now/cmdb/instance/…` is a global-scope `/api/now/` API
-  behind the same gate, confirmed refused identically. The fix is a REST API
-  Auth Scope for `POST` on both `/api/now/identifyreconcile` and
+  403 carries `X-Is-Logged-In: true`. The fix is a REST API Auth Scope for
+  `POST` on both `/api/now/identifyreconcile` and
   `/api/now/identifyreconcile/query`, or Scope Restriction = Broadly Scoped.
+
+- **Which APIs are gated is per-instance — probe, do not assume.** This file
+  previously stated that `/api/now/cmdb/instance/…` was "behind the same gate,
+  confirmed refused identically". A live `--check-api` on 2026-09-04 refuted
+  that: every `identifyreconcile` variant returned 403 at the gate while `POST
+  /api/now/cmdb/instance/{class}` returned 400, i.e. reached the API. Auth
+  scopes bind per API *and per HTTP method*, so the only reliable statement is
+  the one the probe makes. `SNOW_WRITE_MODE=cmdb_instance` is therefore a real
+  fallback on that instance, with the trade-offs in `writers.py`: no
+  `sys_object_source_info`, so identification falls back to serial number then
+  name, and `correlation_id` becomes the only link back to the Intune device.
 
 ## State of the work
 
@@ -136,6 +145,15 @@ not observed responses. Green tests are weaker evidence here than they look.
    probes post to a class that does not exist. A 400/404 from those probes is a
    **pass**: reaching the API's own validation proves the request cleared the
    gate. Exit 3 means the endpoint the configured write mode uses is refused.
+1a. **Unblocked path, if the IRE scope stays stuck: `SNOW_WRITE_MODE=cmdb_instance`.**
+   The 2026-09-04 probe shows that endpoint allowed on this instance, along with
+   `PATCH /api/now/table/…` (retirement) and `POST /api/now/table/…`. `--check`
+   verifies this mode now (`_verify_cmdb_instance_access`) and `--dry-run`
+   predicts insert/update by reading serial number then name rather than
+   reporting `pending`. Both are weaker than IRE and say so: the prediction is
+   not a simulation, and without `sys_object_source_info` a serial-number
+   correction duplicates a CI. Prefer IRE if the auth scope lands; do not treat
+   this as equivalent.
 2. **`intune-cmdb-sync --check`.** Proves both connections *and* simulates a
    write through `/api/now/identifyreconcile/query`, which commits nothing — so
    a missing `itil` role or an unregistered discovery source fails here rather

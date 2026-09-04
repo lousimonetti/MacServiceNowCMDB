@@ -166,10 +166,33 @@ documents all of them; these are the ones that matter most.
 | Identity | Intune device GUID, then identification rules | identification rules only |
 | Survives a serial-number change | yes | no — creates a duplicate |
 | Per-CI result detail | `INSERT` / `UPDATE` / `NO_CHANGE` + errors | success or failure only |
+| Dry run | simulated by IRE, through `/identifyreconcile/query` | predicted by reading the CMDB (see below) |
 | Role | `itil` or `asset` | `itil` |
 
 Use `identify_reconcile`. `cmdb_instance` exists for instances that predate the
 IRE API or where it is blocked by policy; it is meaningfully weaker.
+
+#### Running on `cmdb_instance`
+
+The two are separately scoped APIs, so an OAuth client can be refused one and
+allowed the other. `intune-cmdb-sync --check-api` says which, per method. If it
+reports `POST /api/now/identifyreconcile` refused at the gate and
+`POST /api/now/cmdb/instance/{className}` allowed, this mode is a way to run
+now rather than a workaround for the same block — with these consequences:
+
+- **Identification is by serial number, then name.** There is no
+  `sys_object_source_info`, so a serial-number correction creates a duplicate CI
+  instead of updating the existing one.
+- **`correlation_id` is the only link back to Intune.** Keep
+  `SNOW_SET_CORRELATION=true` (the default); without it nothing on the CI
+  records which Intune device it came from.
+- **`--dry-run` predicts rather than simulates.** It looks each device up by
+  serial number and then name — the identifier fields the API uses — and reports
+  insert vs update. Customised identification rules can still make the real
+  write differ, and `NO_CHANGE` is indistinguishable from an update.
+- **Retirement is a separate API again.** It PATCHes the Table API, which has
+  its own auth scope; `--check-api`'s `table_update` row is what tells you
+  whether it will work.
 
 ---
 

@@ -201,6 +201,11 @@ def _check(cfg: Config) -> int:
         write_access = verify_write_access(snow, cfg.servicenow)
         if write_access.verified:
             log.info("ServiceNow write path verified", extra={"detail": write_access.detail})
+            for caveat in write_access.caveats:
+                # `verified` means the write path is callable, not that the
+                # first run will succeed. Anything in that gap has to be said
+                # out loud, or a pass reads as a guarantee it is not.
+                log.warning("write path caveat", extra={"detail": caveat})
         else:
             # Not proven broken, but not proven working either. Saying "passed"
             # here would be the whole point of this check, inverted.

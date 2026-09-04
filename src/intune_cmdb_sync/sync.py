@@ -56,15 +56,20 @@ class SyncRunner:
         state = SyncState.load(store)
 
         if self.cfg.runtime.dry_run and self.writer.mode == "cmdb_instance":
-            # The CMDB Instance API has no simulate endpoint, so a dry run there
-            # can only report "nothing was written" — it cannot tell you what
-            # *would* have been written. Say so rather than emitting a report
-            # full of zeros that looks like a clean run.
+            # The CMDB Instance API has no simulate endpoint, so the insert /
+            # update split here is predicted from the class's identifier fields
+            # by reading the CMDB, not reported by IRE. Close enough to be worth
+            # having before a first write, not close enough to be called a
+            # simulation — and the difference has to be in the report, because
+            # nothing else in it distinguishes the two.
             report.warnings.append(
-                "dry run under SNOW_WRITE_MODE=cmdb_instance cannot predict per-device "
-                "outcomes: the CMDB Instance API has no simulation endpoint. Use "
-                "SNOW_WRITE_MODE=identify_reconcile for a dry run that reports real "
-                "INSERT/UPDATE/NO_CHANGE results."
+                "dry run under SNOW_WRITE_MODE=cmdb_instance predicts insert/update by "
+                "looking up each device's serial number, then name, in the CMDB: the "
+                "identifier fields the API would use. It is a prediction, not a "
+                "simulation — customised identification rules or IRE reclassification "
+                "can still make the real write differ, and NO_CHANGE cannot be "
+                "distinguished from an update. Only SNOW_WRITE_MODE=identify_reconcile "
+                "reports what IRE itself would do."
             )
 
         identity = self.snow.verify_connectivity()

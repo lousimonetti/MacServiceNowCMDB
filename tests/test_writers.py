@@ -11,6 +11,7 @@ from intune_cmdb_sync.config import Config
 from intune_cmdb_sync.errors import ServiceNowError
 from intune_cmdb_sync.servicenow.client import ServiceNowClient
 from intune_cmdb_sync.servicenow.writers import (
+    PROBE_CLASS,
     PROBE_SOURCE_KEY,
     CiPayload,
     CmdbInstanceWriter,
@@ -251,9 +252,87 @@ class TestCmdbInstanceWriter:
         assert result.action == "error"
         assert "no identifier matched" in result.message
 
-    def test_dry_run_writes_nothing(self, snow_client, config: Config):
-        writer = CmdbInstanceWriter(snow_client, config.servicenow, dry_run=True)
-        assert writer.write([payload()])[0].action == "dry_run:pending"
+class TestCmdbInstanceDryRun:
+    """Without a simulation endpoint this mode used to report every device as
+    "pending", which is no preview at all -- and on an instance where it is the
+    only allowed write path, that puts nothing between configuring the
+    connector and letting it write to production. The prediction reproduces the
+    class's identifier rules with reads."""
+
+    def _writer(self, snow_client, config: Config) -> CmdbInstanceWriter:
+        return CmdbInstanceWriter(snow_client, config.servicenow, dry_run=True)
+
+    @respx.mock
+    def test_writes_nothing(self, snow_client, config: Config):
+        write = respx.post(url__startswith=f"{SNOW}/api/now/cmdb/instance")
+        respx.get(f"{SNOW}/api/now/table/cmdb_ci_computer").mock(
+            return_value=httpx.Response(200, json={"result": []})
+        )
+        self._writer(snow_client, config).write([payload()])
+        assert write.call_count == 0
+
+    @respx.mock
+    def test_a_matching_serial_predicts_an_update(self, snow_client, config: Config):
+        route = respx.get(f"{SNOW}/api/now/table/cmdb_ci_computer").mock(
+            return_value=httpx.Response(
+                200,
+                json={"result": [{"sys_id": "ci-1", "serial_number": "C02XY1Z2ABCD",
+                                  "name": "OTHER-NAME"}]},
+            )
+        )
+        result = self._writer(snow_client, config).write([payload()])[0]
+        assert result.action == "dry_run:updated"
+        assert result.sys_id == "ci-1"
+        # One read for the whole batch, not one per device.
+        assert route.call_count == 1
+
+    @respx.mock
+    def test_no_match_predicts_an_insert(self, snow_client, config: Config):
+        respx.get(f"{SNOW}/api/now/table/cmdb_ci_computer").mock(
+            return_value=httpx.Response(200, json={"result": []})
+        )
+        result = self._writer(snow_client, config).write([payload()])[0]
+        assert result.action == "dry_run:inserted"
+        assert result.sys_id is None
+
+    @respx.mock
+    def test_falls_back_to_name_when_the_serial_is_absent(self, snow_client, config: Config):
+        """Serial first, then name: the order the identifier rules use."""
+        respx.get(f"{SNOW}/api/now/table/cmdb_ci_computer").mock(
+            return_value=httpx.Response(
+                200, json={"result": [{"sys_id": "ci-2", "serial_number": "", "name": "LOU-MBP16"}]}
+            )
+        )
+        result = self._writer(snow_client, config).write([payload(serial_number=None)])[0]
+        assert result.action == "dry_run:updated"
+        assert result.sys_id == "ci-2"
+
+    @respx.mock
+    def test_a_failed_lookup_is_reported_not_guessed(self, snow_client, config: Config):
+        """Predicting "insert" from a read that failed would be a fabrication,
+        and the first real run would then quietly update instead."""
+        respx.get(f"{SNOW}/api/now/table/cmdb_ci_computer").mock(
+            return_value=httpx.Response(403, text="denied")
+        )
+        result = self._writer(snow_client, config).write([payload()])[0]
+        assert result.action == "dry_run:pending"
+        assert "could not look up" in result.message
+
+    @respx.mock
+    def test_a_value_that_would_break_the_encoded_query_is_left_out(
+        self, snow_client, config: Config
+    ):
+        """`,` separates IN values and `^` separates clauses. Escaping is not
+        worth the risk of a malformed query matching the wrong CIs."""
+        route = respx.get(f"{SNOW}/api/now/table/cmdb_ci_computer").mock(
+            return_value=httpx.Response(200, json={"result": []})
+        )
+        self._writer(snow_client, config).write(
+            [payload(serial_number="BAD,SERIAL", device_name="LOU-MBP16")]
+        )
+        query = route.calls[0].request.url.params["sysparm_query"]
+        assert "BAD,SERIAL" not in query
+        assert "nameINLOU-MBP16" in query
 
 
 class TestBuildWriter:
@@ -410,12 +489,109 @@ class TestVerifyWriteAccess:
         assert "asset_tag" in str(exc.value)
         assert "ctx-1" in str(exc.value)
 
-    def test_cmdb_instance_mode_is_honestly_unverified(self, set_env):
+class TestVerifyCmdbInstanceAccess:
+    """On an instance where the OAuth client is refused identifyreconcile but
+    not the CMDB Instance API -- observed live 2026-09-04 -- this mode is the
+    write path, so `--check` has to actually check it. It still cannot create a
+    CI to find out: it posts to a class that cannot exist."""
+
+    def _client(self, set_env) -> tuple[ServiceNowClient, Config]:
         set_env(SNOW_WRITE_MODE="cmdb_instance")
         cfg = Config.from_env()
-        check = verify_write_access(ServiceNowClient(cfg.servicenow), cfg.servicenow)
+        client = ServiceNowClient(cfg.servicenow)
+        client.auth._token = "snow-token"
+        client.auth._expires_at = float("inf")
+        return client, cfg
+
+    def _probe_route(self, status: int, **kwargs):
+        return respx.post(
+            url__startswith=f"{SNOW}/api/now/cmdb/instance/"
+        ).mock(return_value=httpx.Response(status, **kwargs))
+
+    def _source_registered(self, rows=({"value": "Intune"},)):
+        return respx.get(f"{SNOW}/api/now/table/sys_choice").mock(
+            return_value=httpx.Response(200, json={"result": list(rows)})
+        )
+
+    @respx.mock
+    def test_a_rejected_probe_class_proves_the_endpoint_is_callable(self, set_env):
+        client, cfg = self._client(set_env)
+        route = self._probe_route(400, json={"error": {"message": "Invalid class"}})
+        self._source_registered()
+
+        check = verify_write_access(client, cfg.servicenow)
+        assert check.verified
+        # The probe reached the API with nowhere to write.
+        assert PROBE_CLASS in str(route.calls[0].request.url)
+        assert json.loads(route.calls[0].request.content) == {}
+
+    @respx.mock
+    def test_the_oauth_gate_is_still_reported_as_the_gate(self, set_env):
+        client, cfg = self._client(set_env)
+        self._probe_route(403, json=UNSCOPED_403)
+        with pytest.raises(ServiceNowError) as exc:
+            verify_write_access(client, cfg.servicenow)
+        assert "REST API Auth Scope" in str(exc.value)
+        assert "It needs the 'itil'" not in str(exc.value)
+
+    @respx.mock
+    def test_an_ordinary_403_still_names_the_role(self, set_env):
+        client, cfg = self._client(set_env)
+        self._probe_route(403, text="insufficient rights")
+        with pytest.raises(ServiceNowError) as exc:
+            verify_write_access(client, cfg.servicenow)
+        assert "itil" in str(exc.value)
+
+    @respx.mock
+    def test_an_absent_api_is_unverified_not_a_failure(self, set_env):
+        client, cfg = self._client(set_env)
+        self._probe_route(
+            404,
+            json={"error": {"message": "Requested URI does not represent any resource"}},
+        )
+        check = verify_write_access(client, cfg.servicenow)
         assert not check.verified
-        assert "cannot be checked" in check.detail
+
+    @respx.mock
+    def test_an_unregistered_discovery_source_is_a_caveat(self, set_env):
+        """It does not make the endpoint uncallable, but it does make the first
+        write fail, and the error alone never says where to register it."""
+        client, cfg = self._client(set_env)
+        self._probe_route(400, json={"error": {"message": "Invalid class"}})
+        self._source_registered(rows=())
+
+        check = verify_write_access(client, cfg.servicenow)
+        assert check.verified
+        assert any("cmdb_ci.discovery_source" in c for c in check.caveats)
+
+    @respx.mock
+    def test_identification_rules_are_always_flagged_as_unproven(self, set_env):
+        """`verified` here means callable, not "the first run will succeed".
+        Collapsing that distinction is what made this check worth having."""
+        client, cfg = self._client(set_env)
+        self._probe_route(400, json={"error": {"message": "Invalid class"}})
+        self._source_registered()
+        check = verify_write_access(client, cfg.servicenow)
+        assert any("identification rules" in c for c in check.caveats)
+        assert any("--limit 1" in c for c in check.caveats)
+
+    @respx.mock
+    def test_retirement_is_flagged_as_a_separately_scoped_api(self, set_env):
+        """A run can write every CI and then fail only at retirement, because
+        that is a Table API PATCH behind its own auth scope."""
+        set_env(
+            SNOW_WRITE_MODE="cmdb_instance",
+            SNOW_RETIRE_MISSING="true",
+            STATE_PATH="/tmp/intune-cmdb-sync-test-state.json",
+        )
+        cfg = Config.from_env()
+        client = ServiceNowClient(cfg.servicenow)
+        client.auth._token = "snow-token"
+        client.auth._expires_at = float("inf")
+        self._probe_route(400, json={"error": {"message": "Invalid class"}})
+        self._source_registered()
+        check = verify_write_access(client, cfg.servicenow)
+        assert any("--check-api" in c for c in check.caveats)
 
 
 class TestUnscopedApiRefusal:
@@ -434,8 +610,10 @@ class TestUnscopedApiRefusal:
 
     @respx.mock
     def test_cmdb_instance_write_explains_it_too(self, snow_client, config: Config):
-        """The fallback write mode is behind the same gate, so its per-device
-        error must not read as a reason to switch to it."""
+        """When this API is gated too, its per-device error has to explain the
+        gate rather than read as a plain permissions failure. Whether it *is*
+        gated is per-instance -- see TestVerifyCmdbInstanceAccess for the case
+        where identifyreconcile is refused and this endpoint is not."""
         respx.post(f"{SNOW}/api/now/cmdb/instance/cmdb_ci_computer").mock(
             return_value=httpx.Response(403, json=UNSCOPED_403)
         )

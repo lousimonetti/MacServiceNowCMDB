@@ -40,6 +40,16 @@ IDENTIFY_RECONCILE_QUERY_API = "/api/now/identifyreconcile/query"
 # could not collide with a real CI.
 PROBE_SOURCE_KEY = "intune-cmdb-sync:write-access-probe"
 
+# A class name that cannot exist. POSTing to it exercises the CMDB Instance API
+# with nowhere to write, which is how that endpoint's availability gets proven
+# without creating a CI. Shared with probe.py.
+PROBE_CLASS = "cmdb_ci_intune_cmdb_sync_probe_no_such_class"
+
+# ServiceNow's body for a URI that routes to no REST API at all. It is the only
+# thing separating "this API does not exist" from "this API answered and the
+# class you named does not exist" -- both come back 404.
+NO_SUCH_API_MARKER = "does not represent any resource"
+
 # ServiceNow refuses an OAuth client that is not authorised for a global-scope
 # API *before* it looks at roles or ACLs, and the response says only "User Not
 # Authorized". Left unexplained that reads as a missing `itil` role, which is
@@ -236,6 +246,11 @@ class WriteAccessCheck:
 
     verified: bool
     detail: str
+    # Things this check could not establish. `verified` means "the write path
+    # is callable and its prerequisites exist", which is not the same as "the
+    # first run will succeed"; anything in that gap belongs here rather than
+    # being folded into a pass or a fail.
+    caveats: list[str] = field(default_factory=list)
 
 
 def verify_write_access(client: ServiceNowClient, cfg: ServiceNowConfig) -> WriteAccessCheck:
@@ -254,6 +269,8 @@ def verify_write_access(client: ServiceNowClient, cfg: ServiceNowConfig) -> Writ
     an unverified result when the answer is genuinely unknown, which is not the
     same thing and must not be reported as success.
     """
+    if cfg.write_mode == "cmdb_instance":
+        return _verify_cmdb_instance_access(client, cfg)
     if cfg.write_mode != "identify_reconcile":
         return WriteAccessCheck(
             verified=False,
@@ -348,6 +365,115 @@ def verify_write_access(client: ServiceNowClient, cfg: ServiceNowConfig) -> Writ
     )
 
 
+def _verify_cmdb_instance_access(
+    client: ServiceNowClient, cfg: ServiceNowConfig
+) -> WriteAccessCheck:
+    """Verify the CMDB Instance write path without creating a CI.
+
+    This mode has no simulation endpoint, so it used to be reported as
+    uncheckable. That was the right answer while it was a fallback nobody used.
+    It is the wrong answer on an instance where the identifyreconcile API is
+    refused at the OAuth gate and this one is not, because then it is the write
+    path -- and "uncheckable" leaves the operator with a first run as their
+    first test.
+
+    Two things can be established without writing, and they are the two that
+    fail first:
+
+    * whether `POST /api/now/cmdb/instance/{class}` is callable at all, proven
+      by posting to a class that cannot exist -- the request reaches the API,
+      which rejects it on the class name, having already cleared the gate;
+    * whether `SNOW_DISCOVERY_SOURCE` is a registered choice value, read from
+      `sys_choice`.
+
+    What cannot be established is whether the class's identification rules will
+    accept the connector's attributes. That is a caveat, not a pass.
+    """
+    response = client.request("POST", f"{CMDB_INSTANCE_API}/{PROBE_CLASS}", json_body={})
+
+    if response.status_code in (401, 403):
+        detail = describe_error(response)
+        if unscoped_api_refusal(detail):
+            raise ServiceNowError(
+                f"the CMDB Instance API is not available to these credentials: {detail}."
+                f"{_unscoped_api_suffix(detail, path=f'{CMDB_INSTANCE_API}/{{className}}')}"
+            )
+        raise ServiceNowError(
+            f"the integration user cannot write through the CMDB Instance API: {detail}. "
+            "It needs the 'itil' or 'asset' role."
+        )
+
+    if response.status_code == 404 and NO_SUCH_API_MARKER in (response.text or "").lower():
+        return WriteAccessCheck(
+            verified=False,
+            detail=(
+                f"this instance has no {CMDB_INSTANCE_API} endpoint, so "
+                "SNOW_WRITE_MODE=cmdb_instance cannot run here."
+            ),
+        )
+
+    caveats = _discovery_source_caveats(client, cfg)
+    caveats.append(
+        "the CMDB Instance API has no simulation endpoint, so whether the identification "
+        f"rules for {cfg.default_class or 'cmdb_ci_computer'} accept these attributes is "
+        "only knowable from a real write. Run with --limit 1 first."
+    )
+    if cfg.retire_missing:
+        # Retirement is a Table API PATCH, a different API behind the same
+        # gate. A run can therefore write CIs happily and then fail only at
+        # retirement, which is the worst place to discover it.
+        caveats.append(
+            "SNOW_RETIRE_MISSING is on: retirement PATCHes the Table API, which is a "
+            "separate API from this one and separately scoped. Confirm it with "
+            "`intune-cmdb-sync --check-api` (the table_update row)."
+        )
+    if not (cfg.set_correlation and cfg.correlation_field):
+        # Without sys_object_source_info there is nothing on the CI tying it to
+        # the Intune device, so the correlation field is the only such link.
+        caveats.append(
+            "SNOW_SET_CORRELATION is off. This write mode cannot send "
+            "sys_object_source_info, so with no correlation field there is nothing on "
+            "the CI recording which Intune device it came from."
+        )
+
+    return WriteAccessCheck(
+        verified=True,
+        detail=(
+            f"POST {CMDB_INSTANCE_API}/{{className}} is callable by these credentials "
+            f"(probed with a class that does not exist: HTTP {response.status_code}); "
+            "nothing was created"
+        ),
+        caveats=caveats,
+    )
+
+
+def _discovery_source_caveats(client: ServiceNowClient, cfg: ServiceNowConfig) -> list[str]:
+    """Check `SNOW_DISCOVERY_SOURCE` against the registered choice values."""
+    try:
+        rows = client.query_table(
+            "sys_choice",
+            query=(
+                "name=cmdb_ci^element=discovery_source^value="
+                f"{cfg.discovery_source}"
+            ),
+            fields=("value",),
+            limit=1,
+        )
+    except ServiceNowError as exc:
+        return [
+            f"could not read sys_choice to confirm SNOW_DISCOVERY_SOURCE="
+            f"{cfg.discovery_source!r} is registered ({exc}); an unregistered value is "
+            "rejected on the first write"
+        ]
+    if not rows:
+        return [
+            f"SNOW_DISCOVERY_SOURCE={cfg.discovery_source!r} is not a choice value on "
+            "cmdb_ci.discovery_source. Register it (docs/servicenow-setup.md section 5) "
+            "or the first write will be rejected."
+        ]
+    return []
+
+
 class CmdbInstanceWriter:
     """Per-CI writer built on `POST /api/now/cmdb/instance/{className}`."""
 
@@ -362,13 +488,97 @@ class CmdbInstanceWriter:
         if not batch:
             return []
         if self._dry_run:
-            return [
-                WriteResult(intune_id=item.intune_id, action="dry_run:pending") for item in batch
-            ]
+            return self._preview(batch)
 
         workers = min(self._cfg.concurrency, len(batch))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             return list(pool.map(self._write_one, batch))
+
+    def _preview(self, batch: list[CiPayload]) -> list[WriteResult]:
+        """Predict insert vs update using reads only.
+
+        The CMDB Instance API has no simulation endpoint, so this mode used to
+        report every device as "pending" -- a dry run that could not say
+        anything at all. That is tolerable for a fallback and not tolerable for
+        the only write path an instance allows, because it removes the one step
+        between configuring the connector and letting it write to production.
+
+        The prediction reproduces how the API identifies a CI: the class's
+        identifier rules, which for the computer classes are serial number
+        first, then name. It is a prediction, not a simulation -- a rule the
+        admin has customised, or an IRE reclassification, can still make the
+        real write do something else. `_lookup` failing is not fatal: an
+        unpredictable device is reported as such rather than guessed at.
+        """
+        try:
+            by_serial, by_name = self._lookup(batch)
+        except ServiceNowError as exc:
+            log.warning("dry run could not read existing CIs", extra={"error": str(exc)})
+            return [
+                WriteResult(
+                    intune_id=item.intune_id,
+                    action="dry_run:pending",
+                    errors=[f"could not look up the existing CI: {exc}"],
+                )
+                for item in batch
+            ]
+
+        results: list[WriteResult] = []
+        for item in batch:
+            serial = (item.serial_number or "").strip().lower()
+            match = by_serial.get(serial) if serial else None
+            if match is None:
+                match = by_name.get((item.device_name or "").strip().lower())
+            results.append(
+                WriteResult(
+                    intune_id=item.intune_id,
+                    action="dry_run:updated" if match else "dry_run:inserted",
+                    sys_id=match.get("sys_id") if match else None,
+                )
+            )
+        return results
+
+    def _lookup(
+        self, batch: list[CiPayload]
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """One Table API read per class, indexed by serial number and by name."""
+        by_serial: dict[str, dict[str, Any]] = {}
+        by_name: dict[str, dict[str, Any]] = {}
+
+        classes: dict[str, list[CiPayload]] = {}
+        for item in batch:
+            classes.setdefault(item.class_name, []).append(item)
+
+        for class_name, items in classes.items():
+            serials = {_query_safe(i.serial_number) for i in items}
+            names = {_query_safe(i.device_name) for i in items}
+            serials.discard(None)
+            names.discard(None)
+            clauses = []
+            if serials:
+                clauses.append("serial_numberIN" + ",".join(sorted(serials)))  # type: ignore[arg-type]
+            if names:
+                clauses.append("nameIN" + ",".join(sorted(names)))  # type: ignore[arg-type]
+            if not clauses:
+                continue
+
+            rows = self._client.query_table(
+                class_name,
+                query="^OR".join(clauses),
+                fields=("sys_id", "name", "serial_number"),
+                limit=max(len(items) * 2, 10),
+            )
+            for row in rows:
+                serial = str(row.get("serial_number") or "").strip().lower()
+                name = str(row.get("name") or "").strip().lower()
+                # First match wins: a duplicate serial in the CMDB is a data
+                # problem there, and picking arbitrarily would make the dry run
+                # unstable between runs for no benefit.
+                if serial:
+                    by_serial.setdefault(serial, row)
+                if name:
+                    by_name.setdefault(name, row)
+        return by_serial, by_name
 
     def _write_one(self, item: CiPayload) -> WriteResult:
         body = {"attributes": item.values, "source": self._cfg.discovery_source}
@@ -414,6 +624,20 @@ class CmdbInstanceWriter:
         return WriteResult(intune_id=item.intune_id, action=action, sys_id=str(sys_id))
 
 
+def _query_safe(value: str | None) -> str | None:
+    """Drop values that would break an encoded query rather than escaping them.
+
+    `,` separates the values of an `IN` clause and `^` separates clauses, so a
+    serial or device name containing either cannot go in one. Losing the
+    lookup costs a dry-run prediction; a malformed query would silently match
+    the wrong records, which is worse.
+    """
+    cleaned = (value or "").strip()
+    if not cleaned or "," in cleaned or "^" in cleaned:
+        return None
+    return cleaned
+
+
 def unscoped_api_refusal(detail: str) -> bool:
     """True when a refusal is the REST gate rather than a role or an ACL."""
     return _UNSCOPED_API_MARKER in detail.lower()
@@ -435,10 +659,12 @@ def _unscoped_api_suffix(detail: str, *, method: str = "POST", path: str = "this
         f" This is the OAuth client being refused {method} {path} at the REST gate, before "
         "any role or ACL is consulted, so it is not a missing role: the Application Registry "
         "entry is Securely Scoped and has no REST API Auth Scope linked for "
-        f"{method} on {path}. Adding 'itil' will not change it, and "
-        "SNOW_WRITE_MODE=cmdb_instance is behind the same gate. Run "
-        "`intune-cmdb-sync --check-api` for a per-endpoint, per-method breakdown of what "
-        "this credential is and is not allowed to call. See docs/servicenow-setup.md."
+        f"{method} on {path}. Adding 'itil' will not change it. Whether "
+        "SNOW_WRITE_MODE=cmdb_instance is refused too depends on which auth scopes exist — "
+        "it is a separate API and has been observed allowed on an instance that refuses "
+        "identifyreconcile. Run `intune-cmdb-sync --check-api` for a per-endpoint, "
+        "per-method breakdown of what this credential may call. See "
+        "docs/servicenow-setup.md."
     )
 
 

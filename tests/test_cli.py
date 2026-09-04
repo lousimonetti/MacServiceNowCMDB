@@ -176,11 +176,25 @@ class TestCheck:
         assert main(["--check"]) == EXIT_PARTIAL
 
     @respx.mock
-    def test_cmdb_instance_mode_cannot_be_verified(self, set_env):
+    def test_cmdb_instance_mode_is_verified_and_its_caveats_are_printed(self, set_env, capsys):
+        """This mode is the write path on an instance where the OAuth client is
+        refused identifyreconcile but not the CMDB Instance API, so `--check`
+        has to check it -- and has to be plain about what it could not prove."""
         set_env(SNOW_WRITE_MODE="cmdb_instance")
         mock_snow_plumbing()
         self._graph_ok()
-        assert main(["--check"]) == EXIT_PARTIAL
+        respx.get("https://acme.service-now.com/api/now/table/sys_choice").mock(
+            return_value=httpx.Response(200, json={"result": [{"value": "Intune"}]})
+        )
+        probe = respx.post(
+            url__startswith="https://acme.service-now.com/api/now/cmdb/instance/"
+        ).mock(return_value=httpx.Response(400, json={"error": {"message": "Invalid class"}}))
+
+        assert main(["--check"]) == EXIT_OK
+        assert probe.call_count == 1
+        output = capsys.readouterr().out
+        assert "identification rules" in output
+        assert "--limit 1" in output
 
     @respx.mock
     def test_check_fails_when_servicenow_rejects_auth(self, set_env):
@@ -205,17 +219,21 @@ class TestCheckApi:
         respx.get(url__startswith="https://acme.service-now.com/api/now").mock(
             return_value=httpx.Response(200, json={"result": []})
         )
+        gated = httpx.Response(
+            403,
+            json={
+                "error": {
+                    "message": "User Not Authorized",
+                    "detail": "Access to unscoped api is not allowed",
+                }
+            },
+            headers={"X-Is-Logged-In": "true"},
+        )
         respx.post(url__startswith="https://acme.service-now.com/api/now").mock(
-            return_value=httpx.Response(
-                403,
-                json={
-                    "error": {
-                        "message": "User Not Authorized",
-                        "detail": "Access to unscoped api is not allowed",
-                    }
-                },
-                headers={"X-Is-Logged-In": "true"},
-            )
+            return_value=gated
+        )
+        respx.patch(url__startswith="https://acme.service-now.com/api/now").mock(
+            return_value=gated
         )
         graph = respx.get(DEVICES)
 
@@ -237,6 +255,9 @@ class TestCheckApi:
         respx.post(url__startswith="https://acme.service-now.com/api/now").mock(
             return_value=httpx.Response(200, json={"result": {"items": []}})
         )
+        respx.patch(url__startswith="https://acme.service-now.com/api/now").mock(
+            return_value=httpx.Response(200, json={"result": {}})
+        )
         assert main(["--check-api"]) == EXIT_OK
 
     @respx.mock
@@ -250,7 +271,15 @@ class TestCheckApi:
         posts = respx.post(url__startswith="https://acme.service-now.com/api/now").mock(
             return_value=httpx.Response(200, json={"result": {"items": []}})
         )
+        patches = respx.patch(url__startswith="https://acme.service-now.com/api/now").mock(
+            return_value=httpx.Response(200, json={"result": {}})
+        )
         main(["--check-api"])
+        # Retirement PATCHes the Table API, so that method is probed too -- at a
+        # sys_id no record can have, with a body that would change nothing.
+        for call in patches.calls:
+            assert call.request.url.path.endswith("0" * 32)
+            assert json.loads(call.request.content or b"{}") == {}
         for call in posts.calls:
             body = json.loads(call.request.content or b"{}")
             assert body.get("items", []) == []

@@ -430,7 +430,7 @@ class TestHardwareDetail:
 
 class TestDryRunUnderCmdbInstance:
     @respx.mock
-    def test_warns_that_outcomes_cannot_be_predicted(self, set_env, runner_factory):
+    def test_predicts_outcomes_but_labels_them_a_prediction(self, set_env, runner_factory):
         set_env(DRY_RUN="true", SNOW_WRITE_MODE="cmdb_instance")
         cfg = Config.from_env()
         respx.get(DEVICES).mock(
@@ -440,16 +440,18 @@ class TestDryRunUnderCmdbInstance:
             return_value=httpx.Response(200, json={"responses": []})
         )
         mock_snow_plumbing()
+        respx.get(f"{SNOW}/api/now/table/cmdb_ci_computer").mock(
+            return_value=httpx.Response(200, json={"result": []})
+        )
         write = respx.post(f"{SNOW}/api/now/cmdb/instance/cmdb_ci_computer")
 
         report = runner_factory(cfg).run()
 
         assert write.call_count == 0
-        assert any("cannot predict per-device outcomes" in w for w in report.warnings)
-        # Counts stay at zero, but the warning explains why rather than leaving
-        # an empty report looking like a clean run.
-        assert report.inserted == 0
-        assert report.outcomes[0].action == "skipped"
+        # The outcome is now predicted rather than skipped, but the report has
+        # to keep saying that a prediction is not a simulation.
+        assert report.outcomes[0].action == "inserted"
+        assert any("prediction, not a simulation" in w for w in report.warnings)
 
 
 class TestStatePersistenceFailure:
