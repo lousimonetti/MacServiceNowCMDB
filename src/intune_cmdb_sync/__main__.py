@@ -18,6 +18,7 @@ from .graph import GraphClient
 from .logging_setup import configure_logging
 from .models import RunReport
 from .servicenow.client import ServiceNowClient
+from .servicenow.probe import format_report, probe_endpoints
 from .servicenow.writers import verify_write_access
 from .storage import build_state_store
 from .sync import SyncRunner
@@ -63,6 +64,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--check",
         action="store_true",
         help="Validate configuration and connectivity to both systems, then exit.",
+    )
+    parser.add_argument(
+        "--check-api",
+        action="store_true",
+        help=(
+            "Probe each ServiceNow endpoint the connector can use, one HTTP method at a "
+            "time, and report which are allowed and which are refused -- and by what: the "
+            "OAuth REST gate, a role/ACL, or a missing API. Writes nothing (the probes "
+            "cannot create a CI even when fully authorized) and does not touch Graph. Run "
+            "this when a run fails with 'User Not Authorized'. Exits 3 if the endpoint the "
+            "configured write mode uses is refused."
+        ),
     )
     parser.add_argument("--log-level", help="Override LOG_LEVEL (DEBUG, INFO, WARNING, ERROR).")
     parser.add_argument("--log-format", choices=("json", "text"), help="Override LOG_FORMAT.")
@@ -142,6 +155,38 @@ def _write_report(report: RunReport, location: str | None, include_devices: bool
         log.error("could not write run report", extra={"path": location, "error": str(exc)})
 
 
+def _check_api(cfg: Config) -> int:
+    """Report, per endpoint and per method, what this credential may call.
+
+    `--check` stops at the first refusal and cannot say whether the next
+    endpoint would have behaved the same way. The blocker this exists for --
+    an OAuth client refused at the REST gate -- is bound per API and per HTTP
+    method, so the actionable fact is the *shape* of the refusals across the
+    whole matrix, not any single one of them.
+
+    Graph is deliberately not contacted: this is for the half of the setup that
+    is blocked, and it should still run when Graph is down.
+    """
+    with ServiceNowClient(cfg.servicenow) as snow:
+        report = probe_endpoints(snow, cfg.servicenow)
+
+    # Straight to stdout, not the logger: this is a table for a human to read
+    # and forward to a ServiceNow admin, and JSON log formatting would shred it.
+    print(format_report(report))
+
+    if report.write_path_ok:
+        log.info(
+            "write endpoint reachable",
+            extra={"write_mode": cfg.servicenow.write_mode},
+        )
+        return EXIT_OK
+    log.error(
+        "the endpoint this write mode uses is not callable by these credentials",
+        extra={"write_mode": cfg.servicenow.write_mode},
+    )
+    return EXIT_FAILED
+
+
 def _check(cfg: Config) -> int:
     """Validate configuration and both connections, writing nothing.
 
@@ -211,6 +256,9 @@ def _run(args: argparse.Namespace) -> int:
     )
 
     try:
+        if args.check_api:
+            return _check_api(cfg)
+
         if args.check:
             return _check(cfg)
 

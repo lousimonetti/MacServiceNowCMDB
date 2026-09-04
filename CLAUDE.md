@@ -128,6 +128,14 @@ not observed responses. Green tests are weaker evidence here than they look.
    Constraints). This is with the ServiceNow admin. Until it clears, nothing
    below can run — `SNOW_AUTH_MODE=basic` sidesteps it for local testing only,
    since the restriction is on the OAuth entity rather than the user.
+   **`intune-cmdb-sync --check-api` is the diagnostic for this**: it probes
+   every endpoint × method the connector can use (`servicenow/probe.py`),
+   including the `/api/now/v1/...` aliases, and prints which are allowed plus
+   the scope change to request. It writes nothing and must stay that way — the
+   identifyreconcile probes submit an empty `items` array, the CMDB Instance
+   probes post to a class that does not exist. A 400/404 from those probes is a
+   **pass**: reaching the API's own validation proves the request cleared the
+   gate. Exit 3 means the endpoint the configured write mode uses is refused.
 2. **`intune-cmdb-sync --check`.** Proves both connections *and* simulates a
    write through `/api/now/identifyreconcile/query`, which commits nothing — so
    a missing `itil` role or an unregistered discovery source fails here rather

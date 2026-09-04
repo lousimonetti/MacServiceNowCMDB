@@ -191,6 +191,73 @@ class TestCheck:
         assert main(["--check"]) == EXIT_FAILED
 
 
+class TestCheckApi:
+    """`--check-api` exists because `--check` stops at the first refusal and so
+    cannot say whether the *next* endpoint would have behaved the same way. The
+    fix for the live blocker is bound per API and per HTTP method, so the shape
+    of the whole matrix is the actionable output."""
+
+    @respx.mock
+    def test_reports_the_matrix_and_fails_when_the_write_path_is_refused(
+        self, set_env, capsys
+    ):
+        set_env()
+        respx.get(url__startswith="https://acme.service-now.com/api/now").mock(
+            return_value=httpx.Response(200, json={"result": []})
+        )
+        respx.post(url__startswith="https://acme.service-now.com/api/now").mock(
+            return_value=httpx.Response(
+                403,
+                json={
+                    "error": {
+                        "message": "User Not Authorized",
+                        "detail": "Access to unscoped api is not allowed",
+                    }
+                },
+                headers={"X-Is-Logged-In": "true"},
+            )
+        )
+        graph = respx.get(DEVICES)
+
+        assert main(["--check-api"]) == EXIT_FAILED
+        output = capsys.readouterr().out
+        assert "POST /api/now/identifyreconcile" in output
+        assert "REFUSED AT OAUTH GATE" in output
+        assert "GET /api/now/table/sys_properties" in output
+        # Graph is the half that already works; a ServiceNow diagnostic must not
+        # need it, or an unrelated Graph outage hides the answer.
+        assert graph.call_count == 0
+
+    @respx.mock
+    def test_passes_when_the_configured_write_endpoint_is_allowed(self, set_env):
+        set_env()
+        respx.get(url__startswith="https://acme.service-now.com/api/now").mock(
+            return_value=httpx.Response(200, json={"result": []})
+        )
+        respx.post(url__startswith="https://acme.service-now.com/api/now").mock(
+            return_value=httpx.Response(200, json={"result": {"items": []}})
+        )
+        assert main(["--check-api"]) == EXIT_OK
+
+    @respx.mock
+    def test_writes_nothing_even_when_every_endpoint_is_open(self, set_env):
+        """The probes must be incapable of creating a CI: no item to identify,
+        and a class that does not exist."""
+        set_env()
+        respx.get(url__startswith="https://acme.service-now.com/api/now").mock(
+            return_value=httpx.Response(200, json={"result": []})
+        )
+        posts = respx.post(url__startswith="https://acme.service-now.com/api/now").mock(
+            return_value=httpx.Response(200, json={"result": {"items": []}})
+        )
+        main(["--check-api"])
+        for call in posts.calls:
+            body = json.loads(call.request.content or b"{}")
+            assert body.get("items", []) == []
+            if "/cmdb/instance/" in call.request.url.path:
+                assert "no_such_class" in call.request.url.path
+
+
 class TestReportOnFailure:
     """A failed run is exactly when the per-device detail is worth keeping."""
 

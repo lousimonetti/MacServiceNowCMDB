@@ -45,13 +45,6 @@ PROBE_SOURCE_KEY = "intune-cmdb-sync:write-access-probe"
 # Authorized". Left unexplained that reads as a missing `itil` role, which is
 # the one thing that cannot fix it.
 _UNSCOPED_API_MARKER = "unscoped api"
-_UNSCOPED_API_HINT = (
-    " This is the OAuth client being refused the API at the gate, not a missing role: "
-    "the Application Registry entry is Securely Scoped and has no REST API Auth Scope "
-    "linked for POST on this API. Adding 'itil' will not change it, and "
-    "SNOW_WRITE_MODE=cmdb_instance is behind the same gate. "
-    "See docs/servicenow-setup.md."
-)
 
 # IRE `operation` values mapped onto the connector's outcome vocabulary.
 _OPERATION_TO_ACTION = {
@@ -154,7 +147,7 @@ class IdentifyReconcileWriter:
             detail = describe_error(response)
             raise ServiceNowError(
                 f"identifyreconcile ({len(batch)} items) failed: {detail}"
-                f"{_unscoped_api_suffix(detail)}"
+                f"{_unscoped_api_suffix(detail, path=self._endpoint())}"
                 f"{_log_context_suffix(_log_context_id(response))}"
             )
 
@@ -312,7 +305,8 @@ def verify_write_access(client: ServiceNowClient, cfg: ServiceNowConfig) -> Writ
         if _unscoped_api_suffix(detail):
             raise ServiceNowError(
                 f"the Identification and Reconciliation API is not available to these "
-                f"credentials: {detail}.{_unscoped_api_suffix(detail)}"
+                f"credentials: {detail}."
+                f"{_unscoped_api_suffix(detail, path=IDENTIFY_RECONCILE_QUERY_API)}"
             )
         raise ServiceNowError(
             f"the integration user cannot use the Identification and Reconciliation API: "
@@ -390,7 +384,10 @@ class CmdbInstanceWriter:
             return WriteResult(
                 intune_id=item.intune_id,
                 action="error",
-                errors=[f"{detail}{_unscoped_api_suffix(detail)}"],
+                errors=[
+                    f"{detail}"
+                    f"{_unscoped_api_suffix(detail, path=f'{CMDB_INSTANCE_API}/{item.class_name}')}"
+                ],
             )
 
         result = (response.json() or {}).get("result") or {}
@@ -417,14 +414,32 @@ class CmdbInstanceWriter:
         return WriteResult(intune_id=item.intune_id, action=action, sys_id=str(sys_id))
 
 
-def _unscoped_api_suffix(detail: str) -> str:
+def unscoped_api_refusal(detail: str) -> bool:
+    """True when a refusal is the REST gate rather than a role or an ACL."""
+    return _UNSCOPED_API_MARKER in detail.lower()
+
+
+def _unscoped_api_suffix(detail: str, *, method: str = "POST", path: str = "this API") -> str:
     """Explain a "User Not Authorized / Access to unscoped api" refusal.
 
-    Confirmed live on 2026-08-28 against both `/api/now/identifyreconcile` and
-    `/api/now/cmdb/instance/{class}`, on a credential whose Table API reads were
-    working in the same run.
+    Names the exact method and path that was refused: an auth scope binds per
+    API *and per HTTP method*, so "writes are unauthorized" is not something an
+    admin can act on, while "POST /api/now/identifyreconcile is unauthorized"
+    is. Confirmed live on 2026-08-28 against both `/api/now/identifyreconcile`
+    and `/api/now/cmdb/instance/{class}`, on a credential whose Table API reads
+    were working in the same run.
     """
-    return _UNSCOPED_API_HINT if _UNSCOPED_API_MARKER in detail.lower() else ""
+    if not unscoped_api_refusal(detail):
+        return ""
+    return (
+        f" This is the OAuth client being refused {method} {path} at the REST gate, before "
+        "any role or ACL is consulted, so it is not a missing role: the Application Registry "
+        "entry is Securely Scoped and has no REST API Auth Scope linked for "
+        f"{method} on {path}. Adding 'itil' will not change it, and "
+        "SNOW_WRITE_MODE=cmdb_instance is behind the same gate. Run "
+        "`intune-cmdb-sync --check-api` for a per-endpoint, per-method breakdown of what "
+        "this credential is and is not allowed to call. See docs/servicenow-setup.md."
+    )
 
 
 def _log_context_id(response: Any) -> str | None:

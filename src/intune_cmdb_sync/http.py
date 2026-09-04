@@ -210,5 +210,31 @@ def _snippet(response: httpx.Response, limit: int = 400) -> str:
 
 
 def describe_error(response: httpx.Response) -> str:
-    """Build a compact, log-safe description of a failed response."""
-    return f"HTTP {response.status_code} {response.reason_phrase}: {_snippet(response)}"
+    """Build a compact, log-safe description of a failed response.
+
+    Leads with the method and path. A ServiceNow 403 body says only "User Not
+    Authorized" and the caller's own wording ("write failed", "query failed")
+    rarely names a URL, so without this an operator cannot tell which of the
+    several endpoints a run touches was the one refused -- and the fix, a REST
+    API Auth Scope, is bound per API and per method.
+
+    `X-Is-Logged-In: true` on a 4xx is included because it is the tell that
+    ServiceNow authenticated the request and then declined the API itself,
+    which separates an OAuth scope problem from a credential problem.
+    """
+    where = _request_label(response)
+    logged_in = response.headers.get("X-Is-Logged-In")
+    context = f" [X-Is-Logged-In: {logged_in}]" if logged_in else ""
+    return (
+        f"{where}HTTP {response.status_code} {response.reason_phrase}"
+        f"{context}: {_snippet(response)}"
+    )
+
+
+def _request_label(response: httpx.Response) -> str:
+    """`METHOD /path -> ` when the originating request is still attached."""
+    try:
+        request = response.request
+    except RuntimeError:  # a Response built without one, e.g. in a unit test
+        return ""
+    return f"{request.method} {request.url.path} -> "

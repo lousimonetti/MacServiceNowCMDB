@@ -230,6 +230,30 @@ message that names the cause. Run it before scheduling anything.
 
 ### If it fails
 
+When the failure is a 403, run `intune-cmdb-sync --check-api` before reading
+the table below. `--check` stops at the first refusal, which cannot distinguish
+the three layers that produce an identical "User Not Authorized" body.
+`--check-api` walks every endpoint the connector can use, one HTTP method at a
+time, and reports which are allowed:
+
+```
+  GET  /api/now/table/sys_properties        ALLOWED                200
+  GET  /api/now/cmdb/instance/{className}   ALLOWED                200
+  POST /api/now/identifyreconcile           REFUSED AT OAUTH GATE  403
+  POST /api/now/cmdb/instance/{className}   REFUSED AT OAUTH GATE  403
+```
+
+That shape — reads allowed, every POST refused, `X-Is-Logged-In: true` on the
+refusals — is the OAuth scope gate and nothing else. GET allowed alongside POST
+refused *on the same API* is the proof that the restriction is per-method, which
+is the specific thing to fix in the auth scope. It writes nothing: the
+identifyreconcile probes submit an empty `items` array, and the CMDB Instance
+probes post to a class name that does not exist, so neither has anything it
+could create even against a fully authorised instance. It also probes the
+versioned paths (`/api/now/v1/...`), because an auth scope is recorded against
+a specific API version and one bound to only one of the two produces exactly
+this symptom.
+
 | Response | Cause |
 | --- | --- |
 | `401 User Not Authenticated` | The OAuth Application User field on the Application Registry entry is empty. |
