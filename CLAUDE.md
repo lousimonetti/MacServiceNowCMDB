@@ -73,7 +73,7 @@ behaviour change, particularly anything altering what gets written to a CI.
   exactly including case. It failed all 17 devices of the second 2026-09-04 run.
   The CMDB Instance API returns that inside an IRE result envelope, so the
   message is past the point where a raw body snippet truncates — `_ire_item_error`
-  in `writers.py` parses it out. `--check` queries `valueLIKE<configured>`
+  in `writers/errors.py` parses it out. `--check` queries `valueLIKE<configured>`
   rather than listing the choice list — a stock instance has 200+ sources and
   `sys_choice` holds one row per language, so a listing is duplicated noise that
   cannot prove absence past its row limit either. A determined absence **fails**
@@ -91,8 +91,8 @@ behaviour change, particularly anything altering what gets written to a CI.
   java.lang.String` on a JSON number or boolean, before any validation worth
   reading. It failed all 17 devices of the 2026-09-04 run; the culprit was
   `disk_space` (`bytes_to_gb` returns a rounded float), with `ram` (int) and
-  `virtual` (bool) behind it. `stringify_attributes` in `writers.py` coerces the
-  whole payload at that writer. **Do not apply it to IRE** —
+  `virtual` (bool) behind it. `stringify_attributes` in `writers/cmdb_instance.py`
+  coerces the whole payload at that writer. **Do not apply it to IRE** —
   `/api/now/identifyreconcile` accepts typed values, and that path is unchanged.
 
 - **Never assume managed identity for Graph.** Deployments where Intune and the
@@ -154,7 +154,7 @@ behaviour change, particularly anything altering what gets written to a CI.
   /api/now/cmdb/instance/{class}` returned 400, i.e. reached the API. Auth
   scopes bind per API *and per HTTP method*, so the only reliable statement is
   the one the probe makes. `SNOW_WRITE_MODE=cmdb_instance` is therefore a real
-  fallback on that instance, with the trade-offs in `writers.py`: no
+  fallback on that instance, with the trade-offs in `writers/cmdb_instance.py`: no
   `sys_object_source_info`, so identification falls back to serial number then
   name, and `correlation_id` becomes the only link back to the Intune device.
 
@@ -201,7 +201,7 @@ not observed responses. Green tests are weaker evidence here than they look.
    the connectivity probe can be a red herring — as is the message this check
    prints on 403, which blames `itil` for what is usually the OAuth scope gate.
 3. **`--dry-run --limit 5 --report-devices --report ./run.json`.** Confirm the `operation`
-   values IRE actually returns against `_OPERATION_TO_ACTION` in `writers.py`.
+   values IRE actually returns against `_OPERATION_TO_ACTION` in `writers/ire.py`.
    The dry run uses `/identifyreconcile/query`, a *different* endpoint whose
    response vocabulary is unconfirmed; an unrecognised operation is a hard
    error by design, so this is where a surprise will surface.

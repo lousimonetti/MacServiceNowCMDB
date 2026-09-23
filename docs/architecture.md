@@ -76,7 +76,7 @@ A single run is a linear pipeline, orchestrated by `SyncRunner.run` in
 | 5 | Resolve owners | `user_resolver.py` | Entra user → `sys_user` |
 | 6 | Prime reference caches | `reference_resolver.py` | Manufacturer, model |
 | 7 | Build payloads | `mapping.py` | Pure; no I/O |
-| 8 | Write in batches | `servicenow/writers.py` | IRE bulk POST |
+| 8 | Write in batches | `servicenow/writers/ire.py` | IRE bulk POST |
 | 9 | Retire absent devices | `sync.py` | Guarded; off by default |
 | 10 | Persist state, emit report | `state.py`, `models.py` | |
 

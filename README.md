@@ -384,7 +384,7 @@ src/intune_cmdb_sync/
   reference_resolver.py manufacturer/model display names → sys_ids
   servicenow/
     auth.py            client_credentials / password / basic
-    writers.py         the two CMDB write paths
+    writers/           the two CMDB write paths (ire.py, cmdb_instance.py, access.py, ...)
   cmdb_report.py       read-only CMDB queries + CI validation checks
   query_cli.py         `intune-cmdb-query` entry point
   sync.py              orchestration

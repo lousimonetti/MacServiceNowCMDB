@@ -1,6 +1,6 @@
 """Per-endpoint authorization probe for the ServiceNow write path.
 
-`verify_write_access` in writers.py answers one question -- can IRE simulate a
+`verify_write_access` in writers/access.py answers one question -- can IRE simulate a
 write -- and answers it only for `/api/now/identifyreconcile/query`. When that
 comes back 403 it does not say *which* of the several things in front of the
 CMDB refused, and the three candidates need three different people to fix:
@@ -65,8 +65,8 @@ PROBE_TABLE = "u_intune_cmdb_sync_probe_no_such_table"
 PROBE_SYS_ID = "0" * 32
 
 # `PROBE_CLASS` (a class that cannot exist, so the CMDB Instance API has
-# nowhere to write) and `NO_SUCH_API_MARKER` are defined in writers.py, which
-# uses both for the same purpose in `--check`.
+# nowhere to write) and `NO_SUCH_API_MARKER` are defined in
+# writers/_constants.py, which uses both for the same purpose in `--check`.
 
 # Verdicts, ordered from "working" to "broken".
 AUTHORIZED = "authorized"

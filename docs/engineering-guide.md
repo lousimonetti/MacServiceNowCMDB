@@ -47,10 +47,19 @@ src/intune_cmdb_sync/
 ├── secrets.py           File- and SSM-sourced secret resolution
 ├── logging_setup.py     JSON/text logging with credential redaction
 ├── aws_lambda.py        Lambda entry point
+├── cmdb_report.py       Read-only CMDB queries (the `intune-cmdb-query` half)
+├── query_cli.py         `intune-cmdb-query` entry point -- read-only, cannot write
 └── servicenow/
     ├── auth.py          OAuth client credentials / basic
     ├── client.py        Table API + arbitrary endpoints
-    └── writers.py       The two write paths
+    ├── classes.py       `--list-classes`, SNOW_CLASS_MAP validation
+    ├── probe.py         Per-endpoint auth probe for `--check-api`
+    └── writers/         The two write paths
+        ├── ire.py               `identify_reconcile` writer (default)
+        ├── cmdb_instance.py     `cmdb_instance` writer (fallback)
+        ├── access.py            `--check` write-access verification
+        ├── discovery_source.py  `--register-discovery-source`
+        └── errors.py            Error-detail parsing shared by both writers
 ```
 
 **`mapping.py` is pure by design.** No network, no I/O, no clock. That is what
@@ -213,7 +222,7 @@ The ServiceNow half has never run against a live instance. In priority order:
 1. **IRE response shape.** The writer keys off `operation` per result item and
    hard-fails on an unrecognised value and on an item-count mismatch. Both paths
    have only ever fired against fixtures. Confirm the actual `operation` values
-   against `_OPERATION_TO_ACTION` in `writers.py`.
+   against `_OPERATION_TO_ACTION` in `writers/ire.py`.
 2. **`install_status=7` means retired** in the target instance. The README calls
    this a convention, not a guarantee. Verify before enabling retirement.
 3. **`sys_properties` read access.** `--check` reads one row as a connectivity
