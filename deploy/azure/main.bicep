@@ -155,6 +155,20 @@ the CMDB Instance API. Which one works is per instance: run
 ])
 param writeMode string = 'identify_reconcile'
 
+@description('''
+SNOW_CLASS_MAP, e.g. windows=cmdb_ci_computer;macos=cmdb_ci_computer. Empty
+keeps the connector's built-in map. A value REPLACES the built-in map rather
+than extending it, so list every OS you want written.
+''')
+param classMap string = ''
+
+@description('''
+Mapping overrides as a JSON object, the same content as a local
+MAPPING_OVERRIDES_FILE (e.g. {"drop": ["last_discovered"]}). Reaches the job as
+MAPPING_OVERRIDES_JSON. Empty object = no overrides.
+''')
+param mappingOverrides object = {}
+
 @description('Set false to skip the Azure Files share used for retirement state.')
 param enableStatePersistence bool = true
 
@@ -382,6 +396,12 @@ var reportEnv = enableStatePersistence
     ]
   : []
 
+// Omitted rather than set empty, so the connector's own defaults apply.
+var mappingEnv = concat(
+  empty(classMap) ? [] : [ { name: 'SNOW_CLASS_MAP', value: classMap } ],
+  empty(mappingOverrides) ? [] : [ { name: 'MAPPING_OVERRIDES_JSON', value: string(mappingOverrides) } ]
+)
+
 var stateEnv = enableStatePersistence
   ? [ { name: 'STATE_PATH', value: '${stateMountPath}/state.json' } ]
   : []
@@ -461,7 +481,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             cpu: json(cpu)
             memory: memory
           }
-          env: concat(graphEnvCommon, graphEnv, baseEnv, stateEnv, reportEnv)
+          env: concat(graphEnvCommon, graphEnv, baseEnv, mappingEnv, stateEnv, reportEnv)
           volumeMounts: enableStatePersistence
             ? [ { volumeName: 'state', mountPath: stateMountPath } ]
             : []

@@ -87,6 +87,36 @@ case "$SNOW_WRITE_MODE" in
   *) die "SNOW_WRITE_MODE must be 'identify_reconcile' or 'cmdb_instance' (got '${SNOW_WRITE_MODE}')" ;;
 esac
 
+# No default, deliberately. Defaulting to false made every redeploy that forgot
+# DRY_RUN=true turn a dry-run stack live; defaulting to true would leave a
+# production stack silently committing nothing. Both values are also checked
+# exactly: az passes any bool parameter other than 'true' as false, so
+# DRY_RUN=yes would deploy a live job.
+require_bool() {
+  case "${!1:-}" in
+    true|false) ;;
+    "") die "$1 must be set to true or false$2" ;;
+    *)  die "$1 must be exactly 'true' or 'false' (got '${!1}')" ;;
+  esac
+}
+require_bool DRY_RUN " -- true for a first deploy; false commits to the CMDB"
+RETIRE_MISSING="${RETIRE_MISSING:-false}"
+require_bool RETIRE_MISSING ""
+
+# The job receives only what main.bicep sets, so local tuning has to be passed
+# through explicitly or the Azure run differs from the one tested locally.
+#   SNOW_CLASS_MAP          passed as-is; replaces the built-in map
+#   MAPPING_OVERRIDES_FILE  a LOCAL path; its contents reach the job inline as
+#                           MAPPING_OVERRIDES_JSON, since the image holds no such file
+MAPPING_OVERRIDES='{}'
+if [[ -n "${MAPPING_OVERRIDES_FILE:-}" ]]; then
+  [[ -f "$MAPPING_OVERRIDES_FILE" ]] || die "MAPPING_OVERRIDES_FILE not found: ${MAPPING_OVERRIDES_FILE}"
+  # _comment is documentation for people; drop it rather than ship it in an env var.
+  MAPPING_OVERRIDES=$(jq -ce 'if type == "object" then del(._comment) else error("not an object") end' \
+      "$MAPPING_OVERRIDES_FILE" 2>/dev/null) \
+    || die "MAPPING_OVERRIDES_FILE must contain a JSON object: ${MAPPING_OVERRIDES_FILE}"
+fi
+
 SUBSCRIPTION_TENANT=$(az account show --query tenantId --output tsv)
 
 # Everything about the image is checkable now, and each check turns a pull
@@ -178,8 +208,10 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
       serviceNowClientSecret="$SNOW_CLIENT_SECRET" \
       discoverySource="${SNOW_DISCOVERY_SOURCE:-Intune}" \
       writeMode="$SNOW_WRITE_MODE" \
-      retireMissingDevices="${RETIRE_MISSING:-false}" \
-      dryRun="${DRY_RUN:-false}" \
+      classMap="${SNOW_CLASS_MAP:-}" \
+      mappingOverrides="$MAPPING_OVERRIDES" \
+      retireMissingDevices="$RETIRE_MISSING" \
+      dryRun="$DRY_RUN" \
       alertEmail="${ALERT_EMAIL:-}" \
   --query properties.outputs \
   --output json)
@@ -258,6 +290,10 @@ Deployed.
 
   Job              ${JOB_NAME}
   ServiceNow       ${SNOW_INSTANCE} (${SNOW_WRITE_MODE})
+  Dry run          ${DRY_RUN}$([[ "$DRY_RUN" == false ]] && echo "  -- LIVE: the next run commits to the CMDB")
+  Retire missing   ${RETIRE_MISSING}
+  Class map        ${SNOW_CLASS_MAP:-built-in (windows, macos)}
+  Mapping override ${MAPPING_OVERRIDES_FILE:-none}
   Image            ${ACR_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG} (pulled via ${ACR_AUTH_MODE})
   Resource group   ${RESOURCE_GROUP}
   Schedule         ${CRON} (UTC)

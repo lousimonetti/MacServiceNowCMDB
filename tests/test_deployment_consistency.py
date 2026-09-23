@@ -337,3 +337,47 @@ def test_alert_queries_are_scoped_to_this_job():
     text = BICEP.read_text()
     assert text.count("ContainerJobName_s == '{0}'") == 2
     assert text.count("''', jobName)") == 2
+
+
+# ---------------------------------------------------------------------------
+# Safety of redeploys, and parity with the locally tested configuration
+# ---------------------------------------------------------------------------
+
+
+def test_deploy_script_has_no_dry_run_default():
+    """A default of false turned every redeploy that forgot DRY_RUN=true live;
+    a default of true would leave production silently committing nothing. The
+    script must demand the value instead."""
+    text = DEPLOY_SH.read_text()
+    assert "require_bool DRY_RUN" in text
+    assert 'dryRun="$DRY_RUN"' in text
+    assert "${DRY_RUN:-" not in text
+
+
+def test_deploy_script_accepts_only_literal_booleans():
+    """az passes any bool parameter value other than 'true' as false, so
+    DRY_RUN=yes would otherwise deploy a live job without complaint."""
+    text = DEPLOY_SH.read_text()
+    helper = text[text.index("require_bool() {"):]
+    helper = helper[: helper.index("\n}\n")]
+    assert "true|false) ;;" in helper
+    assert "require_bool RETIRE_MISSING" in text
+
+
+def test_class_map_and_mapping_overrides_reach_the_job():
+    """The job gets only what main.bicep sets. Without these, the class map and
+    the last_discovered drop tested locally silently do not apply in Azure."""
+    text = BICEP.read_text()
+    assert "param classMap string = ''" in text
+    assert "param mappingOverrides object = {}" in text
+    assert "{ name: 'SNOW_CLASS_MAP', value: classMap }" in text
+    assert "{ name: 'MAPPING_OVERRIDES_JSON', value: string(mappingOverrides) }" in text
+    assert "mappingEnv" in text[text.index("env: concat("):]
+    assert {"classMap", "mappingOverrides"} <= _deploy_sh_bicep_parameters()
+    assert 'classMap="${SNOW_CLASS_MAP:-}"' in DEPLOY_SH.read_text()
+
+
+def test_empty_class_map_is_omitted_not_blanked():
+    """SNOW_CLASS_MAP replaces the built-in map. Setting it to '' on the job
+    would be at best a no-op; omitting it keeps the default unambiguous."""
+    assert "empty(classMap) ? [] :" in BICEP.read_text()

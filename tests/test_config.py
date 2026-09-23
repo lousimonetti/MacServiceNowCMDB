@@ -155,6 +155,30 @@ class TestMappingOverridesFile:
         with pytest.raises(ConfigError, match="could not be read"):
             Config.from_env()
 
+    def test_inline_json_is_loaded(self, set_env):
+        """The Azure job receives overrides this way, since deploy.sh cannot
+        put a file into the container."""
+        set_env(MAPPING_OVERRIDES_JSON='{"drop": ["last_discovered"]}')
+        assert Config.from_env().runtime.mapping_overrides == {"drop": ["last_discovered"]}
+
+    def test_inline_json_must_be_an_object(self, set_env):
+        set_env(MAPPING_OVERRIDES_JSON='["last_discovered"]')
+        with pytest.raises(ConfigError, match="must be a JSON object"):
+            Config.from_env()
+
+    def test_inline_json_must_parse(self, set_env):
+        set_env(MAPPING_OVERRIDES_JSON="{not json")
+        with pytest.raises(ConfigError, match="not valid JSON"):
+            Config.from_env()
+
+    def test_file_and_inline_json_are_mutually_exclusive(self, set_env, tmp_path):
+        """Silently preferring one would leave the other looking applied."""
+        path = tmp_path / "map.json"
+        path.write_text("{}")
+        set_env(MAPPING_OVERRIDES_FILE=str(path), MAPPING_OVERRIDES_JSON="{}")
+        with pytest.raises(ConfigError, match="not both"):
+            Config.from_env()
+
 
 class TestFederatedManagedIdentity:
     """Secretless cross-tenant auth: a managed identity in the hosting tenant

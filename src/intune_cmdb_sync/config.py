@@ -479,9 +479,16 @@ def _build_config() -> Config:
         s.lower() for s in (*DEFAULT_SERIAL_BLOCKLIST, *serial_extra) if s
     )
 
+    # MAPPING_OVERRIDES_JSON carries the same content inline, for hosts where
+    # shipping a file into the container is awkward: deploy.sh reads the local
+    # file and passes its contents this way.
     overrides_path = _env("MAPPING_OVERRIDES_FILE")
+    overrides_inline = _env("MAPPING_OVERRIDES_JSON")
     mapping_overrides: dict[str, Any] = {}
-    if overrides_path:
+    loaded: Any = None
+    if overrides_path and overrides_inline:
+        problems.append("set MAPPING_OVERRIDES_FILE or MAPPING_OVERRIDES_JSON, not both")
+    elif overrides_path:
         path = Path(overrides_path)
         if not path.is_file():
             problems.append(f"MAPPING_OVERRIDES_FILE does not exist: {overrides_path}")
@@ -491,10 +498,18 @@ def _build_config() -> Config:
             except (OSError, json.JSONDecodeError) as exc:
                 problems.append(f"MAPPING_OVERRIDES_FILE could not be read: {exc}")
             else:
-                if isinstance(loaded, dict):
-                    mapping_overrides = loaded
-                else:
+                if not isinstance(loaded, dict):
                     problems.append("MAPPING_OVERRIDES_FILE must contain a JSON object")
+    elif overrides_inline:
+        try:
+            loaded = json.loads(overrides_inline)
+        except json.JSONDecodeError as exc:
+            problems.append(f"MAPPING_OVERRIDES_JSON is not valid JSON: {exc}")
+        else:
+            if not isinstance(loaded, dict):
+                problems.append("MAPPING_OVERRIDES_JSON must be a JSON object")
+    if isinstance(loaded, dict):
+        mapping_overrides = loaded
 
     device_limit = _env_int("INTUNE_DEVICE_LIMIT", 0, minimum=0) or None
 
