@@ -281,15 +281,16 @@ docker run --rm --env-file .env intune-cmdb-sync
 | | Azure | AWS |
 | --- | --- | --- |
 | Compute | $0.00 — inside the Container Apps free grant | ~$0.15 |
-| Registry | $0.00 — public image | ~$0.04 (ECR) |
+| Registry | ~$5.00 — Azure Container Registry Basic, shared by all environments | ~$0.04 (ECR) |
 | Scheduler | included | $0.00 — free tier |
 | Secrets | ~$0.00 — Key Vault standard | $0.00 — SSM Standard |
 | State | ~$0.06 — Azure Files | ~$0.00 — S3 |
 | Logs | $0.00 — under the 5 GB free tier | $0.00 — under the 5 GB free tier |
-| **Total** | **< $0.10/month** | **~$0.20/month** |
+| **Total** | **~$5/month** | **~$0.20/month** |
 
-List prices, single daily run, ~5 minutes. Both are rounding errors; pick on
-credential model, not cost. Full workings are in the deployment READMEs.
+List prices, single daily run, ~5 minutes. The Azure figure is almost entirely
+the container registry, which the Azure deployment uses so that production
+touches only Azure resources. Full workings are in the deployment READMEs.
 
 ---
 

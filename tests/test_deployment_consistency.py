@@ -29,12 +29,17 @@ NOT_DEPLOYABLE_ON_CONTAINER_APPS = {"workload_identity", "default", "access_toke
 
 
 def _bicep_allowed_modes() -> set[str]:
+    return _bicep_allowed_values("graphAuthMode")
+
+
+def _bicep_allowed_values(param: str) -> set[str]:
+    """The @allowed list directly above `param <name>`. Searching backwards from
+    the param matters: a forward non-greedy match starts at the file's *first*
+    @allowed and swallows every list in between."""
     text = BICEP.read_text()
-    block = re.search(
-        r"@allowed\(\[(.*?)\]\)\s*param graphAuthMode", text, re.DOTALL
-    )
-    assert block, "could not locate the graphAuthMode @allowed block in main.bicep"
-    return set(re.findall(r"'([a-z_]+)'", block.group(1)))
+    at = text.find(f"param {param} ")
+    assert at != -1, f"main.bicep no longer declares {param}"
+    return set(re.findall(r"'([a-z_]+)'", text[text.rfind("@allowed([", 0, at):at]))
 
 
 def _deploy_sh_modes() -> set[str]:
@@ -147,3 +152,188 @@ def test_alerting_is_optional_but_not_accidentally_disabled():
     without one is not silently unmonitored-looking-monitored."""
     assert "param alertEmail string = ''" in BICEP.read_text()
     assert 'variable "alert_email"' in TERRAFORM.read_text()
+
+
+def _deploy_sh_bicep_parameters() -> set[str]:
+    text = DEPLOY_SH.read_text()
+    block = re.search(r"--parameters \\\n(.*?)\n  --query", text, re.DOTALL)
+    assert block, "could not locate the --parameters block in deploy.sh"
+    return set(re.findall(r"^\s+([A-Za-z]+)=", block.group(1), re.MULTILINE))
+
+
+def _bicep_params() -> set[str]:
+    return set(re.findall(r"^param (\w+) ", BICEP.read_text(), re.MULTILINE))
+
+
+def test_deploy_script_only_passes_parameters_the_template_declares():
+    unknown = _deploy_sh_bicep_parameters() - _bicep_params()
+    assert not unknown, f"deploy.sh passes {sorted(unknown)}, which main.bicep does not declare"
+
+
+def test_discovery_source_is_settable_per_environment():
+    """Each ServiceNow instance has its own cmdb_ci.discovery_source choice list,
+    so a DEV and a PROD deploy may need different values. Unpassed, every deploy
+    silently gets the template default and writes are rejected on any instance
+    where that exact value is not registered."""
+    assert "discoverySource" in _deploy_sh_bicep_parameters()
+    assert 'discoverySource="${SNOW_DISCOVERY_SOURCE:-Intune}"' in DEPLOY_SH.read_text()
+
+
+def test_storage_account_name_survives_a_hyphenated_prefix():
+    """Multiple environments in one resource group use prefixes like
+    intunecmdb-dev. Storage account names allow only lowercase letters and
+    digits, so the prefix must be sanitised for that one resource or the deploy
+    fails after everything else has been created."""
+    text = BICEP.read_text()
+    assert "var storageName = take('${storageSafePrefix}st${suffix}', 24)" in text
+    safe = re.search(r"var storageSafePrefix = (.+)", text)
+    assert safe, "storageSafePrefix is gone from main.bicep"
+    assert "replace(" in safe.group(1) and "'-'" in safe.group(1)
+    assert "toLower(" in safe.group(1)
+
+
+def test_bicep_write_modes_are_ones_the_connector_accepts():
+    """The write mode is per instance -- decided by that instance's OAuth auth
+    scopes -- so a DEV and a PROD deploy may need different ones."""
+    from intune_cmdb_sync.config import VALID_WRITE_MODES
+
+    text = BICEP.read_text()
+    param = text.find("param writeMode")
+    assert param != -1, "main.bicep no longer offers a writeMode parameter"
+    allowed = text[text.rfind("@allowed([", 0, param):param]
+    offered = set(re.findall(r"'([a-z_]+)'", allowed))
+    assert offered == set(VALID_WRITE_MODES)
+    assert "{ name: 'SNOW_WRITE_MODE', value: writeMode }" in text
+    assert "writeMode" in _deploy_sh_bicep_parameters()
+
+
+def test_state_mount_is_owned_by_the_image_run_user():
+    """SMB ownership is fixed at mount time. If the mount's uid drifts from the
+    Dockerfile's run user, state.json becomes unwritable and every run ends
+    degraded."""
+    dockerfile = (REPO / "Dockerfile").read_text()
+    uid = re.search(r"useradd[^\n]*--uid (\d+)", dockerfile)
+    assert uid, "could not find the run user's uid in the Dockerfile"
+    assert f"mountOptions: 'uid={uid.group(1)}," in BICEP.read_text()
+
+
+def test_azure_error_alert_also_fires_on_degraded_runs():
+    """A degraded run (retirement guard tripped, state not saved) exits 4 but
+    can report errors == 0. Alerting only on errors would miss exactly the runs
+    that leave the next one unable to reason about the fleet."""
+    text = BICEP.read_text()
+    rule = text[text.index("-device-errors"):]
+    assert "array_length(p.degraded)" in rule
+    assert "degraded > 0" in rule
+
+
+def _job_registries_block() -> str:
+    text = BICEP.read_text()
+    start = text.index("registries: registryNeedsSecret")
+    return text[start:text.index("secrets: concat(", start)]
+
+
+def _registry_branches() -> tuple[str, str]:
+    """The (service_principal, managed_identity) arms of the registries ternary."""
+    block = _job_registries_block()
+    sp, mi = block.split("\n        : [", 1)
+    return sp, mi
+
+
+def test_image_comes_from_azure_container_registry_only():
+    """Production may use only Azure resources: no public-registry default may
+    creep back in, and the image reference is built from the ACR login server."""
+    text = BICEP.read_text()
+    assert "ghcr.io" not in text and "docker.io" not in text
+    assert "param containerImage" not in text, "the image must derive from registryServer"
+    assert "var containerImage = '${registryServer}/intune-cmdb-sync:${imageTag}'" in text
+
+
+def _bicep_registry_modes() -> set[str]:
+    return _bicep_allowed_values("registryAuthMode")
+
+
+def test_service_principal_is_the_default_registry_puller():
+    """By requirement. Changing the default would silently move every existing
+    deployment onto a managed identity that holds no AcrPull."""
+    text = BICEP.read_text()
+    assert "param registryAuthMode string = 'service_principal'" in text
+    assert 'ACR_AUTH_MODE="${ACR_AUTH_MODE:-service_principal}"' in DEPLOY_SH.read_text()
+
+
+def test_service_principal_mode_pulls_with_the_secret_not_the_identity():
+    """A registries entry carrying `identity` silently switches the pull to the
+    managed identity, whatever the mode says."""
+    sp, _ = _registry_branches()
+    assert "username: registryClientId" in sp
+    assert "passwordSecretRef: 'registry-client-secret'" in sp
+    assert "identity" not in sp
+
+
+def test_managed_identity_mode_pulls_with_the_identity_and_no_secret():
+    _, mi = _registry_branches()
+    assert "identity: identity.id" in mi
+    assert "passwordSecretRef" not in mi and "username" not in mi
+
+
+def test_registry_auth_modes_agree_between_template_and_script():
+    assert _bicep_registry_modes() == {"service_principal", "managed_identity"}
+    case = re.search(r'case "\$ACR_AUTH_MODE" in(.*?)\nesac', DEPLOY_SH.read_text(), re.DOTALL)
+    assert case, "could not find the ACR_AUTH_MODE case statement in deploy.sh"
+    assert set(re.findall(r"^  ([a-z_]+)\)", case.group(1), re.MULTILINE)) == (
+        _bicep_registry_modes()
+    )
+
+
+def test_managed_identity_mode_grants_acr_pull_after_deploy():
+    """The registry is outside the template, so the grant can only happen in the
+    script. Without it the job deploys cleanly and fails every pull."""
+    text = DEPLOY_SH.read_text()
+    grant = text[text.index('if [[ "$ACR_AUTH_MODE" == "managed_identity" ]]; then'):]
+    assert "--assignee-object-id" in grant and "--role AcrPull" in grant
+    assert text.index("DEPLOYMENT_OUTPUT=$(az deployment group create") < text.index(
+        'if [[ "$ACR_AUTH_MODE" == "managed_identity" ]]; then'
+    ), "the grant needs the identity the deployment creates"
+
+
+def test_registry_secret_is_held_in_key_vault_only_when_needed():
+    text = BICEP.read_text()
+    assert "@secure()\nparam registryClientSecret string" in text
+    assert (
+        "resource registrySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' =\n"
+        "  if (registryNeedsSecret)"
+    ) in text
+    assert "keyVaultUrl: registrySecret!.properties.secretUri" in text
+
+
+def test_deploy_script_supplies_the_registry_and_checks_the_tag():
+    text = DEPLOY_SH.read_text()
+    for var in ("ACR_NAME", "IMAGE_TAG", "ACR_CLIENT_ID", "ACR_CLIENT_SECRET"):
+        assert f"require {var}" in text
+    assert {
+        "registryServer", "imageTag", "registryAuthMode", "registryClientId",
+        "registryClientSecret",
+    } <= _deploy_sh_bicep_parameters()
+    assert "az acr repository show" in text, "deploy.sh must fail on a tag that does not exist"
+
+
+def test_script_and_template_agree_on_the_image_repository():
+    repo = re.search(r'IMAGE_REPOSITORY="([^"]+)"', DEPLOY_SH.read_text())
+    assert repo, "IMAGE_REPOSITORY is gone from deploy.sh"
+    assert f"/{repo.group(1)}:${{imageTag}}'" in BICEP.read_text()
+
+
+def test_no_interpolation_inside_bicep_multiline_strings():
+    """Bicep does not interpolate inside ''' strings: `${jobName}` there reaches
+    Azure as literal text. Both alert queries shipped that way, so the absence
+    rule matched no job and fired every hour while the error rule never fired.
+    Use format() instead."""
+    blocks = re.findall(r"'''(.*?)'''", BICEP.read_text(), re.DOTALL)
+    offenders = [b.strip().splitlines()[0] for b in blocks if "${" in b]
+    assert not offenders, f"interpolation inside ''' strings is sent literally: {offenders}"
+
+
+def test_alert_queries_are_scoped_to_this_job():
+    text = BICEP.read_text()
+    assert text.count("ContainerJobName_s == '{0}'") == 2
+    assert text.count("''', jobName)") == 2

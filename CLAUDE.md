@@ -52,6 +52,25 @@ behaviour change, particularly anything altering what gets written to a CI.
   issues its own request rather than adding a mode to a shared method. Keep it
   write-free — that property is what makes it safe to point at production.
 
+- **Multiple ServiceNow environments = one Azure stack per `NAME_PREFIX`.**
+  DEV and PROD run from one resource group by running `deploy.sh` once per
+  instance with a distinct prefix. Every resource name derives from the prefix,
+  so each environment gets its own Key Vault, identity, job and storage account.
+  The separate storage account is load-bearing: `state.json` holds
+  instance-specific `sys_id`s, and a shared one would drive PROD retirement from
+  DEV IDs. Do not consolidate stacks onto shared storage. `storageName` strips
+  hyphens because storage account names allow none. See `deploy/azure/README.md`.
+
+- **Production may use only Azure resources.** So the image comes from an
+  existing Azure Container Registry (built with `az acr build`), never a public
+  registry such as ghcr.io, even though that would be free. By requirement the
+  default puller is an existing Entra **service principal** holding AcrPull,
+  its secret in each stack's Key Vault. `ACR_AUTH_MODE=managed_identity` is the
+  opt-in alternative for later: the stack's own identity pulls, and `deploy.sh`
+  grants it AcrPull after deploying (the registry is outside the template).
+  Keep the service principal the default. `deploy.sh` checks the tag exists
+  before deploying.
+
 - **Graph data calls are plain REST, deliberately** — `azure-identity` handles
   tokens, but `msgraph-sdk` is not used. Do not add it.
 

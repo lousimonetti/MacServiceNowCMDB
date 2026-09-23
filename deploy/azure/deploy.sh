@@ -29,8 +29,23 @@ set -euo pipefail
 
 RESOURCE_GROUP="${RESOURCE_GROUP:-rg-intune-cmdb-sync}"
 LOCATION="${LOCATION:-eastus}"
+# Every resource name derives from this. Run once per ServiceNow environment
+# with a distinct prefix (intunecmdb-dev, intunecmdb-prod) to get fully separate
+# stacks in one resource group -- see README.md, "Multiple ServiceNow environments".
 NAME_PREFIX="${NAME_PREFIX:-intunecmdb}"
-CONTAINER_IMAGE="${CONTAINER_IMAGE:-ghcr.io/your-org/intune-cmdb-sync:latest}"
+# The image lives in an existing Azure Container Registry, shared by every
+# environment:
+#   ACR_NAME           registry name (not the login server)
+#   IMAGE_TAG          tag pushed by `az acr build`; pin a version, not latest
+#   ACR_AUTH_MODE      who pulls it:
+#     service_principal  (default) an existing Entra service principal:
+#       ACR_CLIENT_ID      its client (app) ID, holding AcrPull
+#       ACR_CLIENT_SECRET  its client secret; goes into Key Vault
+#     managed_identity   this stack's managed identity; no secret. This script
+#                        grants it AcrPull after deployment, which needs rights
+#                        to create role assignments on the registry.
+IMAGE_REPOSITORY="intune-cmdb-sync"
+ACR_AUTH_MODE="${ACR_AUTH_MODE:-service_principal}"
 CRON="${CRON:-15 3 * * *}"
 GRAPH_AUTH_MODE="${GRAPH_AUTH_MODE:-client_secret}"
 
@@ -55,8 +70,53 @@ require() {
 require SNOW_INSTANCE
 require SNOW_CLIENT_ID
 require SNOW_CLIENT_SECRET
+require ACR_NAME
+require IMAGE_TAG
+case "$ACR_AUTH_MODE" in
+  service_principal)
+    require ACR_CLIENT_ID
+    require ACR_CLIENT_SECRET
+    ;;
+  managed_identity) ;;
+  *) die "ACR_AUTH_MODE must be 'service_principal' or 'managed_identity' (got '${ACR_AUTH_MODE}')" ;;
+esac
+
+SNOW_WRITE_MODE="${SNOW_WRITE_MODE:-identify_reconcile}"
+case "$SNOW_WRITE_MODE" in
+  identify_reconcile|cmdb_instance) ;;
+  *) die "SNOW_WRITE_MODE must be 'identify_reconcile' or 'cmdb_instance' (got '${SNOW_WRITE_MODE}')" ;;
+esac
 
 SUBSCRIPTION_TENANT=$(az account show --query tenantId --output tsv)
+
+# Everything about the image is checkable now, and each check turns a pull
+# failure at the first scheduled run into an error at deploy time.
+echo "==> Container registry ${ACR_NAME}"
+ACR_ID=$(az acr show --name "$ACR_NAME" --query id --output tsv 2>/dev/null) \
+  || die "registry ${ACR_NAME} not found in this subscription"
+ACR_SERVER=$(az acr show --name "$ACR_NAME" --query loginServer --output tsv)
+az acr repository show --name "$ACR_NAME" --image "${IMAGE_REPOSITORY}:${IMAGE_TAG}" \
+    --output none 2>/dev/null \
+  || die "${ACR_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG} does not exist. Build it first:
+       az acr build --registry ${ACR_NAME} --image ${IMAGE_REPOSITORY}:${IMAGE_TAG} ."
+echo "    image ${ACR_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+
+if [[ "$ACR_AUTH_MODE" == "service_principal" ]]; then
+  # Warn rather than fail: the deploying user may not be allowed to read role
+  # assignments, and access can also come from a role this list does not name.
+  PULL_GRANTS=$(az role assignment list --assignee "$ACR_CLIENT_ID" --scope "$ACR_ID" \
+      --include-inherited \
+      --query "[?contains(['AcrPull','AcrPush','Contributor','Owner'], roleDefinitionName)] | length(@)" \
+      --output tsv 2>/dev/null || echo "unknown")
+  case "$PULL_GRANTS" in
+    unknown) echo "    WARNING: could not read role assignments; confirm ${ACR_CLIENT_ID} holds AcrPull" ;;
+    0)       echo "    WARNING: ${ACR_CLIENT_ID} holds no AcrPull (or broader) role on ${ACR_NAME};"
+             echo "             the job will fail to pull. Grant it with:"
+             echo "             az role assignment create --assignee ${ACR_CLIENT_ID} --role AcrPull --scope ${ACR_ID}" ;;
+    *)       echo "    service principal ${ACR_CLIENT_ID} can pull" ;;
+  esac
+fi
+
 GRAPH_TENANT_ID="${GRAPH_TENANT_ID:-$SUBSCRIPTION_TENANT}"
 
 case "$GRAPH_AUTH_MODE" in
@@ -103,7 +163,11 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
   --template-file "$(dirname "$0")/main.bicep" \
   --parameters \
       namePrefix="$NAME_PREFIX" \
-      containerImage="$CONTAINER_IMAGE" \
+      registryServer="$ACR_SERVER" \
+      imageTag="$IMAGE_TAG" \
+      registryAuthMode="$ACR_AUTH_MODE" \
+      registryClientId="${ACR_CLIENT_ID:-}" \
+      registryClientSecret="${ACR_CLIENT_SECRET:-}" \
       cronExpression="$CRON" \
       graphAuthMode="$GRAPH_AUTH_MODE" \
       graphTenantId="$GRAPH_TENANT_ID" \
@@ -112,6 +176,8 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
       serviceNowInstance="$SNOW_INSTANCE" \
       serviceNowClientId="$SNOW_CLIENT_ID" \
       serviceNowClientSecret="$SNOW_CLIENT_SECRET" \
+      discoverySource="${SNOW_DISCOVERY_SOURCE:-Intune}" \
+      writeMode="$SNOW_WRITE_MODE" \
       retireMissingDevices="${RETIRE_MISSING:-false}" \
       dryRun="${DRY_RUN:-false}" \
       alertEmail="${ALERT_EMAIL:-}" \
@@ -121,6 +187,27 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
 PRINCIPAL_ID=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.managedIdentityPrincipalId.value')
 CLIENT_ID=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.managedIdentityClientId.value')
 JOB_NAME=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.jobName.value')
+
+if [[ "$ACR_AUTH_MODE" == "managed_identity" ]]; then
+  # The registry is shared and outside this template, so the grant happens here
+  # rather than in Bicep. Deploying first is safe: a job pulls only when it runs.
+  echo "==> Granting AcrPull on ${ACR_NAME} to managed identity ${CLIENT_ID}"
+  EXISTING_PULL=$(az role assignment list --assignee "$PRINCIPAL_ID" --scope "$ACR_ID" \
+      --role AcrPull --query "length(@)" --output tsv 2>/dev/null || echo 0)
+  if [[ "$EXISTING_PULL" != "0" ]]; then
+    echo "    already granted"
+  else
+    # --assignee-object-id with a principal type skips the Entra lookup, which
+    # can fail for an identity created seconds ago.
+    az role assignment create --assignee-object-id "$PRINCIPAL_ID" \
+        --assignee-principal-type ServicePrincipal --role AcrPull --scope "$ACR_ID" \
+        --output none \
+      || die "could not grant AcrPull; the job cannot pull its image until someone with
+       rights to create role assignments on ${ACR_NAME} runs:
+         az role assignment create --assignee-object-id ${PRINCIPAL_ID} \\
+           --assignee-principal-type ServicePrincipal --role AcrPull --scope ${ACR_ID}"
+  fi
+fi
 
 if [[ "$GRAPH_AUTH_MODE" == "managed_identity" ]]; then
   echo "==> Granting Graph permissions to managed identity ${CLIENT_ID}"
@@ -170,6 +257,8 @@ cat <<SUMMARY
 Deployed.
 
   Job              ${JOB_NAME}
+  ServiceNow       ${SNOW_INSTANCE} (${SNOW_WRITE_MODE})
+  Image            ${ACR_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG} (pulled via ${ACR_AUTH_MODE})
   Resource group   ${RESOURCE_GROUP}
   Schedule         ${CRON} (UTC)
   Graph auth       ${GRAPH_AUTH_MODE}

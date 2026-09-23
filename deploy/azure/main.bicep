@@ -8,14 +8,18 @@
 //   Log Analytics         first 5 GB ingested per month is free; this job
 //                         produces a few MB.                                $0.00
 //   Key Vault (standard)  no monthly fee; ~$0.03 per 10,000 operations and
-//                         this reads two secrets a day.                     ~$0.00
+//                         this reads two or three secrets a day.            ~$0.00
 //   Storage (Azure Files) a few hundred KB of state on a Standard LRS share. ~$0.06
+//   Container Registry    Basic tier, created once and shared by every
+//                         environment -- not by this template.            ~$5.00
 //                                                                    -------------
-//                                                              well under $1/month
+//                                                                ~$5/month total
 //
-// The container image is pulled from a public registry (GHCR by default), which
-// avoids the ~$5/month an Azure Container Registry Basic tier would add. Point
-// `containerImage` at your own ACR if your policy requires a private registry.
+// The image comes from an existing Azure Container Registry, built there with
+// `az acr build`. `registryAuthMode` picks who pulls it: an existing Entra
+// service principal holding AcrPull, its secret in this stack's Key Vault
+// (default), or this stack's managed identity, with no secret at all. Nothing in
+// the pull path leaves Azure either way.
 //
 // TWO TOPOLOGIES, set by `graphAuthMode`:
 //
@@ -34,6 +38,8 @@
 
 targetScope = 'resourceGroup'
 
+// One prefix per ServiceNow environment (e.g. intunecmdb-dev, intunecmdb-prod)
+// gives each a fully separate stack in the same resource group. See README.md.
 @description('Base name used to derive every resource name.')
 @minLength(3)
 @maxLength(18)
@@ -42,8 +48,34 @@ param namePrefix string = 'intunecmdb'
 @description('Azure region. Defaults to the resource group location.')
 param location string = resourceGroup().location
 
-@description('Container image to run.')
-param containerImage string = 'ghcr.io/your-org/intune-cmdb-sync:latest'
+@description('Login server of the existing Azure Container Registry, e.g. myregistry.azurecr.io.')
+param registryServer string
+
+@description('Image tag to run. Pin a version rather than latest, so DEV and PROD can run different builds.')
+param imageTag string
+
+@description('''
+How the job authenticates to the registry.
+
+'service_principal'  An existing Entra service principal holding AcrPull, with its
+                     secret in Key Vault. The default.
+'managed_identity'   This stack's user-assigned identity. No secret to store or
+                     rotate; the identity needs AcrPull on the registry, which
+                     deploy.sh grants after deployment because the registry is
+                     not part of this template.
+''')
+@allowed([
+  'service_principal'
+  'managed_identity'
+])
+param registryAuthMode string = 'service_principal'
+
+@description('Client ID of the existing Entra service principal that holds AcrPull. service_principal mode only.')
+param registryClientId string = ''
+
+@description('That service principal\'s client secret. Stored in Key Vault, never on the job.')
+@secure()
+param registryClientSecret string = ''
 
 @description('Cron schedule in UTC. Default: 03:15 every day.')
 param cronExpression string = '15 3 * * *'
@@ -111,6 +143,18 @@ param graphClientSecret string = ''
 @description('Discovery source name. Must match the sys_choice value on cmdb_ci.discovery_source.')
 param discoverySource string = 'Intune'
 
+@description('''
+How CIs are written. identify_reconcile is preferred; cmdb_instance is for an
+instance whose OAuth client is refused the IRE API at the REST gate but allowed
+the CMDB Instance API. Which one works is per instance: run
+`intune-cmdb-sync --check-api` against each before choosing.
+''')
+@allowed([
+  'identify_reconcile'
+  'cmdb_instance'
+])
+param writeMode string = 'identify_reconcile'
+
 @description('Set false to skip the Azure Files share used for retirement state.')
 param enableStatePersistence bool = true
 
@@ -134,10 +178,15 @@ var useManagedIdentityForGraph = graphAuthMode == 'managed_identity'
 var useFederatedIdentityForGraph = graphAuthMode == 'federated_managed_identity'
 var graphNeedsSecret = graphAuthMode == 'client_secret'
 
+var containerImage = '${registryServer}/intune-cmdb-sync:${imageTag}'
+var registryNeedsSecret = registryAuthMode == 'service_principal'
 var suffix = uniqueString(resourceGroup().id)
 var identityName = '${namePrefix}-id'
 var keyVaultName = take('${namePrefix}kv${suffix}', 24)
-var storageName = take('${namePrefix}st${suffix}', 24)
+// Storage account names allow only lowercase letters and digits, unlike every
+// other resource here, so a hyphenated prefix would otherwise fail on this one.
+var storageSafePrefix = toLower(replace(replace(namePrefix, '-', ''), '_', ''))
+var storageName = take('${storageSafePrefix}st${suffix}', 24)
 var workspaceName = '${namePrefix}-logs'
 var environmentName = '${namePrefix}-env'
 var jobName = '${namePrefix}-job'
@@ -185,6 +234,15 @@ resource serviceNowSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
     value: serviceNowClientSecret
   }
 }
+
+resource registrySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' =
+  if (registryNeedsSecret) {
+    parent: vault
+    name: 'registry-client-secret'
+    properties: {
+      value: registryClientSecret
+    }
+  }
 
 resource graphSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' =
   if (graphNeedsSecret) {
@@ -305,7 +363,7 @@ var baseEnv = [
   { name: 'SNOW_AUTH_MODE', value: 'oauth_client_credentials' }
   { name: 'SNOW_CLIENT_ID', value: serviceNowClientId }
   { name: 'SNOW_CLIENT_SECRET', secretRef: 'servicenow-client-secret' }
-  { name: 'SNOW_WRITE_MODE', value: 'identify_reconcile' }
+  { name: 'SNOW_WRITE_MODE', value: writeMode }
   { name: 'SNOW_DISCOVERY_SOURCE', value: discoverySource }
   { name: 'SNOW_RETIRE_MISSING', value: string(retireMissingDevices) }
   { name: 'DRY_RUN', value: string(dryRun) }
@@ -350,6 +408,22 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
         parallelism: 1
         replicaCompletionCount: 1
       }
+      // service_principal: when that secret expires, pulls fail and the
+      // no-successful-run alert is what reports it.
+      registries: registryNeedsSecret
+        ? [
+            {
+              server: registryServer
+              username: registryClientId
+              passwordSecretRef: 'registry-client-secret'
+            }
+          ]
+        : [
+            {
+              server: registryServer
+              identity: identity.id
+            }
+          ]
       secrets: concat(
         [
           {
@@ -358,6 +432,15 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             identity: identity.id
           }
         ],
+        registryNeedsSecret
+          ? [
+              {
+                name: 'registry-client-secret'
+                keyVaultUrl: registrySecret!.properties.secretUri
+                identity: identity.id
+              }
+            ]
+          : [],
         graphNeedsSecret
           ? [
               {
@@ -390,6 +473,11 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               name: 'state'
               storageType: 'AzureFile'
               storageName: storageMountName
+              // The image runs as uid 10001 (Dockerfile), and SMB ownership is
+              // fixed at mount time -- chown inside the container cannot change
+              // it. Pinning the owner makes state.json writable regardless of
+              // platform mount defaults.
+              mountOptions: 'uid=10001,dir_mode=0700,file_mode=0600'
             }
           ]
         : []
@@ -401,11 +489,6 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
   ]
 }
 
-@description('''
-Client ID of the managed identity. In managed_identity mode this is the identity
-that must hold the Graph application permissions. In client_secret mode it is
-only used to read Key Vault.
-''')
 // ---------------------------------------------------------------------------
 // Alerting
 //
@@ -453,13 +536,17 @@ stale and nothing else will tell you.
           {
             // summarize with no `by` yields a row of 0 when nothing matched,
             // which is what makes absence detectable at all.
-            query: '''
+            //
+            // format(), not interpolation: Bicep multi-line strings are verbatim,
+            // and a literal job-name placeholder matches no job -- which made this rule
+            // fire every hour and the one below never fire.
+            query: format('''
 ContainerAppConsoleLogs_CL
-| where ContainerJobName_s == '${jobName}'
+| where ContainerJobName_s == '{0}'
 | extend p = parse_json(Log_s)
 | where tostring(p.msg) == 'run complete'
 | summarize completed = count()
-'''
+''', jobName)
             timeAggregation: 'Total'
             metricMeasureColumn: 'completed'
             operator: 'LessThan'
@@ -483,11 +570,13 @@ resource deviceErrorAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pre
     name: '${namePrefix}-device-errors'
     location: location
     properties: {
-      displayName: '${jobName}: run completed with device errors'
+      displayName: '${jobName}: run completed with device errors or degraded'
       description: '''
-A run finished but individual devices failed to write. Read the per-device
-outcomes in run-report.json on the state share; error_samples in the summary
-line carries the first twenty.
+A run finished but individual devices failed to write, or it finished degraded:
+the mass-retirement guard tripped or the state file could not be saved, either
+of which leaves the next run unable to reason about the fleet. Read
+run-report.json on the state share; the summary line carries error_samples and
+the degraded conditions.
 '''
       severity: 2
       enabled: true
@@ -497,17 +586,17 @@ line carries the first twenty.
       criteria: {
         allOf: [
           {
-            query: '''
+            query: format('''
 ContainerAppConsoleLogs_CL
-| where ContainerJobName_s == '${jobName}'
+| where ContainerJobName_s == '{0}'
 | extend p = parse_json(Log_s)
 | where tostring(p.msg) == 'run complete'
-| extend failed = toint(p.errors)
-| where failed > 0
-| summarize failed = sum(failed)
-'''
+| extend failed = toint(p.errors), degraded = array_length(p.degraded)
+| where failed > 0 or degraded > 0
+| summarize problems = count()
+''', jobName)
             timeAggregation: 'Total'
-            metricMeasureColumn: 'failed'
+            metricMeasureColumn: 'problems'
             operator: 'GreaterThan'
             threshold: 0
             failingPeriods: {
@@ -526,6 +615,11 @@ ContainerAppConsoleLogs_CL
 
 output alertsEnabled bool = enableAlerts
 
+@description('''
+Client ID of the managed identity. In managed_identity mode this is the identity
+that must hold the Graph application permissions. In client_secret mode it is
+only used to read Key Vault.
+''')
 output managedIdentityClientId string = identity.properties.clientId
 
 @description('Object ID of the managed identity service principal. Used for the app-role grant.')
