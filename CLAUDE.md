@@ -69,12 +69,50 @@ behaviour change, particularly anything altering what gets written to a CI.
   opt-in alternative for later: the stack's own identity pulls, and `deploy.sh`
   grants it AcrPull after deploying (the registry is outside the template).
   Keep the service principal the default. `deploy.sh` checks the tag exists
-  before deploying.
+  before deploying. **The target subscription's policy refuses both the
+  registry and Container Apps** (see Constraints), so this whole model is
+  currently undeployable there.
+
+- **`deploy.sh` has no `DRY_RUN` default and accepts only `true` / `false`.**
+  A default of `false` turned any redeploy that forgot `DRY_RUN=true` live.
+  `az` also sends any bool parameter other than the literal string `true` as
+  `false`, so `DRY_RUN=yes` deployed a live job. `RETIRE_MISSING` gets the same
+  strict check. Do not reintroduce a default.
+- **The job gets only the settings `main.bicep` sets.** A local `.env` does not
+  carry over. `SNOW_CLASS_MAP` passes through as-is. `MAPPING_OVERRIDES_FILE`
+  is read **locally** by `deploy.sh`, which strips `_comment` and ships the
+  contents as `MAPPING_OVERRIDES_JSON`, because the image contains no such
+  file. `config.py` accepts either variable but refuses both at once. Any
+  future host (Functions, a VM) needs the same pass-through, or the
+  `last_discovered` churn comes back.
 
 - **Graph data calls are plain REST, deliberately** — `azure-identity` handles
   tokens, but `msgraph-sdk` is not used. Do not add it.
 
 ## Constraints
+
+- **The target subscription's policy allows only listed resource types, and
+  none of them host code except VMs.** The first deploy (2026-09-23,
+  `az acr create` into resource group `azc-obm-development`) was denied with
+  `RequestDisallowedByPolicy` by `vpcx-lzn-cmmn-allowed-services`. That policy
+  sits in the "VPCx Landing Zone Common Baseline" set, assigned at the
+  `Production` management group, with effect Deny.
+  - **Allowed:** Key Vault, storage accounts and file shares, Log Analytics
+    workspaces, user-assigned identities, `insights` action groups and
+    scheduled query rules, and `Compute/virtualMachines` plus extensions.
+  - **Denied:** `ContainerRegistry/registries`, `App/managedEnvironments`,
+    `App/jobs`, all of `Microsoft.Web` (Functions, App Service, Logic Apps
+    Standard), `Microsoft.Logic`, and `Microsoft.Automation`.
+  - **Also denied, and it matters for the VM route:**
+    `Insights/dataCollectionRules`, which the Azure Monitor Agent needs to ship
+    logs, and `Network/natGateways`, which a VM would need for outbound access
+    to Graph and ServiceNow.
+  - **Every route needs the platform team.** Functions or Container Apps need
+    an exemption. A VM needs a network placement, firewall egress, and
+    probably the data collection rule type.
+  - **Functions is the preferred ask.** Its exemption is only
+    `Microsoft.Web/sites` + `Microsoft.Web/serverfarms`, and a zip deploy
+    removes the registry entirely.
 
 - **`SNOW_CLASS_MAP` replaces the built-in default, it does not extend it.**
   `_env_kv_map` returns the parsed value or the default, never a merge, so a map
@@ -189,6 +227,22 @@ not observed responses. Green tests are weaker evidence here than they look.
 
 ## Next steps
 
+0. **Next session: plan an Azure Functions host.** The Container Apps stack in
+   `deploy/azure/` cannot deploy under the landing zone policy (see
+   Constraints). Planned direction:
+   - A timer-triggered Python function wrapping `main()`, shaped like
+     `aws_lambda.handler`.
+   - The Flex Consumption plan, because Consumption's 10-minute limit is tight.
+   - A zip deploy, so there is no registry.
+   - Keep the parts the policy allows: the managed identity, Key Vault, state
+     on storage, Log Analytics, and the alerts. The alert queries currently
+     read `ContainerAppConsoleLogs_CL` and will need a Functions log source.
+   - Keep the `DRY_RUN` and settings pass-through safety properties from
+     `deploy.sh`.
+
+   It still needs a policy exemption for `Microsoft.Web/sites` and
+   `Microsoft.Web/serverfarms`. Get that request moving in parallel. A VM is
+   the fallback if it is refused.
 1. **Blocked: get the OAuth client authorized for the IRE API.** The instance
    exists and reads work; every write is refused by the unscoped-api gate (see
    Constraints). This is with the ServiceNow admin. Until it clears, nothing
