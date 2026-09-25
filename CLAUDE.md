@@ -45,7 +45,7 @@ behaviour change, particularly anything altering what gets written to a CI.
   the fleet. See `RunReport.degraded`.
 - **`intune-cmdb-query` is the read-only half.** `cmdb_report.py` + `query_cli.py`
   issue `GET /api/now/table/...` and nothing else, so they run against an
-  instance whose write path is still blocked by the unscoped-api gate. It reads
+  instance whose write path is blocked by the unscoped-api gate. It reads
   with `sysparm_display_value=all` because `manufacturer` / `model_id` /
   `assigned_to` are references whose raw value is a sys_id; `query_table` keeps
   asking for raw values because the resolvers depend on that, so the reader
@@ -84,7 +84,25 @@ behaviour change, particularly anything altering what gets written to a CI.
   contents as `MAPPING_OVERRIDES_JSON`, because the image contains no such
   file. `config.py` accepts either variable but refuses both at once. Any
   future host (Functions, a VM) needs the same pass-through, or the
-  `last_discovered` churn comes back.
+  `last_discovered` churn comes back. The AWS stack has it: `deploy/aws` takes
+  `mapping_overrides_file` / `class_map` and a required `dry_run` for both of
+  its hosts (`host = "lambda" | "ecs"`), checked offline by `terraform test`
+  against a mocked provider. The ECS image needs `--build-arg EXTRAS=aws`,
+  because S3 state imports boto3.
+- **AWS secrets are referenced by SSM parameter name, never passed to
+  Terraform.** As variables they landed in plaintext in `terraform.tfvars` and
+  the (backend-less, local) state. The parameter ARNs are built from the names
+  rather than read with the `aws_ssm_parameter` data source, which would copy
+  the decrypted value into state anyway. `removed` blocks forget the
+  parameters older versions created without deleting them.
+- **A degraded run needs its own alarm.** It still logs `run complete` and can
+  have zero errors, so neither the absence alarm nor the error alarm sees it.
+  Azure's alert matches `degraded > 0`; AWS matches the `run completed in a
+  degraded state` / `sync failed` messages. Any new host needs the same.
+- **Lambda: no async retries, one run at a time.** A timeout counts as a
+  failure, so Lambda's default two async retries would run a 15-minute sync
+  three times. Reserved concurrency 1 stops overlapping runs racing on
+  `state.json`. ECS has no equivalent, which the README documents.
 
 - **Graph data calls are plain REST, deliberately** — `azure-identity` handles
   tokens, but `msgraph-sdk` is not used. Do not add it.
@@ -135,8 +153,9 @@ behaviour change, particularly anything altering what gets written to a CI.
   `sys_choice` holds one row per language, so a listing is duplicated noise that
   cannot prove absence past its row limit either. A determined absence **fails**
   the check (exit 3), including a case-only near-miss; only an unreadable
-  `sys_choice` is a caveat. On dpsnowdev (2026-09-04) nothing resembling
-  "Intune" is registered at all. `--register-discovery-source` creates the row
+  `sys_choice` is a caveat. On dpsnowdev nothing resembling "Intune" was
+  registered on 2026-09-04. By 2026-09-25 `Intune` was registered and `--check`
+  passes with it. `--register-discovery-source` creates the row
   via `POST /api/now/table/sys_choice` — which `--check-api` says this
   credential may call — and prints the record for an admin when ACLs refuse.
   Keep it on its own flag: a connector that edited choice lists as a side
@@ -203,6 +222,9 @@ behaviour change, particularly anything altering what gets written to a CI.
   403 carries `X-Is-Logged-In: true`. The fix is a REST API Auth Scope for
   `POST` on both `/api/now/identifyreconcile` and
   `/api/now/identifyreconcile/query`, or Scope Restriction = Broadly Scoped.
+  **Resolved on dpsnowdev by 2026-09-25**: `--check-api` (run_id `5fe75e06fcfc`)
+  shows all four `identifyreconcile` variants ALLOWED with 200. The notes stay
+  because PROD's OAuth client will need the same scope.
 
 - **Which APIs are gated is per-instance — probe, do not assume.** This file
   previously stated that `/api/now/cmdb/instance/…` was "behind the same gate,
@@ -218,12 +240,19 @@ behaviour change, particularly anything altering what gets written to a CI.
 ## State of the work
 
 The Microsoft Graph half is verified against a live tenant. On the ServiceNow
-half, **reads are now verified against a live instance and writes are not**: as
-of 2026-08-28 a `--dry-run --limit 5` reached the instance, resolved real
-`sys_user` sys_ids, and was then refused on every write by the unscoped-api gate
-described under Constraints. Nothing has ever been written to a live CMDB, and
-the 278 tests mock at the HTTP boundary with `respx` from vendor documentation,
-not observed responses. Green tests are weaker evidence here than they look.
+half, reads are verified, and so are writes **through `SNOW_WRITE_MODE=cmdb_instance`
+only**: on 2026-09-04 that mode wrote 19 CIs to dpsnowdev, and a re-run matched by
+serial rather than duplicating. **The IRE path has never written anything.** Its
+endpoints cleared the unscoped-api gate on 2026-09-25 (see Constraints), and a
+dry run went through `/identifyreconcile/query` the same day (run_id
+`4f027adeed81`, `--limit 5`): every operation it returned was recognised, and all
+three mapped devices came back `updated` against the `ci_sys_id`s the 2026-09-04
+`cmdb_instance` run created, so IRE matched them rather than planning duplicates.
+A real `--limit 5` IRE write followed on 2026-09-25, and the same dry run repeated
+straight afterwards reported every device `unchanged`, so no mapped field churns
+between runs. Retirement through IRE runs is still untested. The tests mock at the
+HTTP boundary with `respx` from vendor documentation, not observed responses.
+Green tests are weaker evidence here than they look.
 
 ## Next steps
 
@@ -243,12 +272,10 @@ not observed responses. Green tests are weaker evidence here than they look.
    It still needs a policy exemption for `Microsoft.Web/sites` and
    `Microsoft.Web/serverfarms`. Get that request moving in parallel. A VM is
    the fallback if it is refused.
-1. **Blocked: get the OAuth client authorized for the IRE API.** The instance
-   exists and reads work; every write is refused by the unscoped-api gate (see
-   Constraints). This is with the ServiceNow admin. Until it clears, nothing
-   below can run — `SNOW_AUTH_MODE=basic` sidesteps it for local testing only,
-   since the restriction is on the OAuth entity rather than the user.
-   **`intune-cmdb-sync --check-api` is the diagnostic for this**: it probes
+1. **Done on dpsnowdev (2026-09-25): the OAuth client is authorized for the IRE
+   API.** `--check-api` shows every endpoint allowed. PROD's OAuth client will
+   need the same REST API Auth Scope, so re-run the probe there before its first
+   run. **`intune-cmdb-sync --check-api` is the diagnostic for this**: it probes
    every endpoint × method the connector can use (`servicenow/probe.py`),
    including the `/api/now/v1/...` aliases, and prints which are allowed plus
    the scope change to request. It writes nothing and must stay that way — the
@@ -256,8 +283,8 @@ not observed responses. Green tests are weaker evidence here than they look.
    probes post to a class that does not exist. A 400/404 from those probes is a
    **pass**: reaching the API's own validation proves the request cleared the
    gate. Exit 3 means the endpoint the configured write mode uses is refused.
-1a. **Unblocked path, if the IRE scope stays stuck: `SNOW_WRITE_MODE=cmdb_instance`.**
-   The 2026-09-04 probe shows that endpoint allowed on this instance, along with
+1a. **Fallback only, now that IRE is open: `SNOW_WRITE_MODE=cmdb_instance`.**
+   The 2026-09-04 probe showed that endpoint allowed on this instance, along with
    `PATCH /api/now/table/…` (retirement) and `POST /api/now/table/…`. `--check`
    verifies this mode now (`_verify_cmdb_instance_access`) and `--dry-run`
    predicts insert/update by reading serial number then name rather than
@@ -278,8 +305,14 @@ not observed responses. Green tests are weaker evidence here than they look.
    The dry run uses `/identifyreconcile/query`, a *different* endpoint whose
    response vocabulary is unconfirmed; an unrecognised operation is a hard
    error by design, so this is where a surprise will surface.
-4. **First real write with `--limit` and `SNOW_RETIRE_MISSING=false`.** Then
-   verify that `install_status=7` actually means retired *in that instance*
+   **Done 2026-09-25 (run_id `4f027adeed81`)**: 3 `updated`, 0 errors, no
+   unrecognised operation. `updated` is expected on the first IRE pass over CIs
+   the `cmdb_instance` mode wrote; whether it persists is step 4's churn check.
+4. **First real write with `--limit` and `SNOW_RETIRE_MISSING=false`.** Re-run
+   the same dry run straight afterwards: it must report `unchanged`. If it still
+   says `updated`, some field moves between runs (see the `last_discovered` note
+   in Architecture). **Done 2026-09-25**: the post-write dry run reported all
+   `unchanged`. Still outstanding: verify that `install_status=7` actually means retired *in that instance*
    before enabling retirement — the README calls this a convention, not a
    guarantee.
 5. **Drop the limit** once the written CIs look right, and only then consider

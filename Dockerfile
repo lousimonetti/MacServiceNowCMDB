@@ -15,9 +15,15 @@ COPY src ./src
 
 # Build a wheel, then install it into a self-contained prefix we can copy into
 # the runtime stage. Keeps build tooling out of the shipped image.
+#
+# EXTRAS selects optional dependencies from pyproject.toml. ECS/Fargate needs
+# `--build-arg EXTRAS=aws`: STATE_PATH=s3://... imports boto3, and without it the
+# task fails at startup rather than at build time. Azure needs nothing extra.
+ARG EXTRAS=""
 RUN pip install --no-cache-dir build hatchling \
  && python -m build --wheel --outdir /wheels \
- && pip install --no-cache-dir --prefix=/install /wheels/*.whl
+ && wheel=$(ls /wheels/*.whl) \
+ && pip install --no-cache-dir --prefix=/install "${wheel}${EXTRAS:+[${EXTRAS}]}"
 
 
 FROM python:3.12-slim AS runtime

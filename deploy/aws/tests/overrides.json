@@ -1,0 +1,4 @@
+{
+  "_comment": ["Test fixture: must not reach the job."],
+  "drop": ["last_discovered"]
+}

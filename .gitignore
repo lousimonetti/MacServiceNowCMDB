@@ -31,6 +31,8 @@ servicenow-app/.now/
 !.env.example
 state.json
 run-report.json
+# local container runs write their report here (see deploy/aws/README.md)
+out/
 mapping-overrides.json
 !docs/examples/mapping-overrides.json
 

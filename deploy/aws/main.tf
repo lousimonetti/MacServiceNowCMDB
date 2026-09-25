@@ -1,4 +1,9 @@
-# intune-cmdb-sync on AWS: Lambda (container image) triggered by EventBridge Scheduler.
+# intune-cmdb-sync on AWS, triggered by EventBridge Scheduler. `host` picks the
+# compute: a Lambda container image (default, this file) or an ECS Fargate
+# scheduled task (ecs.tf). Everything else -- state bucket, secrets, schedule,
+# alerting -- is shared.
+#
+# Lambda cost shape below; ECS is in ecs.tf.
 #
 # Cost shape (us-east-1 list prices, outside the perpetual free tier):
 #   Lambda            1 run/day x 5 min x 1024 MB = ~9,000 GB-s/month.
@@ -17,11 +22,12 @@
 #   * State goes in S3 rather than EFS, because EFS would force the VPC above.
 #
 # Secrets live in SSM Parameter Store (SecureString), which is free, rather than
-# Secrets Manager at $0.40 per secret per month. See deploy/aws/README.md if
-# your organisation mandates Secrets Manager.
+# Secrets Manager at $0.40 per secret per month. They are created OUTSIDE
+# Terraform and referenced by name, so the values never enter a tfvars file or
+# the Terraform state. See deploy/aws/README.md.
 
 terraform {
-  required_version = ">= 1.5"
+  required_version = ">= 1.7" # removed blocks, below
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -35,6 +41,8 @@ provider "aws" {
 }
 
 data "aws_caller_identity" "current" {}
+
+data "aws_partition" "current" {}
 
 # ---------------------------------------------------------------- variables
 
@@ -71,10 +79,18 @@ variable "graph_client_id" {
   type        = string
 }
 
-variable "graph_client_secret" {
-  description = "Entra app registration client secret."
+variable "graph_client_secret_parameter" {
+  description = <<-DESC
+    Name of an existing SSM SecureString holding the Entra client secret, e.g.
+    "/intune-cmdb-sync/graph-client-secret". Created outside Terraform so the
+    value never reaches the state file; see deploy/aws/README.md.
+  DESC
   type        = string
-  sensitive   = true
+
+  validation {
+    condition     = startswith(var.graph_client_secret_parameter, "/")
+    error_message = "Use the full parameter name, starting with \"/\"."
+  }
 }
 
 variable "servicenow_instance" {
@@ -87,10 +103,14 @@ variable "servicenow_client_id" {
   type        = string
 }
 
-variable "servicenow_client_secret" {
-  description = "ServiceNow OAuth client secret."
+variable "servicenow_client_secret_parameter" {
+  description = "Name of an existing SSM SecureString holding the ServiceNow OAuth client secret."
   type        = string
-  sensitive   = true
+
+  validation {
+    condition     = startswith(var.servicenow_client_secret_parameter, "/")
+    error_message = "Use the full parameter name, starting with \"/\"."
+  }
 }
 
 variable "discovery_source" {
@@ -106,9 +126,62 @@ variable "retire_missing_devices" {
 }
 
 variable "dry_run" {
-  description = "Run without committing anything to the CMDB."
+  description = <<-DESC
+    Run without committing anything to the CMDB. Required, deliberately: a
+    default of false turned any apply that forgot it into a live run, the same
+    hazard deploy/azure/deploy.sh removed.
+  DESC
   type        = bool
-  default     = false
+  nullable    = false
+}
+
+variable "host" {
+  description = "Compute that runs the sync: \"lambda\" or \"ecs\" (Fargate scheduled task, see ecs.tf)."
+  type        = string
+  default     = "lambda"
+
+  validation {
+    condition     = contains(["lambda", "ecs"], var.host)
+    error_message = "host must be \"lambda\" or \"ecs\"."
+  }
+}
+
+variable "write_mode" {
+  description = "SNOW_WRITE_MODE. cmdb_instance is a fallback for instances where the IRE API is refused."
+  type        = string
+  default     = "identify_reconcile"
+
+  validation {
+    condition     = contains(["identify_reconcile", "cmdb_instance"], var.write_mode)
+    error_message = "write_mode must be \"identify_reconcile\" or \"cmdb_instance\"."
+  }
+}
+
+variable "class_map" {
+  description = <<-DESC
+    SNOW_CLASS_MAP, e.g. "windows=cmdb_ci_computer;macos=cmdb_ci_computer".
+    It REPLACES the built-in map rather than extending it, so list every OS you
+    want written. Empty leaves the built-in map (windows, macos) in effect.
+  DESC
+  type        = string
+  default     = ""
+}
+
+variable "mapping_overrides_file" {
+  description = <<-DESC
+    Path to a local mapping overrides JSON object, relative to this directory
+    (e.g. "../../mapping-overrides.json"). Its contents, minus _comment, reach
+    the job as MAPPING_OVERRIDES_JSON because the image holds no such file.
+    Leave it empty and last_discovered is sent again, which makes every device
+    an UPDATE on every run.
+  DESC
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.mapping_overrides_file == "" || can(keys(jsondecode(file(var.mapping_overrides_file))))
+    error_message = "mapping_overrides_file must name a readable file containing a JSON object."
+  }
 }
 
 variable "memory_mb" {
@@ -124,7 +197,24 @@ variable "timeout_seconds" {
 
   validation {
     condition     = var.timeout_seconds > 0 && var.timeout_seconds <= 900
-    error_message = "Lambda supports a maximum timeout of 900 seconds. Very large tenants that cannot finish in 15 minutes should use ECS Fargate instead; see deploy/aws/README.md."
+    error_message = "Lambda supports a maximum timeout of 900 seconds. Very large tenants that cannot finish in 15 minutes should set host = \"ecs\" instead; see deploy/aws/README.md."
+  }
+}
+
+variable "lambda_reserved_concurrency" {
+  description = <<-DESC
+    Lambda only. 1 means a second invocation is throttled rather than run
+    alongside the first, so two runs never read and write state.json at once.
+    Set -1 (unreserved) only if the account's concurrency limit is 10, the
+    default on new accounts: AWS refuses any reservation that leaves fewer than
+    10 unreserved, and the apply fails saying so.
+  DESC
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.lambda_reserved_concurrency == -1 || var.lambda_reserved_concurrency == 1
+    error_message = "lambda_reserved_concurrency must be 1 (one run at a time) or -1 (unreserved)."
   }
 }
 
@@ -140,20 +230,81 @@ variable "log_retention_days" {
   default     = 30
 }
 
-# ------------------------------------------------------------------ secrets
+# ------------------------------------------------------------------- locals
 
-resource "aws_ssm_parameter" "graph_client_secret" {
-  name        = "/${var.name}/graph-client-secret"
-  description = "Entra app registration client secret for Microsoft Graph."
-  type        = "SecureString"
-  value       = var.graph_client_secret
+locals {
+  use_lambda = var.host == "lambda"
+  use_ecs    = var.host == "ecs"
+
+  # _comment is documentation for people; drop it rather than ship it in an env
+  # var. Same transformation deploy/azure/deploy.sh applies with jq.
+  mapping_overrides = var.mapping_overrides_file == "" ? "" : jsonencode({
+    for k, v in jsondecode(file(var.mapping_overrides_file)) : k => v if k != "_comment"
+  })
+
+  # Settings shared by both hosts. Each host adds only how it receives secrets.
+  sync_env = merge(
+    {
+      GRAPH_AUTH_MODE  = "client_secret"
+      GRAPH_TENANT_ID  = var.graph_tenant_id
+      GRAPH_CLIENT_ID  = var.graph_client_id
+      INTUNE_OWNERSHIP = "company"
+
+      SNOW_INSTANCE         = var.servicenow_instance
+      SNOW_AUTH_MODE        = "oauth_client_credentials"
+      SNOW_CLIENT_ID        = var.servicenow_client_id
+      SNOW_WRITE_MODE       = var.write_mode
+      SNOW_DISCOVERY_SOURCE = var.discovery_source
+      SNOW_RETIRE_MISSING   = tostring(var.retire_missing_devices)
+
+      STATE_PATH = "s3://${aws_s3_bucket.state.id}/state.json"
+      DRY_RUN    = tostring(var.dry_run)
+      LOG_FORMAT = "json"
+      LOG_LEVEL  = "INFO"
+
+      # The run report is the only per-device record of what happened, and
+      # neither host's filesystem outlives the run, so it goes to the same
+      # bucket as the state file.
+      RUN_REPORT_PATH    = "s3://${aws_s3_bucket.state.id}/run-report.json"
+      RUN_REPORT_DEVICES = "true"
+
+      # Without this a run where every device failed still exits 0.
+      FAIL_ON_ERROR = "true"
+    },
+    # Set only when given: an empty SNOW_CLASS_MAP is not the same as none.
+    var.class_map == "" ? {} : { SNOW_CLASS_MAP = var.class_map },
+    local.mapping_overrides == "" ? {} : { MAPPING_OVERRIDES_JSON = local.mapping_overrides },
+  )
 }
 
-resource "aws_ssm_parameter" "servicenow_client_secret" {
-  name        = "/${var.name}/servicenow-client-secret"
-  description = "ServiceNow OAuth client secret."
-  type        = "SecureString"
-  value       = var.servicenow_client_secret
+# ------------------------------------------------------------------ secrets
+
+locals {
+  # ARNs built from the names rather than read with a data source: the
+  # aws_ssm_parameter data source would copy the decrypted value into state,
+  # which is exactly what referencing by name avoids.
+  ssm_arn_prefix                  = "arn:${data.aws_partition.current.partition}:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter"
+  graph_secret_parameter_arn      = "${local.ssm_arn_prefix}${var.graph_client_secret_parameter}"
+  servicenow_secret_parameter_arn = "${local.ssm_arn_prefix}${var.servicenow_client_secret_parameter}"
+}
+
+# Earlier versions of this template created the two parameters from tfvars
+# values. Forget them without deleting them, so an existing deployment keeps its
+# secrets and simply points the *_parameter variables at the same names.
+removed {
+  from = aws_ssm_parameter.graph_client_secret
+
+  lifecycle {
+    destroy = false
+  }
+}
+
+removed {
+  from = aws_ssm_parameter.servicenow_client_secret
+
+  lifecycle {
+    destroy = false
+  }
 }
 
 # -------------------------------------------------------------------- state
@@ -179,6 +330,30 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "state" {
       sse_algorithm = "AES256"
     }
   }
+}
+
+# The connector always uses HTTPS; this makes anything else a hard refusal.
+resource "aws_s3_bucket_policy" "state" {
+  bucket = aws_s3_bucket.state.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource = [
+        aws_s3_bucket.state.arn,
+        "${aws_s3_bucket.state.arn}/*",
+      ]
+      Condition = {
+        Bool = { "aws:SecureTransport" = "false" }
+      }
+    }]
+  })
+
+  depends_on = [aws_s3_bucket_public_access_block.state]
 }
 
 resource "aws_s3_bucket_versioning" "state" {
@@ -222,6 +397,7 @@ data "aws_iam_policy_document" "assume" {
 }
 
 resource "aws_iam_role" "lambda" {
+  count              = local.use_lambda ? 1 : 0
   name               = "${var.name}-lambda"
   assume_role_policy = data.aws_iam_policy_document.assume.json
 }
@@ -230,15 +406,15 @@ data "aws_iam_policy_document" "lambda" {
   statement {
     sid       = "Logs"
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = ["${aws_cloudwatch_log_group.lambda.arn}:*"]
+    resources = ["${aws_cloudwatch_log_group.sync.arn}:*"]
   }
 
   statement {
     sid     = "ReadSecrets"
     actions = ["ssm:GetParameter", "ssm:GetParameters"]
     resources = [
-      aws_ssm_parameter.graph_client_secret.arn,
-      aws_ssm_parameter.servicenow_client_secret.arn,
+      local.graph_secret_parameter_arn,
+      local.servicenow_secret_parameter_arn,
     ]
   }
 
@@ -265,67 +441,79 @@ data "aws_iam_policy_document" "lambda" {
 }
 
 resource "aws_iam_role_policy" "lambda" {
+  count  = local.use_lambda ? 1 : 0
   name   = "${var.name}-lambda"
-  role   = aws_iam_role.lambda.id
+  role   = aws_iam_role.lambda[0].id
   policy = data.aws_iam_policy_document.lambda.json
 }
 
 # ------------------------------------------------------------------ compute
 
-resource "aws_cloudwatch_log_group" "lambda" {
-  name              = "/aws/lambda/${var.name}"
+# One log group for whichever host runs, at the path that host writes to by
+# convention, so the alerting below needs no per-host variant.
+resource "aws_cloudwatch_log_group" "sync" {
+  name              = local.use_lambda ? "/aws/lambda/${var.name}" : "/ecs/${var.name}"
   retention_in_days = var.log_retention_days
 }
 
+moved {
+  from = aws_cloudwatch_log_group.lambda
+  to   = aws_cloudwatch_log_group.sync
+}
+
+moved {
+  from = aws_iam_role.lambda
+  to   = aws_iam_role.lambda[0]
+}
+
+moved {
+  from = aws_iam_role_policy.lambda
+  to   = aws_iam_role_policy.lambda[0]
+}
+
+moved {
+  from = aws_lambda_function.sync
+  to   = aws_lambda_function.sync[0]
+}
+
 resource "aws_lambda_function" "sync" {
+  count         = local.use_lambda ? 1 : 0
   function_name = var.name
-  role          = aws_iam_role.lambda.arn
+  role          = aws_iam_role.lambda[0].arn
   package_type  = "Image"
   image_uri     = var.image_uri
   memory_size   = var.memory_mb
   timeout       = var.timeout_seconds
 
+  reserved_concurrent_executions = var.lambda_reserved_concurrency
+
   environment {
-    variables = {
-      GRAPH_AUTH_MODE  = "client_secret"
-      GRAPH_TENANT_ID  = var.graph_tenant_id
-      GRAPH_CLIENT_ID  = var.graph_client_id
-      INTUNE_OWNERSHIP = "company"
-
-      SNOW_INSTANCE         = var.servicenow_instance
-      SNOW_AUTH_MODE        = "oauth_client_credentials"
-      SNOW_CLIENT_ID        = var.servicenow_client_id
-      SNOW_WRITE_MODE       = "identify_reconcile"
-      SNOW_DISCOVERY_SOURCE = var.discovery_source
-      SNOW_RETIRE_MISSING   = tostring(var.retire_missing_devices)
-
-      STATE_PATH = "s3://${aws_s3_bucket.state.id}/state.json"
-      DRY_RUN    = tostring(var.dry_run)
-      LOG_FORMAT = "json"
-      LOG_LEVEL  = "INFO"
-
-      # The run report is the only per-device record of what happened, and a
-      # Lambda's filesystem does not outlive the invocation, so it goes to the
-      # same bucket as the state file.
-      RUN_REPORT_PATH    = "s3://${aws_s3_bucket.state.id}/run-report.json"
-      RUN_REPORT_DEVICES = "true"
-
-      # Without this a run where every device failed still exits 0.
-      FAIL_ON_ERROR = "true"
-
-      # The connector reads these two at startup from SSM Parameter Store
-      # (see src/intune_cmdb_sync/secrets.py). Only the parameter *names* live
-      # here; the values never enter the function configuration, where anyone
-      # with lambda:GetFunctionConfiguration could read them.
-      GRAPH_CLIENT_SECRET_PARAMETER = aws_ssm_parameter.graph_client_secret.name
-      SNOW_CLIENT_SECRET_PARAMETER  = aws_ssm_parameter.servicenow_client_secret.name
-    }
+    # The connector reads the two secrets at startup from SSM Parameter Store
+    # (see src/intune_cmdb_sync/secrets.py). Only the parameter *names* live
+    # here; the values never enter the function configuration, where anyone
+    # with lambda:GetFunctionConfiguration could read them.
+    variables = merge(local.sync_env, {
+      GRAPH_CLIENT_SECRET_PARAMETER = var.graph_client_secret_parameter
+      SNOW_CLIENT_SECRET_PARAMETER  = var.servicenow_client_secret_parameter
+    })
   }
 
   depends_on = [
     aws_iam_role_policy.lambda,
-    aws_cloudwatch_log_group.lambda,
+    aws_cloudwatch_log_group.sync,
   ]
+}
+
+# The scheduler invokes asynchronously, and Lambda retries a failed async
+# invocation twice by default. The handler returns rather than raises, so an
+# ordinary failed sync is not retried -- but a timeout is a failure, and a run
+# that hits the 15-minute ceiling would otherwise go three times in a row
+# against the instance. A missed day is caught by the no-successful-run alarm.
+resource "aws_lambda_function_event_invoke_config" "sync" {
+  count                        = local.use_lambda ? 1 : 0
+  function_name                = aws_lambda_function.sync[0].function_name
+  maximum_retry_attempts       = 0
+  maximum_event_age_in_seconds = 3600
 }
 
 # ---------------------------------------------------------------- scheduler
@@ -352,18 +540,47 @@ resource "aws_iam_role" "scheduler" {
   assume_role_policy = data.aws_iam_policy_document.scheduler_assume.json
 }
 
-resource "aws_iam_role_policy" "scheduler" {
-  name = "${var.name}-scheduler"
-  role = aws_iam_role.scheduler.id
+data "aws_iam_policy_document" "scheduler" {
+  dynamic "statement" {
+    for_each = local.use_lambda ? [1] : []
+    content {
+      actions   = ["lambda:InvokeFunction"]
+      resources = [aws_lambda_function.sync[0].arn]
+    }
+  }
 
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = "lambda:InvokeFunction"
-      Resource = aws_lambda_function.sync.arn
-    }]
-  })
+  dynamic "statement" {
+    for_each = local.use_ecs ? [1] : []
+    content {
+      actions   = ["ecs:RunTask"]
+      resources = ["${aws_ecs_task_definition.sync[0].arn_without_revision}:*"]
+
+      condition {
+        test     = "ArnLike"
+        variable = "ecs:cluster"
+        values   = [aws_ecs_cluster.sync[0].arn]
+      }
+    }
+  }
+
+  # RunTask hands both roles to ECS, so the scheduler must be allowed to pass
+  # them.
+  dynamic "statement" {
+    for_each = local.use_ecs ? [1] : []
+    content {
+      actions = ["iam:PassRole"]
+      resources = [
+        aws_iam_role.ecs_execution[0].arn,
+        aws_iam_role.ecs_task[0].arn,
+      ]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "scheduler" {
+  name   = "${var.name}-scheduler"
+  role   = aws_iam_role.scheduler.id
+  policy = data.aws_iam_policy_document.scheduler.json
 }
 
 resource "aws_scheduler_schedule" "daily" {
@@ -379,8 +596,23 @@ resource "aws_scheduler_schedule" "daily" {
   }
 
   target {
-    arn      = aws_lambda_function.sync.arn
+    arn      = local.use_lambda ? aws_lambda_function.sync[0].arn : aws_ecs_cluster.sync[0].arn
     role_arn = aws_iam_role.scheduler.arn
+
+    dynamic "ecs_parameters" {
+      for_each = local.use_ecs ? [1] : []
+      content {
+        task_definition_arn = aws_ecs_task_definition.sync[0].arn
+        launch_type         = "FARGATE"
+        task_count          = 1
+
+        network_configuration {
+          subnets          = var.subnet_ids
+          security_groups  = [aws_security_group.ecs[0].id]
+          assign_public_ip = var.assign_public_ip
+        }
+      }
+    }
 
     retry_policy {
       maximum_retry_attempts       = 1
@@ -391,8 +623,12 @@ resource "aws_scheduler_schedule" "daily" {
 
 # ------------------------------------------------------------------ outputs
 
+output "host" {
+  value = var.host
+}
+
 output "function_name" {
-  value = aws_lambda_function.sync.function_name
+  value = local.use_lambda ? aws_lambda_function.sync[0].function_name : null
 }
 
 output "state_bucket" {
@@ -400,12 +636,14 @@ output "state_bucket" {
 }
 
 output "log_group" {
-  value = aws_cloudwatch_log_group.lambda.name
+  value = aws_cloudwatch_log_group.sync.name
 }
 
 output "manual_invoke_command" {
   description = "Run the sync immediately, without waiting for the schedule."
-  value       = "aws lambda invoke --function-name ${aws_lambda_function.sync.function_name} --cli-binary-format raw-in-base64-out --payload '{\"dry_run\":true}' /dev/stdout"
+  value = local.use_lambda ? (
+    "aws lambda invoke --function-name ${aws_lambda_function.sync[0].function_name} --cli-binary-format raw-in-base64-out --payload '{\"dry_run\":true}' /dev/stdout"
+  ) : local.ecs_run_task_command
 }
 
 # ---------------------------------------------------------------------------
@@ -438,7 +676,7 @@ resource "aws_sns_topic_subscription" "alerts_email" {
 resource "aws_cloudwatch_log_metric_filter" "run_complete" {
   count          = local.enable_alerts ? 1 : 0
   name           = "${var.name}-run-complete"
-  log_group_name = aws_cloudwatch_log_group.lambda.name
+  log_group_name = aws_cloudwatch_log_group.sync.name
   pattern        = "{ $.msg = \"run complete\" }"
 
   metric_transformation {
@@ -452,7 +690,7 @@ resource "aws_cloudwatch_log_metric_filter" "run_complete" {
 resource "aws_cloudwatch_log_metric_filter" "device_errors" {
   count          = local.enable_alerts ? 1 : 0
   name           = "${var.name}-device-errors"
-  log_group_name = aws_cloudwatch_log_group.lambda.name
+  log_group_name = aws_cloudwatch_log_group.sync.name
   pattern        = "{ $.msg = \"run complete\" && $.errors > 0 }"
 
   metric_transformation {
@@ -508,6 +746,46 @@ resource "aws_cloudwatch_metric_alarm" "device_errors" {
 
   # A quiet period here genuinely means no errors were reported.
   treat_missing_data = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.alerts[0].arn]
+}
+
+# A degraded run still logs "run complete", so the absence alarm stays quiet and
+# errors may be 0. Degraded means a tripped mass-retirement guard or a lost
+# state write: the next run cannot be trusted to reason about the fleet. "sync
+# failed" is the aborted-run line. Both are ERROR lines with a fixed message.
+resource "aws_cloudwatch_log_metric_filter" "run_degraded" {
+  count          = local.enable_alerts ? 1 : 0
+  name           = "${var.name}-run-degraded"
+  log_group_name = aws_cloudwatch_log_group.sync.name
+  pattern        = "{ ($.msg = \"run completed in a degraded state\") || ($.msg = \"sync failed\") }"
+
+  metric_transformation {
+    name          = "RunsDegraded"
+    namespace     = "IntuneCmdbSync"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "run_degraded" {
+  count             = local.enable_alerts ? 1 : 0
+  alarm_name        = "${var.name}-run-degraded"
+  alarm_description = <<-DESC
+    A run aborted, or finished degraded: the mass-retirement guard tripped or
+    the state file could not be written. Either leaves the next run unable to
+    reason about the fleet. The "degraded" list in run-report.json in the state
+    bucket names the condition.
+  DESC
+
+  namespace           = "IntuneCmdbSync"
+  metric_name         = "RunsDegraded"
+  statistic           = "Sum"
+  period              = 21600
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
 
   alarm_actions = [aws_sns_topic.alerts[0].arn]
 }

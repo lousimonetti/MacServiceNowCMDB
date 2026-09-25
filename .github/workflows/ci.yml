@@ -62,6 +62,13 @@ jobs:
       - name: Build runtime image
         run: docker build -t intune-cmdb-sync:ci .
 
+      - name: Build ECS image and check boto3 is present
+        # STATE_PATH=s3://... imports boto3 at startup; without the extra, an ECS
+        # task builds fine and then fails on its first run.
+        run: |
+          docker build --build-arg EXTRAS=aws -t intune-cmdb-sync:ecs-ci .
+          docker run --rm --entrypoint python intune-cmdb-sync:ecs-ci -c "import boto3"
+
       - name: Build Lambda image
         run: docker build -f deploy/aws/Dockerfile.lambda -t intune-cmdb-sync:lambda-ci .
 
@@ -95,9 +102,10 @@ jobs:
       - name: Validate Terraform
         working-directory: deploy/aws
         run: |
-          terraform fmt -check -diff
+          terraform fmt -recursive -check -diff
           terraform init -backend=false
           terraform validate
+          terraform test
 
       - name: Check shell scripts
         run: bash -n deploy/azure/deploy.sh
