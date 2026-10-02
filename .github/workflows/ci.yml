@@ -87,6 +87,47 @@ jobs:
             exit 1
           fi
 
+  azure-function-package:
+    # Builds the zip exactly as deploy/azure/deploy.sh does, then imports it on
+    # Linux with the runtime's Python. A package that deploys but cannot import
+    # registers no function, so nothing runs and nothing errors.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build the package
+        run: |
+          mkdir -p build/package
+          cp deploy/azure/functions/function_app.py deploy/azure/functions/host.json build/package/
+          python -m pip wheel --quiet --no-deps --wheel-dir build/wheel .
+          wheel=$(ls build/wheel/intune_cmdb_sync-*.whl)
+          python -m pip install --quiet \
+            --target build/package/.python_packages/lib/site-packages \
+            --platform manylinux_2_28_x86_64 --platform manylinux2014_x86_64 \
+            --implementation cp --python-version 3.12 --only-binary=:all: \
+            "${wheel}[azure]"
+
+      - name: Import it and check the timer binding
+        working-directory: build/package
+        run: |
+          python - <<'EOF'
+          import sys
+          sys.path.insert(0, ".python_packages/lib/site-packages")
+          import cryptography.hazmat.bindings._rust  # compiled; proves the platform is right
+          import function_app
+          functions = function_app.app.get_functions()
+          assert [f.get_function_name() for f in functions] == ["intune_cmdb_sync"], functions
+          binding = functions[0].get_bindings()[0].get_dict_repr()
+          assert binding["type"] == "timerTrigger", binding
+          assert binding["schedule"] == "%SYNC_SCHEDULE%", binding
+          assert binding["runOnStartup"] is False, binding
+          print("ok", binding)
+          EOF
+
   infra:
     runs-on: ubuntu-latest
     steps:

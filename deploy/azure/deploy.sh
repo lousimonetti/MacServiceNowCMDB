@@ -1,27 +1,34 @@
 #!/usr/bin/env bash
-# Deploy intune-cmdb-sync to Azure Container Apps Jobs.
+# Deploy intune-cmdb-sync to Azure Functions (Flex Consumption).
+#
+# There is no container image and no registry: this script builds a zip package
+# on this machine -- the connector, its Linux wheels, and the function entry
+# point -- and deploys it into a blob container in the stack's own storage
+# account. Re-running it redeploys both the infrastructure and the code from the
+# current checkout.
 #
 # Three topologies, selected by GRAPH_AUTH_MODE:
 #
 #   client_secret     (default) Intune lives in a different tenant from this
-#                     subscription. The job authenticates as an app registration
+#                     subscription. The app authenticates as an app registration
 #                     from the Intune tenant; its secret goes into Key Vault.
 #
-#   managed_identity  Intune and this subscription share a tenant. The job's
+#   managed_identity  Intune and this subscription share a tenant. The app's
 #                     managed identity is granted Graph application permissions
 #                     directly and no Graph credential exists. This script
 #                     performs that grant, which ARM cannot do because app-role
 #                     assignments live in Entra rather than in ARM.
 #
 #   federated_managed_identity
-#                     Cross-tenant AND secretless. The job's managed identity is
+#                     Cross-tenant AND secretless. The app's managed identity is
 #                     a federated credential on a multi-tenant app registration
 #                     that has been admin-consented into the Intune tenant. That
 #                     setup spans two tenants and cannot be automated from a
 #                     single login, so this script verifies rather than creates
 #                     it -- see docs/entra-setup.md for the four steps.
 #
-# Requires: az CLI, logged in to the SUBSCRIPTION's tenant. managed_identity mode
+# Requires: az CLI logged in to the SUBSCRIPTION's tenant, jq, zip, and a python3
+# with pip (any OS: the wheels are fetched for Linux explicitly). managed_identity mode
 # additionally needs Privileged Role Administrator, Cloud Application
 # Administrator, or Global Administrator in that same tenant.
 
@@ -33,20 +40,12 @@ LOCATION="${LOCATION:-eastus}"
 # with a distinct prefix (intunecmdb-dev, intunecmdb-prod) to get fully separate
 # stacks in one resource group -- see README.md, "Multiple ServiceNow environments".
 NAME_PREFIX="${NAME_PREFIX:-intunecmdb}"
-# The image lives in an existing Azure Container Registry, shared by every
-# environment:
-#   ACR_NAME           registry name (not the login server)
-#   IMAGE_TAG          tag pushed by `az acr build`; pin a version, not latest
-#   ACR_AUTH_MODE      who pulls it:
-#     service_principal  (default) an existing Entra service principal:
-#       ACR_CLIENT_ID      its client (app) ID, holding AcrPull
-#       ACR_CLIENT_SECRET  its client secret; goes into Key Vault
-#     managed_identity   this stack's managed identity; no secret. This script
-#                        grants it AcrPull after deployment, which needs rights
-#                        to create role assignments on the registry.
-IMAGE_REPOSITORY="intune-cmdb-sync"
-ACR_AUTH_MODE="${ACR_AUTH_MODE:-service_principal}"
-CRON="${CRON:-15 3 * * *}"
+# Six-field NCRONTAB (seconds first), UTC. Flex Consumption has no time zones.
+SCHEDULE="${SCHEDULE:-0 15 3 * * *}"
+# The Functions runtime version; the package's wheels are built for the same one.
+PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
+PYTHON="${PYTHON:-python3}"
+FUNCTION_NAME="intune_cmdb_sync"
 GRAPH_AUTH_MODE="${GRAPH_AUTH_MODE:-client_secret}"
 
 # Graph's own service principal. This app ID is the same in every tenant.
@@ -70,16 +69,23 @@ require() {
 require SNOW_INSTANCE
 require SNOW_CLIENT_ID
 require SNOW_CLIENT_SECRET
-require ACR_NAME
-require IMAGE_TAG
-case "$ACR_AUTH_MODE" in
-  service_principal)
-    require ACR_CLIENT_ID
-    require ACR_CLIENT_SECRET
-    ;;
-  managed_identity) ;;
-  *) die "ACR_AUTH_MODE must be 'service_principal' or 'managed_identity' (got '${ACR_AUTH_MODE}')" ;;
+
+# CRON was the Container Apps setting: five fields. NCRONTAB has six, and a
+# five-field value is rejected by the timer at startup, after deployment.
+[[ -z "${CRON:-}" ]] || die "CRON is no longer read. Set SCHEDULE to a six-field NCRONTAB
+       expression instead, seconds first: CRON='15 3 * * *' becomes SCHEDULE='0 15 3 * * *'"
+read -ra SCHEDULE_FIELDS <<< "$SCHEDULE"
+[[ ${#SCHEDULE_FIELDS[@]} -eq 6 ]] \
+  || die "SCHEDULE must have six fields, seconds first (got '${SCHEDULE}')"
+
+case "$PYTHON_VERSION" in
+  3.11|3.12) ;;
+  *) die "PYTHON_VERSION must be 3.11 or 3.12, the versions main.bicep offers (got '${PYTHON_VERSION}')" ;;
 esac
+
+for tool in jq zip "$PYTHON"; do
+  command -v "$tool" >/dev/null || die "$tool is required"
+done
 
 SNOW_WRITE_MODE="${SNOW_WRITE_MODE:-identify_reconcile}"
 case "$SNOW_WRITE_MODE" in
@@ -91,7 +97,7 @@ esac
 # DRY_RUN=true turn a dry-run stack live; defaulting to true would leave a
 # production stack silently committing nothing. Both values are also checked
 # exactly: az passes any bool parameter other than 'true' as false, so
-# DRY_RUN=yes would deploy a live job.
+# DRY_RUN=yes would deploy a live app.
 require_bool() {
   case "${!1:-}" in
     true|false) ;;
@@ -103,11 +109,11 @@ require_bool DRY_RUN " -- true for a first deploy; false commits to the CMDB"
 RETIRE_MISSING="${RETIRE_MISSING:-false}"
 require_bool RETIRE_MISSING ""
 
-# The job receives only what main.bicep sets, so local tuning has to be passed
+# The app receives only what main.bicep sets, so local tuning has to be passed
 # through explicitly or the Azure run differs from the one tested locally.
 #   SNOW_CLASS_MAP          passed as-is; replaces the built-in map
-#   MAPPING_OVERRIDES_FILE  a LOCAL path; its contents reach the job inline as
-#                           MAPPING_OVERRIDES_JSON, since the image holds no such file
+#   MAPPING_OVERRIDES_FILE  a LOCAL path; its contents reach the app inline as
+#                           MAPPING_OVERRIDES_JSON, since the package holds no such file
 MAPPING_OVERRIDES='{}'
 if [[ -n "${MAPPING_OVERRIDES_FILE:-}" ]]; then
   [[ -f "$MAPPING_OVERRIDES_FILE" ]] || die "MAPPING_OVERRIDES_FILE not found: ${MAPPING_OVERRIDES_FILE}"
@@ -118,34 +124,6 @@ if [[ -n "${MAPPING_OVERRIDES_FILE:-}" ]]; then
 fi
 
 SUBSCRIPTION_TENANT=$(az account show --query tenantId --output tsv)
-
-# Everything about the image is checkable now, and each check turns a pull
-# failure at the first scheduled run into an error at deploy time.
-echo "==> Container registry ${ACR_NAME}"
-ACR_ID=$(az acr show --name "$ACR_NAME" --query id --output tsv 2>/dev/null) \
-  || die "registry ${ACR_NAME} not found in this subscription"
-ACR_SERVER=$(az acr show --name "$ACR_NAME" --query loginServer --output tsv)
-az acr repository show --name "$ACR_NAME" --image "${IMAGE_REPOSITORY}:${IMAGE_TAG}" \
-    --output none 2>/dev/null \
-  || die "${ACR_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG} does not exist. Build it first:
-       az acr build --registry ${ACR_NAME} --image ${IMAGE_REPOSITORY}:${IMAGE_TAG} ."
-echo "    image ${ACR_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG}"
-
-if [[ "$ACR_AUTH_MODE" == "service_principal" ]]; then
-  # Warn rather than fail: the deploying user may not be allowed to read role
-  # assignments, and access can also come from a role this list does not name.
-  PULL_GRANTS=$(az role assignment list --assignee "$ACR_CLIENT_ID" --scope "$ACR_ID" \
-      --include-inherited \
-      --query "[?contains(['AcrPull','AcrPush','Contributor','Owner'], roleDefinitionName)] | length(@)" \
-      --output tsv 2>/dev/null || echo "unknown")
-  case "$PULL_GRANTS" in
-    unknown) echo "    WARNING: could not read role assignments; confirm ${ACR_CLIENT_ID} holds AcrPull" ;;
-    0)       echo "    WARNING: ${ACR_CLIENT_ID} holds no AcrPull (or broader) role on ${ACR_NAME};"
-             echo "             the job will fail to pull. Grant it with:"
-             echo "             az role assignment create --assignee ${ACR_CLIENT_ID} --role AcrPull --scope ${ACR_ID}" ;;
-    *)       echo "    service principal ${ACR_CLIENT_ID} can pull" ;;
-  esac
-fi
 
 GRAPH_TENANT_ID="${GRAPH_TENANT_ID:-$SUBSCRIPTION_TENANT}"
 
@@ -184,6 +162,33 @@ if [[ "$GRAPH_TENANT_ID" != "$SUBSCRIPTION_TENANT" ]]; then
   echo "      Subscription tenant ${SUBSCRIPTION_TENANT}"
 fi
 
+# Built before anything in Azure changes, so a package that cannot be built
+# fails the deploy with nothing half-done.
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+BUILD_DIR="$(mktemp -d)"
+trap 'rm -rf "$BUILD_DIR"' EXIT
+PACKAGE_DIR="${BUILD_DIR}/package"
+PACKAGE_ZIP="${BUILD_DIR}/app.zip"
+SOURCE_REVISION=$(git -C "$REPO_ROOT" describe --always --dirty 2>/dev/null || echo unknown)
+
+echo "==> Building function package (Python ${PYTHON_VERSION}, source ${SOURCE_REVISION})"
+mkdir -p "$PACKAGE_DIR"
+cp "$(dirname "$0")/functions/function_app.py" "$(dirname "$0")/functions/host.json" "$PACKAGE_DIR/"
+"$PYTHON" -m pip wheel --quiet --no-deps --wheel-dir "${BUILD_DIR}/wheel" "$REPO_ROOT" \
+  || die "could not build the connector wheel"
+WHEEL=$(ls "${BUILD_DIR}"/wheel/intune_cmdb_sync-*.whl)
+# Linux x86_64 wheels for the runtime's Python, whatever this machine is.
+# Without --platform, a Mac would package macOS builds of cryptography (pulled in
+# by azure-identity) and the function would fail to import at its first run.
+"$PYTHON" -m pip install --quiet \
+    --target "${PACKAGE_DIR}/.python_packages/lib/site-packages" \
+    --platform manylinux_2_28_x86_64 --platform manylinux2014_x86_64 \
+    --implementation cp --python-version "$PYTHON_VERSION" --only-binary=:all: \
+    "${WHEEL}[azure]" \
+  || die "could not install the connector's Linux dependencies"
+(cd "$PACKAGE_DIR" && zip --quiet --recurse-paths "$PACKAGE_ZIP" .)
+echo "    $(du -h "$PACKAGE_ZIP" | cut -f1) package"
+
 echo "==> Resource group ${RESOURCE_GROUP} (${LOCATION})"
 az group create --name "$RESOURCE_GROUP" --location "$LOCATION" --output none
 
@@ -193,12 +198,8 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
   --template-file "$(dirname "$0")/main.bicep" \
   --parameters \
       namePrefix="$NAME_PREFIX" \
-      registryServer="$ACR_SERVER" \
-      imageTag="$IMAGE_TAG" \
-      registryAuthMode="$ACR_AUTH_MODE" \
-      registryClientId="${ACR_CLIENT_ID:-}" \
-      registryClientSecret="${ACR_CLIENT_SECRET:-}" \
-      cronExpression="$CRON" \
+      schedule="$SCHEDULE" \
+      pythonVersion="$PYTHON_VERSION" \
       graphAuthMode="$GRAPH_AUTH_MODE" \
       graphTenantId="$GRAPH_TENANT_ID" \
       graphClientId="${GRAPH_CLIENT_ID:-}" \
@@ -218,28 +219,38 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
 
 PRINCIPAL_ID=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.managedIdentityPrincipalId.value')
 CLIENT_ID=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.managedIdentityClientId.value')
-JOB_NAME=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.jobName.value')
+APP_NAME=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.functionAppName.value')
 
-if [[ "$ACR_AUTH_MODE" == "managed_identity" ]]; then
-  # The registry is shared and outside this template, so the grant happens here
-  # rather than in Bicep. Deploying first is safe: a job pulls only when it runs.
-  echo "==> Granting AcrPull on ${ACR_NAME} to managed identity ${CLIENT_ID}"
-  EXISTING_PULL=$(az role assignment list --assignee "$PRINCIPAL_ID" --scope "$ACR_ID" \
-      --role AcrPull --query "length(@)" --output tsv 2>/dev/null || echo 0)
-  if [[ "$EXISTING_PULL" != "0" ]]; then
-    echo "    already granted"
-  else
-    # --assignee-object-id with a principal type skips the Entra lookup, which
-    # can fail for an identity created seconds ago.
-    az role assignment create --assignee-object-id "$PRINCIPAL_ID" \
-        --assignee-principal-type ServicePrincipal --role AcrPull --scope "$ACR_ID" \
-        --output none \
-      || die "could not grant AcrPull; the job cannot pull its image until someone with
-       rights to create role assignments on ${ACR_NAME} runs:
-         az role assignment create --assignee-object-id ${PRINCIPAL_ID} \\
-           --assignee-principal-type ServicePrincipal --role AcrPull --scope ${ACR_ID}"
+# The upload writes to the package container as the app's identity, whose role
+# assignments were created seconds ago and can take a minute or two to apply.
+echo "==> Deploying code to ${APP_NAME}"
+for attempt in 1 2 3 4 5; do
+  if az functionapp deployment source config-zip \
+      --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
+      --src "$PACKAGE_ZIP" --build-remote false --output none; then
+    break
   fi
-fi
+  [[ $attempt -lt 5 ]] || die "code deployment failed; the infrastructure is deployed, so re-running
+       this script is safe"
+  echo "    attempt ${attempt} failed; retrying in 30s (role assignments may still be propagating)"
+  sleep 30
+done
+
+# A package that deploys fine but fails to import (a missing or wrong-platform
+# wheel) registers no function at all, and then nothing ever runs and nothing
+# errors. Make that a deploy-time failure instead.
+echo "==> Checking the timer function is registered"
+REGISTERED=""
+for attempt in 1 2 3 4 5 6; do
+  REGISTERED=$(az functionapp function list --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
+      --query "[?ends_with(name, '/${FUNCTION_NAME}')] | length(@)" --output tsv 2>/dev/null || echo 0)
+  [[ "$REGISTERED" == "1" ]] && break
+  sleep 20
+done
+[[ "$REGISTERED" == "1" ]] || die "${FUNCTION_NAME} is not registered on ${APP_NAME}. The package
+       deployed but did not load; check the host's startup traces:
+         AppTraces | where AppRoleName == '${APP_NAME}' | where SeverityLevel >= 3"
+echo "    ${FUNCTION_NAME} registered"
 
 if [[ "$GRAPH_AUTH_MODE" == "managed_identity" ]]; then
   echo "==> Granting Graph permissions to managed identity ${CLIENT_ID}"
@@ -276,7 +287,7 @@ elif [[ "$GRAPH_AUTH_MODE" == "federated_managed_identity" ]]; then
   echo "        with audience api://AzureADTokenExchange"
   echo
   echo "    None of that is verifiable from this login, because it lives in the"
-  echo "    other tenant. Run the job once before trusting the schedule."
+  echo "    other tenant. Run the function once before trusting the schedule."
 else
   echo "==> Graph permissions are carried by app registration ${GRAPH_CLIENT_ID}"
   echo "    in tenant ${GRAPH_TENANT_ID}. Confirm it has admin consent for:"
@@ -284,34 +295,38 @@ else
   echo "    The managed identity ${CLIENT_ID} is used only to read Key Vault."
 fi
 
+APP_HOST=$(az functionapp show --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
+    --query defaultHostName --output tsv)
+
 cat <<SUMMARY
 
 Deployed.
 
-  Job              ${JOB_NAME}
+  Function app     ${APP_NAME} (${FUNCTION_NAME})
+  Source           ${SOURCE_REVISION}
   ServiceNow       ${SNOW_INSTANCE} (${SNOW_WRITE_MODE})
   Dry run          ${DRY_RUN}$([[ "$DRY_RUN" == false ]] && echo "  -- LIVE: the next run commits to the CMDB")
   Retire missing   ${RETIRE_MISSING}
   Class map        ${SNOW_CLASS_MAP:-built-in (windows, macos)}
   Mapping override ${MAPPING_OVERRIDES_FILE:-none}
-  Image            ${ACR_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG} (pulled via ${ACR_AUTH_MODE})
   Resource group   ${RESOURCE_GROUP}
-  Schedule         ${CRON} (UTC)
+  Schedule         ${SCHEDULE} (NCRONTAB, UTC)
   Graph auth       ${GRAPH_AUTH_MODE}
   Intune tenant    ${GRAPH_TENANT_ID}
   Alerts           ${ALERT_EMAIL:-NONE - set ALERT_EMAIL to be told when runs stop}
 
-Verify the whole path end to end before trusting the schedule:
+Verify the whole path end to end before trusting the schedule. A timer function
+is started by hand through the host's admin endpoint (returns 202 at once):
 
-  az containerapp job start --name ${JOB_NAME} --resource-group ${RESOURCE_GROUP}
-  az containerapp job execution list --name ${JOB_NAME} \\
-      --resource-group ${RESOURCE_GROUP} --output table
+  curl -sS -X POST "https://${APP_HOST}/admin/functions/${FUNCTION_NAME}" \\
+    -H "x-functions-key: \$(az functionapp keys list -g ${RESOURCE_GROUP} -n ${APP_NAME} --query masterKey -o tsv)" \\
+    -H "Content-Type: application/json" -d '{}'
 
-Logs:
+Logs (allow a few minutes for ingestion):
 
   az monitor log-analytics query \\
     --workspace "\$(az monitor log-analytics workspace show \\
         -g ${RESOURCE_GROUP} -n ${NAME_PREFIX}-logs --query customerId -o tsv)" \\
-    --analytics-query "ContainerAppConsoleLogs_CL | where ContainerJobName_s == '${JOB_NAME}' | order by TimeGenerated desc | take 100"
+    --analytics-query "AppTraces | where AppRoleName == '${APP_NAME}' | order by TimeGenerated desc | take 100 | project TimeGenerated, Message"
 
 SUMMARY

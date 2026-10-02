@@ -219,30 +219,33 @@ the per-device `sys_id`s before dropping the limit.
 
 ## Deploying
 
-### Azure Container Apps Jobs — recommended
+### Azure Functions (Flex Consumption) — recommended
 
 ```bash
 export SNOW_INSTANCE=acme SNOW_CLIENT_ID=... SNOW_CLIENT_SECRET=...
-./deploy/azure/deploy.sh
+DRY_RUN=true ./deploy/azure/deploy.sh
 ```
 
-Provisions a scheduled Container Apps Job, a user-assigned managed identity, Key
-Vault for the ServiceNow secret, an Azure Files share for state, and Log
-Analytics — then grants the identity its Graph permissions.
+Provisions a timer-triggered function app on the Flex Consumption plan, a
+user-assigned managed identity, Key Vault for the ServiceNow secret, an Azure
+Files share mounted for state, and Application Insights over Log Analytics —
+then grants the identity its Graph permissions.
 
-A job that only runs for a few minutes a day lands inside the Container Apps
-free grant, so the compute is genuinely free rather than merely cheap.
+There is no container image and no registry. `deploy.sh` builds a zip package
+locally (the connector plus its Linux wheels) and deploys it into a blob
+container in the stack's own storage account. A run of a few minutes a day sits
+inside the Flex Consumption free grant.
 
 **Check which tenant topology you have first**, because it decides the
 credential model:
 
 - **Intune and the Azure subscription share a tenant** — set
-  `GRAPH_AUTH_MODE=managed_identity`. The job's managed identity is granted the
+  `GRAPH_AUTH_MODE=managed_identity`. The app's managed identity is granted the
   Graph permissions directly and **no Graph credential exists anywhere**.
   Nothing to rotate, nothing to leak. Prefer this whenever you can.
 - **They are in different tenants** — the default. A managed identity is
   single-tenant and *cannot* be granted app roles in another directory, so the
-  job authenticates as an app registration from the Intune tenant with its
+  app authenticates as an app registration from the Intune tenant with its
   secret in Key Vault. The managed identity is still used, to read Key Vault
   rather than to reach Graph.
 
@@ -268,8 +271,8 @@ Details: [deploy/aws/README.md](deploy/aws/README.md).
 
 ### Anywhere else
 
-The image is a plain container that runs to completion — Kubernetes `CronJob`,
-ECS scheduled task, or cron on a VM all work:
+The root `Dockerfile` image is a plain container that runs to completion —
+Kubernetes `CronJob`, ECS scheduled task, or cron on a VM all work:
 
 ```bash
 docker build -t intune-cmdb-sync .
@@ -280,17 +283,16 @@ docker run --rm --env-file .env intune-cmdb-sync
 
 | | Azure | AWS |
 | --- | --- | --- |
-| Compute | $0.00 — inside the Container Apps free grant | ~$0.15 |
-| Registry | ~$5.00 — Azure Container Registry Basic, shared by all environments | ~$0.04 (ECR) |
+| Compute | $0.00 — inside the Flex Consumption free grant | ~$0.15 |
+| Registry | none — zip deploy | ~$0.04 (ECR) |
 | Scheduler | included | $0.00 — free tier |
 | Secrets | ~$0.00 — Key Vault standard | $0.00 — SSM Standard |
-| State | ~$0.06 — Azure Files | ~$0.00 — S3 |
+| State and package | ~$0.10 — Azure Files and Blob | ~$0.00 — S3 |
 | Logs | $0.00 — under the 5 GB free tier | $0.00 — under the 5 GB free tier |
-| **Total** | **~$5/month** | **~$0.20/month** |
+| **Total** | **~$0.10/month** | **~$0.20/month** |
 
-List prices, single daily run, ~5 minutes. The Azure figure is almost entirely
-the container registry, which the Azure deployment uses so that production
-touches only Azure resources. Full workings are in the deployment READMEs.
+List prices, single daily run, ~5 minutes. Full workings are in the deployment
+READMEs.
 
 ---
 

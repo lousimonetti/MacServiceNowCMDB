@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from .__main__ import EXIT_OK, main
+from .logging_setup import reset_run_id
 
 
 def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[str, Any]:
@@ -31,6 +32,8 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
         if event.get("check"):
             argv.append("--check")
 
+    # A warm container runs several invocations in one process; each is its own run.
+    reset_run_id()
     exit_code = main(argv)
     return {
         "exit_code": exit_code,

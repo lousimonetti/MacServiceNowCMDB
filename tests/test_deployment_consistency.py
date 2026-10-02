@@ -1,7 +1,7 @@
 """Guards against drift between the places that define Graph auth modes.
 
 Three files independently decide which modes exist: `config.py` validates them,
-`main.bicep` offers a subset for Azure Container Apps, and `deploy.sh` gates on
+`main.bicep` offers a subset for Azure Functions, and `deploy.sh` gates on
 that same subset. Nothing makes them agree automatically, and the failure when
 they disagree is a deployment that validates fine and then cannot authenticate
 at runtime.
@@ -9,6 +9,7 @@ at runtime.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -20,12 +21,12 @@ DEPLOY_SH = REPO / "deploy" / "azure" / "deploy.sh"
 
 # Modes that are real but deliberately absent from the Azure deployment:
 #   workload_identity  needs a projected federated token file, which AKS and
-#                      GitHub Actions provide and Container Apps does not.
+#                      GitHub Actions provide and Azure Functions does not.
 #   default            DefaultAzureCredential, a local-development convenience.
 #   access_token       a hand-pasted, non-refreshable token. Deploying this on a
 #                      schedule would produce a job that works until the token
 #                      expires and then fails silently every night.
-NOT_DEPLOYABLE_ON_CONTAINER_APPS = {"workload_identity", "default", "access_token"}
+NOT_DEPLOYABLE_ON_AZURE = {"workload_identity", "default", "access_token"}
 
 
 def _bicep_allowed_modes() -> set[str]:
@@ -39,7 +40,7 @@ def _bicep_allowed_values(param: str) -> set[str]:
     text = BICEP.read_text()
     at = text.find(f"param {param} ")
     assert at != -1, f"main.bicep no longer declares {param}"
-    return set(re.findall(r"'([a-z_]+)'", text[text.rfind("@allowed([", 0, at):at]))
+    return set(re.findall(r"'([a-z0-9_.]+)'", text[text.rfind("@allowed([", 0, at):at]))
 
 
 def _deploy_sh_modes() -> set[str]:
@@ -71,10 +72,10 @@ def test_every_deployable_mode_is_reachable_from_azure():
     there. This is the check that would have caught `workload_identity` being
     added to the template because it looked like the cross-tenant answer."""
     offered = _bicep_allowed_modes()
-    impossible = offered & NOT_DEPLOYABLE_ON_CONTAINER_APPS
+    impossible = offered & NOT_DEPLOYABLE_ON_AZURE
     assert not impossible, (
         f"main.bicep offers {sorted(impossible)}, which cannot authenticate on "
-        "Container Apps. For secretless cross-tenant use federated_managed_identity."
+        "Azure Functions. For secretless cross-tenant use federated_managed_identity."
     )
 
 
@@ -203,18 +204,8 @@ def test_bicep_write_modes_are_ones_the_connector_accepts():
     allowed = text[text.rfind("@allowed([", 0, param):param]
     offered = set(re.findall(r"'([a-z_]+)'", allowed))
     assert offered == set(VALID_WRITE_MODES)
-    assert "{ name: 'SNOW_WRITE_MODE', value: writeMode }" in text
+    assert "SNOW_WRITE_MODE: writeMode" in text
     assert "writeMode" in _deploy_sh_bicep_parameters()
-
-
-def test_state_mount_is_owned_by_the_image_run_user():
-    """SMB ownership is fixed at mount time. If the mount's uid drifts from the
-    Dockerfile's run user, state.json becomes unwritable and every run ends
-    degraded."""
-    dockerfile = (REPO / "Dockerfile").read_text()
-    uid = re.search(r"useradd[^\n]*--uid (\d+)", dockerfile)
-    assert uid, "could not find the run user's uid in the Dockerfile"
-    assert f"mountOptions: 'uid={uid.group(1)}," in BICEP.read_text()
 
 
 def test_azure_error_alert_also_fires_on_degraded_runs():
@@ -227,102 +218,6 @@ def test_azure_error_alert_also_fires_on_degraded_runs():
     assert "degraded > 0" in rule
 
 
-def _job_registries_block() -> str:
-    text = BICEP.read_text()
-    start = text.index("registries: registryNeedsSecret")
-    return text[start:text.index("secrets: concat(", start)]
-
-
-def _registry_branches() -> tuple[str, str]:
-    """The (service_principal, managed_identity) arms of the registries ternary."""
-    block = _job_registries_block()
-    sp, mi = block.split("\n        : [", 1)
-    return sp, mi
-
-
-def test_image_comes_from_azure_container_registry_only():
-    """Production may use only Azure resources: no public-registry default may
-    creep back in, and the image reference is built from the ACR login server."""
-    text = BICEP.read_text()
-    assert "ghcr.io" not in text and "docker.io" not in text
-    assert "param containerImage" not in text, "the image must derive from registryServer"
-    assert "var containerImage = '${registryServer}/intune-cmdb-sync:${imageTag}'" in text
-
-
-def _bicep_registry_modes() -> set[str]:
-    return _bicep_allowed_values("registryAuthMode")
-
-
-def test_service_principal_is_the_default_registry_puller():
-    """By requirement. Changing the default would silently move every existing
-    deployment onto a managed identity that holds no AcrPull."""
-    text = BICEP.read_text()
-    assert "param registryAuthMode string = 'service_principal'" in text
-    assert 'ACR_AUTH_MODE="${ACR_AUTH_MODE:-service_principal}"' in DEPLOY_SH.read_text()
-
-
-def test_service_principal_mode_pulls_with_the_secret_not_the_identity():
-    """A registries entry carrying `identity` silently switches the pull to the
-    managed identity, whatever the mode says."""
-    sp, _ = _registry_branches()
-    assert "username: registryClientId" in sp
-    assert "passwordSecretRef: 'registry-client-secret'" in sp
-    assert "identity" not in sp
-
-
-def test_managed_identity_mode_pulls_with_the_identity_and_no_secret():
-    _, mi = _registry_branches()
-    assert "identity: identity.id" in mi
-    assert "passwordSecretRef" not in mi and "username" not in mi
-
-
-def test_registry_auth_modes_agree_between_template_and_script():
-    assert _bicep_registry_modes() == {"service_principal", "managed_identity"}
-    case = re.search(r'case "\$ACR_AUTH_MODE" in(.*?)\nesac', DEPLOY_SH.read_text(), re.DOTALL)
-    assert case, "could not find the ACR_AUTH_MODE case statement in deploy.sh"
-    assert set(re.findall(r"^  ([a-z_]+)\)", case.group(1), re.MULTILINE)) == (
-        _bicep_registry_modes()
-    )
-
-
-def test_managed_identity_mode_grants_acr_pull_after_deploy():
-    """The registry is outside the template, so the grant can only happen in the
-    script. Without it the job deploys cleanly and fails every pull."""
-    text = DEPLOY_SH.read_text()
-    grant = text[text.index('if [[ "$ACR_AUTH_MODE" == "managed_identity" ]]; then'):]
-    assert "--assignee-object-id" in grant and "--role AcrPull" in grant
-    assert text.index("DEPLOYMENT_OUTPUT=$(az deployment group create") < text.index(
-        'if [[ "$ACR_AUTH_MODE" == "managed_identity" ]]; then'
-    ), "the grant needs the identity the deployment creates"
-
-
-def test_registry_secret_is_held_in_key_vault_only_when_needed():
-    text = BICEP.read_text()
-    assert "@secure()\nparam registryClientSecret string" in text
-    assert (
-        "resource registrySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' =\n"
-        "  if (registryNeedsSecret)"
-    ) in text
-    assert "keyVaultUrl: registrySecret!.properties.secretUri" in text
-
-
-def test_deploy_script_supplies_the_registry_and_checks_the_tag():
-    text = DEPLOY_SH.read_text()
-    for var in ("ACR_NAME", "IMAGE_TAG", "ACR_CLIENT_ID", "ACR_CLIENT_SECRET"):
-        assert f"require {var}" in text
-    assert {
-        "registryServer", "imageTag", "registryAuthMode", "registryClientId",
-        "registryClientSecret",
-    } <= _deploy_sh_bicep_parameters()
-    assert "az acr repository show" in text, "deploy.sh must fail on a tag that does not exist"
-
-
-def test_script_and_template_agree_on_the_image_repository():
-    repo = re.search(r'IMAGE_REPOSITORY="([^"]+)"', DEPLOY_SH.read_text())
-    assert repo, "IMAGE_REPOSITORY is gone from deploy.sh"
-    assert f"/{repo.group(1)}:${{imageTag}}'" in BICEP.read_text()
-
-
 def test_no_interpolation_inside_bicep_multiline_strings():
     """Bicep does not interpolate inside ''' strings: `${jobName}` there reaches
     Azure as literal text. Both alert queries shipped that way, so the absence
@@ -331,12 +226,6 @@ def test_no_interpolation_inside_bicep_multiline_strings():
     blocks = re.findall(r"'''(.*?)'''", BICEP.read_text(), re.DOTALL)
     offenders = [b.strip().splitlines()[0] for b in blocks if "${" in b]
     assert not offenders, f"interpolation inside ''' strings is sent literally: {offenders}"
-
-
-def test_alert_queries_are_scoped_to_this_job():
-    text = BICEP.read_text()
-    assert text.count("ContainerJobName_s == '{0}'") == 2
-    assert text.count("''', jobName)") == 2
 
 
 # ---------------------------------------------------------------------------
@@ -365,19 +254,140 @@ def test_deploy_script_accepts_only_literal_booleans():
 
 
 def test_class_map_and_mapping_overrides_reach_the_job():
-    """The job gets only what main.bicep sets. Without these, the class map and
+    """The app gets only what main.bicep sets. Without these, the class map and
     the last_discovered drop tested locally silently do not apply in Azure."""
     text = BICEP.read_text()
     assert "param classMap string = ''" in text
     assert "param mappingOverrides object = {}" in text
-    assert "{ name: 'SNOW_CLASS_MAP', value: classMap }" in text
-    assert "{ name: 'MAPPING_OVERRIDES_JSON', value: string(mappingOverrides) }" in text
-    assert "mappingEnv" in text[text.index("env: concat("):]
+    assert "{ SNOW_CLASS_MAP: classMap }" in text
+    assert "{ MAPPING_OVERRIDES_JSON: string(mappingOverrides) }" in text
+    assert "mappingEnv" in text[text.index("properties: union("):]
     assert {"classMap", "mappingOverrides"} <= _deploy_sh_bicep_parameters()
     assert 'classMap="${SNOW_CLASS_MAP:-}"' in DEPLOY_SH.read_text()
 
 
 def test_empty_class_map_is_omitted_not_blanked():
-    """SNOW_CLASS_MAP replaces the built-in map. Setting it to '' on the job
+    """SNOW_CLASS_MAP replaces the built-in map. Setting it to '' on the app
     would be at best a no-op; omitting it keeps the default unambiguous."""
-    assert "empty(classMap) ? [] :" in BICEP.read_text()
+    assert "empty(classMap) ? {} :" in BICEP.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Azure Functions host
+#
+# Each of these is a property whose failure is silent: the deploy succeeds and
+# then nothing runs, the alerts go blind, or two runs race on state.json.
+# ---------------------------------------------------------------------------
+
+FUNCTIONS = REPO / "deploy" / "azure" / "functions"
+FUNCTION_APP = FUNCTIONS / "function_app.py"
+HOST_JSON = FUNCTIONS / "host.json"
+
+
+def test_no_container_registry_or_container_apps_anywhere_in_the_azure_stack():
+    """The landing-zone policy denies both. The stack deploys code as a zip
+    package into its own storage account; nothing may reintroduce an image."""
+    for path in (BICEP, DEPLOY_SH):
+        text = path.read_text()
+        for denied in ("Microsoft.ContainerRegistry", "Microsoft.App/", "az acr", "containerapp"):
+            assert denied not in text, f"{path.name} references {denied}"
+    assert "'FlexConsumption'" in BICEP.read_text()
+    assert "Microsoft.Web/sites@" in BICEP.read_text()
+
+
+def test_timer_schedule_comes_from_the_app_setting_bicep_sets():
+    """function_app.py reads %SYNC_SCHEDULE%. If the setting is missing or
+    renamed, the host fails to index the function and nothing ever runs."""
+    assert 'schedule="%SYNC_SCHEDULE%"' in FUNCTION_APP.read_text()
+    assert "SYNC_SCHEDULE: schedule" in BICEP.read_text()
+    assert 'schedule="$SCHEDULE"' in DEPLOY_SH.read_text()
+
+
+def test_default_schedules_agree_and_have_six_fields():
+    """NCRONTAB has a seconds field; a five-field cron is rejected by the
+    timer at startup, after the deploy has reported success."""
+    bicep = re.search(r"param schedule string = '([^']+)'", BICEP.read_text())
+    script = re.search(r'SCHEDULE="\$\{SCHEDULE:-([^}]+)\}"', DEPLOY_SH.read_text())
+    assert bicep and script
+    assert bicep.group(1) == script.group(1)
+    assert len(bicep.group(1).split()) == 6
+
+
+def test_timer_does_not_run_on_startup():
+    """run_on_startup=True fires on every cold start and every deploy: an
+    unscheduled live sync each time the platform moves the app."""
+    text = FUNCTION_APP.read_text()
+    assert "run_on_startup=False" in text
+    assert "run_on_startup=True" not in text
+
+
+def test_deploy_script_checks_the_function_it_actually_deploys():
+    """deploy.sh fails the deploy if the function did not register; the name it
+    looks for must be the one function_app.py defines."""
+    name = re.search(r'FUNCTION_NAME="([^"]+)"', DEPLOY_SH.read_text())
+    assert name, "FUNCTION_NAME is gone from deploy.sh"
+    assert f"def {name.group(1)}(" in FUNCTION_APP.read_text()
+    assert "az functionapp function list" in DEPLOY_SH.read_text()
+
+
+def test_at_most_one_instance_runs():
+    """Two concurrent runs would race on state.json, the Functions twin of the
+    Lambda's reserved concurrency of 1."""
+    assert "maximumInstanceCount: 1" in BICEP.read_text()
+
+
+def test_trace_sampling_is_off():
+    """Application Insights sampling can drop the one `run complete` trace a
+    day, and the absence alert then reports a run that happened as missing."""
+    host = json.loads(HOST_JSON.read_text())
+    assert host["logging"]["applicationInsights"]["samplingSettings"]["isEnabled"] is False
+
+
+def test_function_timeout_covers_a_large_tenant():
+    """Same 30-minute ceiling the Container Apps job had. Flex Consumption's
+    default is also 30, but an explicit value survives a platform change."""
+    host = json.loads(HOST_JSON.read_text())
+    assert host["functionTimeout"] == "00:30:00"
+
+
+def test_python_versions_agree_between_template_and_package_build():
+    """deploy.sh builds wheels for one Python ABI; the runtime must be the same
+    one, or compiled dependencies (cryptography) fail to import."""
+    offered = _bicep_allowed_values("pythonVersion")
+    case = re.search(r'case "\$PYTHON_VERSION" in\n\s+([0-9.|]+)\)', DEPLOY_SH.read_text())
+    assert case, "deploy.sh no longer validates PYTHON_VERSION"
+    assert set(case.group(1).split("|")) == offered
+    assert 'pythonVersion="$PYTHON_VERSION"' in DEPLOY_SH.read_text()
+    assert '--python-version "$PYTHON_VERSION"' in DEPLOY_SH.read_text()
+
+
+def test_package_is_built_for_linux_whatever_the_build_machine():
+    """Without --platform, a Mac packages macOS wheels and the function fails
+    to import on its first run."""
+    text = DEPLOY_SH.read_text()
+    assert "--platform manylinux" in text
+    assert "--only-binary=:all:" in text
+    assert '"${WHEEL}[azure]"' in text, "the azure extra carries azure-functions"
+    assert "--build-remote false" in text
+
+
+def test_secrets_reach_the_app_as_key_vault_references_only():
+    """A secret parameter written into app settings as a literal is readable by
+    anyone with read access to the app's configuration."""
+    text = BICEP.read_text()
+    settings = text[text.index("var graphEnvCommon"):text.index("resource appSettings")]
+    assert "serviceNowClientSecret" not in settings
+    assert "graphClientSecret" not in settings
+    assert "SNOW_CLIENT_SECRET: snowSecretRef" in settings
+    assert "@Microsoft.KeyVault(SecretUri=${serviceNowSecret.properties.secretUri})" in text
+    assert "keyVaultReferenceIdentity: identity.id" in text
+
+
+def test_state_lives_on_the_mounted_share():
+    """state.json must outlive the instance, or retirement silently stops."""
+    text = BICEP.read_text()
+    mount = re.search(r"var stateMountPath = '([^']+)'", text)
+    assert mount
+    assert "STATE_PATH: '${stateMountPath}/state.json'" in text
+    assert "mountPath: stateMountPath" in text
+    assert "type: 'AzureFiles'" in text

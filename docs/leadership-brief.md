@@ -69,12 +69,11 @@ fleet:
 
 | | Azure | AWS |
 |---|---|---|
-| **Total** | **approximately $5 / month** | **approximately $0.20 / month** |
+| **Total** | **approximately $0.10 / month** | **approximately $0.20 / month** |
 
 These are list prices for a single daily run of roughly five minutes. The Azure
-figure is almost all a private container registry, which keeps the production
-path entirely inside Azure; it is shared, so DEV and PROD together cost the
-same. Both are rounding errors on any IT budget; the platform choice should be
+deployment runs as an Azure Function deployed from a zip package, so it needs no
+container registry. Both are rounding errors on any IT budget; the platform choice should be
 made on credential and security model, not cost.
 
 The meaningful cost is not infrastructure. It is the engineering ownership

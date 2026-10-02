@@ -55,35 +55,49 @@ behaviour change, particularly anything altering what gets written to a CI.
 - **Multiple ServiceNow environments = one Azure stack per `NAME_PREFIX`.**
   DEV and PROD run from one resource group by running `deploy.sh` once per
   instance with a distinct prefix. Every resource name derives from the prefix,
-  so each environment gets its own Key Vault, identity, job and storage account.
+  so each environment gets its own Key Vault, identity, function app and storage
+  account.
   The separate storage account is load-bearing: `state.json` holds
   instance-specific `sys_id`s, and a shared one would drive PROD retirement from
   DEV IDs. Do not consolidate stacks onto shared storage. `storageName` strips
   hyphens because storage account names allow none. See `deploy/azure/README.md`.
 
-- **Production may use only Azure resources.** So the image comes from an
-  existing Azure Container Registry (built with `az acr build`), never a public
-  registry such as ghcr.io, even though that would be free. By requirement the
-  default puller is an existing Entra **service principal** holding AcrPull,
-  its secret in each stack's Key Vault. `ACR_AUTH_MODE=managed_identity` is the
-  opt-in alternative for later: the stack's own identity pulls, and `deploy.sh`
-  grants it AcrPull after deploying (the registry is outside the template).
-  Keep the service principal the default. `deploy.sh` checks the tag exists
-  before deploying. **The target subscription's policy refuses both the
-  registry and Container Apps** (see Constraints), so this whole model is
-  currently undeployable there.
+- **Azure runs on Functions (Flex Consumption), zip-deployed, no image.**
+  The landing-zone policy denies Azure Container Registry and Container Apps,
+  and approved `Microsoft.Web` on 2026-10-02, so `deploy/azure/` is a
+  timer-triggered function app. `deploy.sh` builds the zip locally (the wheel,
+  plus Linux x86_64 wheels fetched with `pip --platform`) and deploys it with
+  `config-zip --build-remote false` into a blob container in the stack's own
+  storage account. Do not reintroduce a registry or a remote build. The timer
+  reads `%SYNC_SCHEDULE%` (six-field NCRONTAB, UTC; Flex has no time zones);
+  `maximumInstanceCount: 1` keeps two runs off `state.json`. State stays on an
+  Azure Files mount (`/mounts/state`), which on Functions authenticates only by
+  account key, so the storage account keeps shared-key access on. `deploy.sh`
+  fails if the function did not register after the zip deploy, since a package
+  that cannot import otherwise never runs and never errors. The root
+  `Dockerfile` now serves only AWS ECS and generic container hosts.
+- **On Functions, the worker's root log handler is the only route to
+  Application Insights.** `configure_logging` normally replaces root handlers
+  with a stdout one; `azure_function.run()` calls `adopt_host_handlers()` first
+  so the worker's handler is kept and given the JSON formatter. The worker sends
+  `handler.format(record)` as the trace `Message`, which is what the alert
+  queries `parse_json`. `host.json` turns sampling off, or a sampled-out
+  `run complete` line fires the absence alert. `run()` raises on a non-zero exit
+  (timer triggers have no retry here, so this cannot rerun a sync) and resets
+  `run_id` per invocation, as `aws_lambda.handler` now also does.
 
 - **`deploy.sh` has no `DRY_RUN` default and accepts only `true` / `false`.**
   A default of `false` turned any redeploy that forgot `DRY_RUN=true` live.
   `az` also sends any bool parameter other than the literal string `true` as
   `false`, so `DRY_RUN=yes` deployed a live job. `RETIRE_MISSING` gets the same
   strict check. Do not reintroduce a default.
-- **The job gets only the settings `main.bicep` sets.** A local `.env` does not
-  carry over. `SNOW_CLASS_MAP` passes through as-is. `MAPPING_OVERRIDES_FILE`
-  is read **locally** by `deploy.sh`, which strips `_comment` and ships the
-  contents as `MAPPING_OVERRIDES_JSON`, because the image contains no such
+- **The app gets only the settings `main.bicep` sets.** A local `.env` does not
+  carry over; the `appsettings` resource replaces the whole list each deploy.
+  `SNOW_CLASS_MAP` passes through as-is. `MAPPING_OVERRIDES_FILE` is read
+  **locally** by `deploy.sh`, which strips `_comment` and ships the
+  contents as `MAPPING_OVERRIDES_JSON`, because the package contains no such
   file. `config.py` accepts either variable but refuses both at once. Any
-  future host (Functions, a VM) needs the same pass-through, or the
+  future host (a VM, App Service) needs the same pass-through, or the
   `last_discovered` churn comes back. The AWS stack has it: `deploy/aws` takes
   `mapping_overrides_file` / `class_map` and a required `dry_run` for both of
   its hosts (`host = "lambda" | "ecs"`), checked offline by `terraform test`
@@ -97,8 +111,8 @@ behaviour change, particularly anything altering what gets written to a CI.
   parameters older versions created without deleting them.
 - **A degraded run needs its own alarm.** It still logs `run complete` and can
   have zero errors, so neither the absence alarm nor the error alarm sees it.
-  Azure's alert matches `degraded > 0`; AWS matches the `run completed in a
-  degraded state` / `sync failed` messages. Any new host needs the same.
+  Azure's alert (on `AppTraces`) matches `degraded > 0`; AWS matches the
+  `run completed in a degraded state` / `sync failed` messages. Any new host needs the same.
 - **Lambda: no async retries, one run at a time.** A timeout counts as a
   failure, so Lambda's default two async retries would run a 15-minute sync
   three times. Reserved concurrency 1 stops overlapping runs racing on
@@ -109,28 +123,23 @@ behaviour change, particularly anything altering what gets written to a CI.
 
 ## Constraints
 
-- **The target subscription's policy allows only listed resource types, and
-  none of them host code except VMs.** The first deploy (2026-09-23,
-  `az acr create` into resource group `azc-obm-development`) was denied with
-  `RequestDisallowedByPolicy` by `vpcx-lzn-cmmn-allowed-services`. That policy
-  sits in the "VPCx Landing Zone Common Baseline" set, assigned at the
-  `Production` management group, with effect Deny.
+- **The target subscription's policy allows only listed resource types.**
+  The first deploy (2026-09-23, `az acr create` into resource group
+  `azc-obm-development`) was denied with `RequestDisallowedByPolicy` by
+  `vpcx-lzn-cmmn-allowed-services`, in the "VPCx Landing Zone Common Baseline"
+  set, assigned at the `Production` management group, effect Deny.
   - **Allowed:** Key Vault, storage accounts and file shares, Log Analytics
     workspaces, user-assigned identities, `insights` action groups and
-    scheduled query rules, and `Compute/virtualMachines` plus extensions.
-  - **Denied:** `ContainerRegistry/registries`, `App/managedEnvironments`,
-    `App/jobs`, all of `Microsoft.Web` (Functions, App Service, Logic Apps
-    Standard), `Microsoft.Logic`, and `Microsoft.Automation`.
-  - **Also denied, and it matters for the VM route:**
-    `Insights/dataCollectionRules`, which the Azure Monitor Agent needs to ship
-    logs, and `Network/natGateways`, which a VM would need for outbound access
-    to Graph and ServiceNow.
-  - **Every route needs the platform team.** Functions or Container Apps need
-    an exemption. A VM needs a network placement, firewall egress, and
-    probably the data collection rule type.
-  - **Functions is the preferred ask.** Its exemption is only
-    `Microsoft.Web/sites` + `Microsoft.Web/serverfarms`, and a zip deploy
-    removes the registry entirely.
+    scheduled query rules, `Compute/virtualMachines`, and since 2026-10-02
+    **Azure Functions and App Service** (`Microsoft.Web`).
+  - **Still denied:** `ContainerRegistry/registries`, `App/managedEnvironments`,
+    `App/jobs`, `Microsoft.Logic`, `Microsoft.Automation`,
+    `Insights/dataCollectionRules`, `Network/natGateways`.
+  - **Unconfirmed and load-bearing: `Microsoft.Insights/components`**
+    (Application Insights). It was not on the recorded allowlist, and without it
+    the function's logs reach nothing and both alerts are blind. ARM preflight
+    rejects a denied type before creating anything, so the first deploy is the
+    test. If refused, request it; do not drop telemetry to get a deploy through.
 
 - **`SNOW_CLASS_MAP` replaces the built-in default, it does not extend it.**
   `_env_kv_map` returns the parsed value or the default, never a merge, so a map
@@ -181,7 +190,7 @@ behaviour change, particularly anything altering what gets written to a CI.
   `GRAPH_ASSERTION_IDENTITY_CLIENT_ID` is the *identity*. Do not conflate them —
   the resulting AADSTS error names neither.
 - **`workload_identity` is not that mode.** It needs a projected federated token
-  file, which AKS and GitHub Actions provide and Container Apps does not, which
+  file, which AKS and GitHub Actions provide and Azure Functions does not, which
   is why `main.bicep` deliberately does not offer it.
 - **The federated credential can only be created after the first deploy.**
   `main.bicep` creates the user-assigned managed identity at deploy time, so
@@ -256,22 +265,16 @@ Green tests are weaker evidence here than they look.
 
 ## Next steps
 
-0. **Next session: plan an Azure Functions host.** The Container Apps stack in
-   `deploy/azure/` cannot deploy under the landing zone policy (see
-   Constraints). Planned direction:
-   - A timer-triggered Python function wrapping `main()`, shaped like
-     `aws_lambda.handler`.
-   - The Flex Consumption plan, because Consumption's 10-minute limit is tight.
-   - A zip deploy, so there is no registry.
-   - Keep the parts the policy allows: the managed identity, Key Vault, state
-     on storage, Log Analytics, and the alerts. The alert queries currently
-     read `ContainerAppConsoleLogs_CL` and will need a Functions log source.
-   - Keep the `DRY_RUN` and settings pass-through safety properties from
-     `deploy.sh`.
-
-   It still needs a policy exemption for `Microsoft.Web/sites` and
-   `Microsoft.Web/serverfarms`. Get that request moving in parallel. A VM is
-   the fallback if it is refused.
+0. **First Azure Functions deploy (written 2026-10-02, never deployed).** The
+   stack in `deploy/azure/` replaced Container Apps the day `Microsoft.Web` was
+   approved. Nothing about it has run in Azure yet; green tests and a clean
+   `az bicep build` are all that back it. Things the first deploy must confirm:
+   that `Microsoft.Insights/components` is allowed (see Constraints); that the
+   region supports Flex Consumption; that the zip deploy registers
+   `intune_cmdb_sync` (deploy.sh checks); that `AppTraces` carries the JSON line
+   under `AppRoleName` = the app name (the alert queries assume both); and that
+   `state.json` is writable on the `/mounts/state` share. Follow
+   `deploy/azure/README.md` stages 3-5 with `DRY_RUN=true`.
 1. **Done on dpsnowdev (2026-09-25): the OAuth client is authorized for the IRE
    API.** `--check-api` shows every endpoint allowed. PROD's OAuth client will
    need the same REST API Auth Scope, so re-run the probe there before its first

@@ -207,12 +207,14 @@ a non-zero exit rather than scrolling past in a log. See `RunReport.degraded`.
 
 ## 7. Deployment topologies
 
-Both are scheduled-container deployments of the same image. Pick on credential
-model, not cost — the difference is under $0.15/month.
+Both run the same `main()` on a schedule. Pick on credential model, not cost —
+both are well under a dollar a month.
 
-**Azure Container Apps Jobs** (`deploy/azure/`) — cron-triggered job, Key Vault
-for secrets accessed by user-assigned managed identity, Azure Files for state,
-Log Analytics for output.
+**Azure Functions, Flex Consumption** (`deploy/azure/`) — a timer-triggered
+Python function, zip-deployed with no container registry (the landing-zone
+policy denies registries and Container Apps). Key Vault references for secrets,
+resolved by a user-assigned managed identity; an Azure Files mount for state;
+Application Insights over Log Analytics for output.
 
 **AWS Lambda** (`deploy/aws/`) — container-image Lambda on an EventBridge
 schedule, SSM Parameter Store for secrets, S3 for state, deliberately outside a
@@ -238,7 +240,7 @@ implemented and supported by `main.bicep`, but the two-tenant setup it depends
 on cannot be automated from one login. See [entra-setup.md](entra-setup.md).
 
 `workload_identity` exists for AKS and GitHub Actions OIDC, which project a
-federated token file. Container Apps does not, so `deploy/azure` deliberately
+federated token file. Azure Functions does not, so `deploy/azure` deliberately
 does not offer it.
 
 ---

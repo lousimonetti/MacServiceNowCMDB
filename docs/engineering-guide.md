@@ -156,7 +156,7 @@ enough that the percentage guard is not a reliable backstop. The limit path
 short-circuits retirement outright rather than relying on it.
 
 **`workload_identity` is not the cross-tenant answer.** It needs a projected
-federated token file, which AKS and GitHub Actions provide and Container Apps
+federated token file, which AKS and GitHub Actions provide and Azure Functions
 does not. For secretless cross-tenant use `federated_managed_identity`, which
 signs a client assertion with a managed identity.
 
@@ -188,8 +188,8 @@ That is how you isolate one run in a log store holding weeks of them, and how
 you tie a report back to the run that produced it:
 
 ```kusto
-ContainerAppConsoleLogs_CL
-| extend p = parse_json(Log_s)
+AppTraces
+| extend p = parse_json(Message)
 | where p.run_id == "<id from the report>"
 | order by TimeGenerated asc
 ```

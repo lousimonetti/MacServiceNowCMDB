@@ -4,9 +4,8 @@ Two hosts, one stack, picked with `host`:
 
 - **`lambda`** (default): Lambda on a container image, triggered by EventBridge
   Scheduler. Cheapest, simplest, capped at 15 minutes.
-- **`ecs`**: an ECS Fargate scheduled task. It is the AWS counterpart of the
-  Azure Container Apps job: the root `Dockerfile` image runs to completion with
-  no time limit. See [ECS Fargate](#ecs-fargate).
+- **`ecs`**: an ECS Fargate scheduled task: the root `Dockerfile` image runs to
+  completion with no time limit. See [ECS Fargate](#ecs-fargate).
 
 The state bucket, secrets, schedule and alerting are shared by both.
 

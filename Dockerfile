@@ -1,5 +1,7 @@
 # Runtime image for schedulers that run a container to completion:
-# Azure Container Apps Jobs, ECS/Fargate scheduled tasks, Kubernetes CronJob, cron.
+# ECS/Fargate scheduled tasks, Kubernetes CronJob, cron. The Azure deployment does
+# not use it: it zip-deploys to Azure Functions (deploy/azure/), because the
+# landing-zone policy there denies container registries.
 #
 # For AWS Lambda use deploy/aws/Dockerfile.lambda instead — it needs the Lambda
 # runtime interface baked in.
