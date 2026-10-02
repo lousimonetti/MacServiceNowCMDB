@@ -32,13 +32,15 @@ kudu_init() {
 
 # kudu METHOD PATH [curl args...]
 #   Calls https://$KUDU_HOST$PATH at $KUDU_IP. Prints the body; fails on HTTP >= 400.
+#
+#   No --cacert, even behind Zscaler: this path goes over Zscaler Private Access,
+#   which does not inspect TLS, so Kudu presents its real certificate and the
+#   system curl's own trust store verifies it (seen on 2026-10-02). deploy.sh's
+#   combined bundle is for az and pip, which do not use the OS store.
 kudu() {
   local method="$1" path="$2"
   shift 2
-  local tls=()
-  # Behind TLS inspection deploy.sh exports the combined bundle; use it here too.
-  [[ -n "${REQUESTS_CA_BUNDLE:-}" ]] && tls=(--cacert "$REQUESTS_CA_BUNDLE")
-  curl --silent --show-error --fail-with-body "${tls[@]+"${tls[@]}"}" \
+  curl --silent --show-error --fail-with-body \
     --resolve "${KUDU_HOST}:443:${KUDU_IP}" \
     --header "Authorization: Bearer ${KUDU_TOKEN}" \
     --request "$method" "$@" \
@@ -46,20 +48,43 @@ kudu() {
 }
 
 # kudu_reachable
-#   One cheap call, so an unreachable endpoint fails with an explanation rather
-#   than as a stalled upload.
+#   One cheap authenticated call, so a failure is explained before any upload.
+#   /api/deployments, not /api/environment: on a Linux app the latter returns
+#   Kudu's HTML dashboard with HTTP 500 (2026-10-02), so it fails on a healthy app.
+#   Not /api/settings either, whose body can carry app settings.
+#   Leaves the HTTP status in KUDU_STATUS and curl's own error in KUDU_ERROR,
+#   which kudu_unreachable_help reports.
+KUDU_STATUS=""
+KUDU_ERROR=""
 kudu_reachable() {
-  kudu GET /api/environment --max-time 20 --output /dev/null 2>/dev/null
+  local err
+  err=$(mktemp)
+  KUDU_STATUS=$(kudu GET /api/deployments --max-time 20 --output /dev/null \
+      --write-out '%{http_code}' 2>"$err") && { rm -f "$err"; return 0; }
+  KUDU_ERROR=$(head -c 300 "$err")
+  rm -f "$err"
+  return 1
 }
 
 kudu_unreachable_help() {
+  local cause
+  case "${KUDU_STATUS:-000}" in
+    000) cause="no HTTP response: no route to ${KUDU_IP}, or TLS failed. Connect
+       Zscaler Private Access or the VPN; curl said: ${KUDU_ERROR:-nothing}" ;;
+    401) cause="401: Kudu refused the token. Re-run 'az login'; the token comes from
+       az account get-access-token --resource https://appservice.azure.com" ;;
+    403) cause="403: the route and token work, but your login lacks Contributor or
+       Website Contributor on the app" ;;
+    *)   cause="HTTP ${KUDU_STATUS}: ${KUDU_ERROR:-no detail}" ;;
+  esac
   cat >&2 <<HELP
-error: cannot reach Kudu for ${KUDU_HOST} at its private endpoint ${KUDU_IP}.
-       Check, from this machine:
-         curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 10 \\
-           --resolve ${KUDU_HOST}:443:${KUDU_IP} https://${KUDU_HOST}/
-       000 or a timeout means no route to ${KUDU_IP}: connect Zscaler Private
-       Access or the VPN. 401/403 means the route works but your login lacks
-       Contributor or Website Contributor on the app.
+error: Kudu for ${KUDU_HOST} at its private endpoint ${KUDU_IP} did not answer
+       an authenticated request.
+       ${cause}
+       To repeat the check by hand:
+         TOKEN=\$(az account get-access-token --resource https://appservice.azure.com --query accessToken -o tsv)
+         curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 15 \\
+           --resolve ${KUDU_HOST}:443:${KUDU_IP} -H "Authorization: Bearer \$TOKEN" \\
+           https://${KUDU_HOST}/api/deployments
 HELP
 }

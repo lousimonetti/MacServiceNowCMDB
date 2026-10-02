@@ -105,7 +105,11 @@ behaviour change, particularly anything altering what gets written to a CI.
   resolves privatelink names publicly. So `kudu.sh` looks up the endpoint's IP
   through ARM and pins the scm hostname with `curl --resolve`, keeping TLS
   verification on the real name, with an App Service token
-  (`--resource https://appservice.azure.com`). `deploy.sh` uploads through
+  (`--resource https://appservice.azure.com`). No `--cacert` on these calls: the ZPA path
+  is not TLS-inspected, and the system curl's trust store verifies Kudu's real
+  certificate. The reachability check uses `/api/deployments`: on Linux,
+  `/api/environment` returns the Kudu dashboard with HTTP 500. That stopped the
+  first real deploy (2026-10-02) on a healthy app. `deploy.sh` uploads through
   `POST /api/publish` that way, and `webjob.sh` runs and reads the job.
   `az webapp deploy`, `az webapp webjob` and the portal's Kudu pages do not
   work from outside the network; ARM operations (app settings, restart, stop)

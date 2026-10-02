@@ -552,6 +552,9 @@ def test_kudu_calls_pin_the_hostname_to_the_private_ip():
     assert '--resolve "${KUDU_HOST}:443:${KUDU_IP}"' in text
     assert '"https://${KUDU_HOST}${path}"' in text
     assert "--insecure" not in text and " -k " not in text
+    # The private path is not TLS-inspected; the system trust store suffices.
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert "--cacert" not in code
     assert "--resource https://appservice.azure.com" in text, "same token az webapp deploy uses"
 
 
@@ -568,3 +571,24 @@ def test_deploys_and_operations_go_through_the_private_path():
     assert 'kudu POST "/api/publish?type=zip' in deploy
     assert "kudu GET /api/triggeredwebjobs" in deploy
     assert deploy.index("kudu_reachable") < deploy.index('kudu POST "/api/publish')
+
+
+def test_kudu_failures_report_their_cause():
+    """A bare "cannot reach Kudu" hid a client-side TLS failure behind a message
+    about routes; the status and curl's own error must reach the user."""
+    text = KUDU_SH.read_text()
+    assert "--write-out '%{http_code}'" in text
+    assert "KUDU_ERROR=" in text
+    for status in ("000)", "401)", "403)"):
+        assert status in text
+
+
+def test_kudu_reachability_uses_an_endpoint_linux_kudu_serves():
+    """/api/environment returns Kudu's HTML dashboard with HTTP 500 on a Linux
+    app, which made the reachability check fail a healthy app on the first real
+    deploy (2026-10-02). /api/deployments returns 200 there."""
+    text = KUDU_SH.read_text()
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert "kudu GET /api/deployments --max-time 20" in code
+    assert "/api/environment" not in code
+
