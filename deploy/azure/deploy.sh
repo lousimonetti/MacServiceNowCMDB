@@ -32,6 +32,15 @@
 # additionally needs Privileged Role Administrator, Cloud Application
 # Administrator, or Global Administrator in that same tenant.
 
+# Bash only. `sh deploy.sh` runs it under a POSIX shell (dash on Linux, bash in
+# POSIX mode on macOS), which rejects the bash syntax below with a bare syntax
+# error, so re-run under bash instead. Written in POSIX sh so that any shell can
+# parse it before it gets that far.
+case ":${SHELLOPTS:-}:" in
+  *:posix:*) exec bash "$0" "$@" ;;
+esac
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
+
 set -euo pipefail
 
 # The resource group must already exist: in the landing zone, groups are
@@ -139,12 +148,14 @@ SUBSCRIPTION_NAME=$(az account show --query name --output tsv)
 pick_resource_group() {
   [[ -t 0 ]] || die "RESOURCE_GROUP must be set when not running interactively"
 
-  local names=() locations=() name location
+  local names=() locations=() name location listing
+  listing=$(az group list --query "sort_by(@, &name)[].[name, location]" --output tsv) \
+    || die "could not list resource groups in subscription ${SUBSCRIPTION_NAME}"
   while IFS=$'\t' read -r name location; do
     [[ -n "$name" ]] || continue
     names+=("$name")
     locations+=("$location")
-  done < <(az group list --query "sort_by(@, &name)[].[name, location]" --output tsv)
+  done <<< "$listing"
   [[ ${#names[@]} -gt 0 ]] || die "no resource groups visible in subscription ${SUBSCRIPTION_NAME}.
        Check the subscription (az account set --subscription <name>)."
 

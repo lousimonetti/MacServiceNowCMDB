@@ -429,3 +429,17 @@ def test_resources_deploy_to_east_us_by_default():
 def test_docs_never_suggest_deleting_the_shared_resource_group():
     readme = (REPO / "deploy" / "azure" / "README.md").read_text()
     assert "az group delete --name" not in readme
+
+
+def test_deploy_script_survives_being_run_with_sh():
+    """`sh deploy.sh` is a natural way to run it, and a POSIX shell rejects
+    bash syntax with a bare "syntax error near unexpected token" (it happened
+    with `done < <(...)`). The script re-runs itself under bash first, and that
+    guard must come before any bash-only line."""
+    text = DEPLOY_SH.read_text()
+    guard = text.index('[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"')
+    assert '*:posix:*) exec bash "$0" "$@" ;;' in text, "macOS sh is bash in POSIX mode"
+    assert guard < text.index("set -euo pipefail")
+    assert guard < text.index("[[")
+    # Process substitution fails to parse even in bash's own POSIX mode.
+    assert "< <(" not in text

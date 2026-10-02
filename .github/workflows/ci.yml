@@ -149,4 +149,5 @@ jobs:
           terraform test
 
       - name: Check shell scripts
-        run: bash -n deploy/azure/deploy.sh
+        # sh too: the script must parse far enough to re-run itself under bash.
+        run: bash -n deploy/azure/deploy.sh && sh -n deploy/azure/deploy.sh
