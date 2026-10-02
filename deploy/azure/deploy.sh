@@ -34,7 +34,15 @@
 
 set -euo pipefail
 
-RESOURCE_GROUP="${RESOURCE_GROUP:-rg-intune-cmdb-sync}"
+# The resource group must already exist: in the landing zone, groups are
+# provisioned by the platform team (DEV is azc-obm-development), and this script
+# never creates one. Set RESOURCE_GROUP to name it, or leave it unset and the
+# script lists the groups in the current subscription and asks you to pick one.
+# There is no default, for the same reason as DRY_RUN: a deploy into the wrong
+# group is hard to see and harder to undo.
+RESOURCE_GROUP="${RESOURCE_GROUP:-}"
+# Region for every resource, independent of the resource group's own region.
+# East US by requirement; it offers Flex Consumption.
 LOCATION="${LOCATION:-eastus}"
 # Every resource name derives from this. Run once per ServiceNow environment
 # with a distinct prefix (intunecmdb-dev, intunecmdb-prod) to get fully separate
@@ -124,6 +132,69 @@ if [[ -n "${MAPPING_OVERRIDES_FILE:-}" ]]; then
 fi
 
 SUBSCRIPTION_TENANT=$(az account show --query tenantId --output tsv)
+SUBSCRIPTION_NAME=$(az account show --query name --output tsv)
+
+# Interactive only: a pipeline or CI run with no RESOURCE_GROUP must fail, not
+# block on a prompt or guess.
+pick_resource_group() {
+  [[ -t 0 ]] || die "RESOURCE_GROUP must be set when not running interactively"
+
+  local names=() locations=() name location
+  while IFS=$'\t' read -r name location; do
+    [[ -n "$name" ]] || continue
+    names+=("$name")
+    locations+=("$location")
+  done < <(az group list --query "sort_by(@, &name)[].[name, location]" --output tsv)
+  [[ ${#names[@]} -gt 0 ]] || die "no resource groups visible in subscription ${SUBSCRIPTION_NAME}.
+       Check the subscription (az account set --subscription <name>)."
+
+  echo "==> Resource groups in subscription ${SUBSCRIPTION_NAME}"
+  local i
+  for i in "${!names[@]}"; do
+    printf '    %3d) %-40s %s\n' "$((i + 1))" "${names[$i]}" "${locations[$i]}"
+  done
+  echo "    Resources are created in ${LOCATION}, whatever the group's own region."
+
+  local choice
+  while true; do
+    read -r -p "    Deploy into which resource group? [1-${#names[@]}, q to quit] " choice \
+      || die "no resource group chosen"
+    case "$choice" in
+      q|Q) die "cancelled; nothing was deployed" ;;
+      ''|*[!0-9]*) echo "    enter a number from the list" ;;
+      *)
+        choice=$((10#$choice))
+        if (( choice >= 1 && choice <= ${#names[@]} )); then
+          RESOURCE_GROUP="${names[$((choice - 1))]}"
+          return
+        fi
+        echo "    enter a number from the list" ;;
+    esac
+  done
+}
+
+[[ -n "$RESOURCE_GROUP" ]] || pick_resource_group
+
+echo "==> Resource group ${RESOURCE_GROUP} (subscription ${SUBSCRIPTION_NAME})"
+az group show --name "$RESOURCE_GROUP" --output none 2>/dev/null \
+  || die "resource group ${RESOURCE_GROUP} not found in subscription ${SUBSCRIPTION_NAME}.
+       This script deploys into an existing group and never creates one. Check
+       the subscription (az account set --subscription <name>) and the name."
+echo "    deploying to ${LOCATION}"
+
+# Not every region offers Flex Consumption, and a region that does not fails the
+# deploy only after the identity, vault and storage exist. The listing's names
+# may be display names ("East US"), so both sides are normalised.
+normalise_region() { tr '[:upper:]' '[:lower:]' | tr -d ' '; }
+FLEX_REGIONS=$(az functionapp list-flexconsumption-locations --query "[].name" --output tsv 2>/dev/null \
+  | normalise_region || true)
+if [[ -z "$FLEX_REGIONS" ]]; then
+  echo "    WARNING: could not list Flex Consumption regions; continuing unchecked"
+elif ! grep -qx "$(normalise_region <<< "$LOCATION")" <<< "$FLEX_REGIONS"; then
+  die "${LOCATION} does not offer Flex Consumption. Set LOCATION to one that does
+       (az functionapp list-flexconsumption-locations -o table). Resources may
+       live in a different region from their resource group."
+fi
 
 GRAPH_TENANT_ID="${GRAPH_TENANT_ID:-$SUBSCRIPTION_TENANT}"
 
@@ -189,15 +260,13 @@ WHEEL=$(ls "${BUILD_DIR}"/wheel/intune_cmdb_sync-*.whl)
 (cd "$PACKAGE_DIR" && zip --quiet --recurse-paths "$PACKAGE_ZIP" .)
 echo "    $(du -h "$PACKAGE_ZIP" | cut -f1) package"
 
-echo "==> Resource group ${RESOURCE_GROUP} (${LOCATION})"
-az group create --name "$RESOURCE_GROUP" --location "$LOCATION" --output none
-
 echo "==> Deploying infrastructure (graph auth: ${GRAPH_AUTH_MODE})"
 DEPLOYMENT_OUTPUT=$(az deployment group create \
   --resource-group "$RESOURCE_GROUP" \
   --template-file "$(dirname "$0")/main.bicep" \
   --parameters \
       namePrefix="$NAME_PREFIX" \
+      location="$LOCATION" \
       schedule="$SCHEDULE" \
       pythonVersion="$PYTHON_VERSION" \
       graphAuthMode="$GRAPH_AUTH_MODE" \
@@ -309,7 +378,7 @@ Deployed.
   Retire missing   ${RETIRE_MISSING}
   Class map        ${SNOW_CLASS_MAP:-built-in (windows, macos)}
   Mapping override ${MAPPING_OVERRIDES_FILE:-none}
-  Resource group   ${RESOURCE_GROUP}
+  Resource group   ${RESOURCE_GROUP} (${LOCATION})
   Schedule         ${SCHEDULE} (NCRONTAB, UTC)
   Graph auth       ${GRAPH_AUTH_MODE}
   Intune tenant    ${GRAPH_TENANT_ID}

@@ -61,6 +61,15 @@ behaviour change, particularly anything altering what gets written to a CI.
   instance-specific `sys_id`s, and a shared one would drive PROD retirement from
   DEV IDs. Do not consolidate stacks onto shared storage. `storageName` strips
   hyphens because storage account names allow none. See `deploy/azure/README.md`.
+- **Resource groups are pre-provisioned; `deploy.sh` never creates or deletes
+  one.** DEV deploys into the existing `azc-obm-development`. `RESOURCE_GROUP`
+  has no default: when unset, `deploy.sh` lists the subscription's groups and
+  asks the user to pick one, and a non-interactive run fails instead of
+  prompting. The script fails if the group is missing. Resources go to
+  **East US** (`LOCATION` defaults to `eastus`) by requirement, regardless of
+  the group's region; Flex Consumption is checked against it before anything is
+  created. Teardown is by prefix, never `az group delete`:
+  the group may hold other teams' resources.
 
 - **Azure runs on Functions (Flex Consumption), zip-deployed, no image.**
   The landing-zone policy denies Azure Container Registry and Container Apps,

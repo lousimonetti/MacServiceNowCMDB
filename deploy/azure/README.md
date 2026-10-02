@@ -79,6 +79,11 @@ az account set --subscription <name or id>    # if it is the wrong one
 
 **These must already exist.** `deploy.sh` creates none of them:
 
+- [ ] **The resource group.** In the landing zone, groups are provisioned for
+  you: DEV deploys into **`azc-obm-development`**. If `RESOURCE_GROUP` is
+  unset, `deploy.sh` lists the groups in the current subscription and asks you
+  to pick one by number. It checks the group exists, and never creates one.
+  There is no default group.
 - [ ] **A Graph credential that matches your tenant topology.** See
   [Choosing Graph authentication](#choosing-graph-authentication) below and
   [docs/entra-setup.md](../../docs/entra-setup.md).
@@ -92,7 +97,7 @@ az account set --subscription <name or id>    # if it is the wrong one
 
 | Action | Needs |
 | --- | --- |
-| Create the resource group, deploy, and assign the stack's identity its roles | Owner, or Contributor plus User Access Administrator (or Role Based Access Control Administrator), on the subscription or resource group |
+| Deploy, and assign the stack's identity its roles | Owner, or Contributor plus User Access Administrator (or Role Based Access Control Administrator), on the resource group |
 | `GRAPH_AUTH_MODE=managed_identity` (the script grants Graph app roles) | Privileged Role Administrator, Cloud Application Administrator, or Global Administrator in the subscription's tenant |
 
 The template assigns roles to the stack's own managed identity (Key Vault
@@ -175,11 +180,12 @@ the environment file in stage 4.
 
 ## 3. Check region and policy
 
-**Region.** Flex Consumption is not in every region. Pick a `LOCATION` from:
-
-```bash
-az functionapp list-flexconsumption-locations -o table
-```
+**Region.** Every resource is created in **East US** (`eastus`), whatever
+region the chosen resource group is in; a resource's region need not match
+its group's. East US offers Flex Consumption, and `deploy.sh` re-checks that
+against `az functionapp list-flexconsumption-locations` before creating
+anything. `LOCATION` overrides the region, but the requirement is East US, so
+leave it unset.
 
 **Policy.** The landing-zone policy is an allowlist of resource types. This
 stack creates these, and every one must be on it:
@@ -219,8 +225,8 @@ reuses exactly the values you tested. Keep it out of git.
 ```bash
 # dev.env: no secrets in this file
 NAME_PREFIX=intunecmdb-dev
-RESOURCE_GROUP=rg-intune-cmdb-sync
-LOCATION=eastus                        # one stage 3 listed
+RESOURCE_GROUP=azc-obm-development     # pre-existing, never created; omit to pick from a list
+# LOCATION is not set: resources go to East US (eastus) by default
 SNOW_INSTANCE=acmedev
 SNOW_CLIENT_ID=<from the Application Registry entry>
 SNOW_WRITE_MODE=identify_reconcile     # the mode --check-api allowed
@@ -437,9 +443,11 @@ Every other setting uses the connector's built-in default.
 ## Multiple ServiceNow environments
 
 To feed more than one ServiceNow instance from the same Intune tenant, such as
-DEV and PROD, run `deploy.sh` once per instance into the same resource group,
-each time with a different `NAME_PREFIX`. Every resource name is derived from
-the prefix, so each run creates a separate stack. In practice that means one
+DEV and PROD, run `deploy.sh` once per instance, each time with a different
+`NAME_PREFIX`. Every resource name is derived from the prefix, so each run
+creates a separate stack, whether the environments share a resource group or,
+as is likely here, each has its own pre-provisioned one (DEV is
+`azc-obm-development`; set PROD's in `prod.env`). In practice that means one
 environment file per instance, `dev.env` and `prod.env`, following the stage 4
 pattern.
 
@@ -468,8 +476,9 @@ redeploy PROD from that same revision only after DEV has run cleanly. Re-running
 In `managed_identity` mode, each prefix creates its own identity and grants
 Graph permissions to it, so each deploy needs the admin role from stage 1.
 
-**Removing one environment.** `az group delete` removes every environment in
-the group. To remove only one, delete its resources by prefix. Run the list on
+**Removing one environment.** Never use `az group delete`: the resource group
+is pre-provisioned and may hold other teams' resources. Delete by prefix
+instead. Run the list on
 its own first and read what it matches:
 
 ```bash
@@ -567,7 +576,7 @@ Two Functions-specific details keep both rules honest:
 ## Operating
 
 ```bash
-RG=rg-intune-cmdb-sync
+RG=azc-obm-development
 PREFIX=intunecmdb-dev
 APP=<function app name>
 
@@ -625,11 +634,11 @@ next deploy.
 
 ## Teardown
 
-```bash
-az group delete --name rg-intune-cmdb-sync --yes
-```
-
-This removes **every** environment in the group. To remove only one, see
-[Multiple ServiceNow environments](#multiple-servicenow-environments). Key
-Vault soft-delete keeps the vault name reserved for 7 days. Use
-`az keyvault purge` if you need to reuse it sooner.
+**Do not delete the resource group.** It was provisioned for you, `deploy.sh`
+did not create it, and it may hold resources that are not this connector's.
+Remove a stack by its prefix, as in
+[Removing one environment](#multiple-servicenow-environments). Role assignments
+made to the deleted identity are left behind as "Identity not found" entries;
+remove them from the group's Access control blade if they bother you. Key Vault
+soft-delete keeps the vault name reserved for 7 days. Use `az keyvault purge`
+if you need to reuse it sooner.

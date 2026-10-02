@@ -391,3 +391,41 @@ def test_state_lives_on_the_mounted_share():
     assert "STATE_PATH: '${stateMountPath}/state.json'" in text
     assert "mountPath: stateMountPath" in text
     assert "type: 'AzureFiles'" in text
+
+
+def test_deploy_script_uses_an_existing_resource_group_and_never_creates_one():
+    """Landing-zone resource groups are pre-provisioned (DEV is
+    azc-obm-development). Creating one may be refused by policy, and a defaulted
+    name would deploy a stack into a group nobody looks at."""
+    text = DEPLOY_SH.read_text()
+    assert 'RESOURCE_GROUP="${RESOURCE_GROUP:-}"' in text, "no default group, ever"
+    assert "az group create" not in text
+    assert "az group delete" not in text
+    assert 'az group show --name "$RESOURCE_GROUP"' in text
+
+
+def test_resource_group_is_picked_from_a_list_only_when_interactive():
+    """Unset RESOURCE_GROUP lists the subscription's groups and asks. A
+    non-interactive run must fail rather than hang on the prompt or guess."""
+    text = DEPLOY_SH.read_text()
+    picker = text[text.index("pick_resource_group() {"):]
+    picker = picker[: picker.index("\n}\n")]
+    assert "[[ -t 0 ]] || die" in picker
+    assert "az group list" in picker
+    assert '[[ -n "$RESOURCE_GROUP" ]] || pick_resource_group' in text
+    # The picked group goes through the same existence check as a named one.
+    exists_check = text.index('az group show --name "$RESOURCE_GROUP"')
+    assert text.index("|| pick_resource_group") < exists_check
+
+
+def test_resources_deploy_to_east_us_by_default():
+    """East US by requirement, whatever region the chosen group is in."""
+    text = DEPLOY_SH.read_text()
+    assert 'LOCATION="${LOCATION:-eastus}"' in text
+    assert 'location="$LOCATION"' in text
+    assert "list-flexconsumption-locations" in text
+
+
+def test_docs_never_suggest_deleting_the_shared_resource_group():
+    readme = (REPO / "deploy" / "azure" / "README.md").read_text()
+    assert "az group delete --name" not in readme
