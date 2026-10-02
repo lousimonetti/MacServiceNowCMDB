@@ -1,7 +1,7 @@
 """Guards against drift between the places that define Graph auth modes.
 
 Three files independently decide which modes exist: `config.py` validates them,
-`main.bicep` offers a subset for Azure Functions, and `deploy.sh` gates on
+`main.bicep` offers a subset for Azure App Service, and `deploy.sh` gates on
 that same subset. Nothing makes them agree automatically, and the failure when
 they disagree is a deployment that validates fine and then cannot authenticate
 at runtime.
@@ -9,7 +9,6 @@ at runtime.
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
@@ -21,7 +20,7 @@ DEPLOY_SH = REPO / "deploy" / "azure" / "deploy.sh"
 
 # Modes that are real but deliberately absent from the Azure deployment:
 #   workload_identity  needs a projected federated token file, which AKS and
-#                      GitHub Actions provide and Azure Functions does not.
+#                      GitHub Actions provide and App Service does not.
 #   default            DefaultAzureCredential, a local-development convenience.
 #   access_token       a hand-pasted, non-refreshable token. Deploying this on a
 #                      schedule would produce a job that works until the token
@@ -75,7 +74,7 @@ def test_every_deployable_mode_is_reachable_from_azure():
     impossible = offered & NOT_DEPLOYABLE_ON_AZURE
     assert not impossible, (
         f"main.bicep offers {sorted(impossible)}, which cannot authenticate on "
-        "Azure Functions. For secretless cross-tenant use federated_managed_identity."
+        "Azure App Service. For secretless cross-tenant use federated_managed_identity."
     )
 
 
@@ -180,19 +179,6 @@ def test_discovery_source_is_settable_per_environment():
     assert 'discoverySource="${SNOW_DISCOVERY_SOURCE:-Intune}"' in DEPLOY_SH.read_text()
 
 
-def test_storage_account_name_survives_a_hyphenated_prefix():
-    """Multiple environments in one resource group use prefixes like
-    intunecmdb-dev. Storage account names allow only lowercase letters and
-    digits, so the prefix must be sanitised for that one resource or the deploy
-    fails after everything else has been created."""
-    text = BICEP.read_text()
-    assert "var storageName = take('${storageSafePrefix}st${suffix}', 24)" in text
-    safe = re.search(r"var storageSafePrefix = (.+)", text)
-    assert safe, "storageSafePrefix is gone from main.bicep"
-    assert "replace(" in safe.group(1) and "'-'" in safe.group(1)
-    assert "toLower(" in safe.group(1)
-
-
 def test_bicep_write_modes_are_ones_the_connector_accepts():
     """The write mode is per instance -- decided by that instance's OAuth auth
     scopes -- so a DEV and a PROD deploy may need different ones."""
@@ -272,137 +258,6 @@ def test_empty_class_map_is_omitted_not_blanked():
     assert "empty(classMap) ? {} :" in BICEP.read_text()
 
 
-# ---------------------------------------------------------------------------
-# Azure Functions host
-#
-# Each of these is a property whose failure is silent: the deploy succeeds and
-# then nothing runs, the alerts go blind, or two runs race on state.json.
-# ---------------------------------------------------------------------------
-
-FUNCTIONS = REPO / "deploy" / "azure" / "functions"
-FUNCTION_APP = FUNCTIONS / "function_app.py"
-HOST_JSON = FUNCTIONS / "host.json"
-
-
-def test_no_container_registry_or_container_apps_anywhere_in_the_azure_stack():
-    """The landing-zone policy denies both. The stack deploys code as a zip
-    package into its own storage account; nothing may reintroduce an image.
-    (Microsoft.App/environments may appear: it is the Flex subnet delegation,
-    not a Container Apps resource.)"""
-    denied_types = (
-        "Microsoft.ContainerRegistry",
-        "Microsoft.App/managedEnvironments",
-        "Microsoft.App/jobs",
-        "Microsoft.App/containerApps",
-        "az acr",
-        "containerapp",
-    )
-    for path in (BICEP, DEPLOY_SH):
-        text = path.read_text()
-        for denied in denied_types:
-            assert denied not in text, f"{path.name} references {denied}"
-    assert "'FlexConsumption'" in BICEP.read_text()
-    assert "Microsoft.Web/sites@" in BICEP.read_text()
-
-
-def test_timer_schedule_comes_from_the_app_setting_bicep_sets():
-    """function_app.py reads %SYNC_SCHEDULE%. If the setting is missing or
-    renamed, the host fails to index the function and nothing ever runs."""
-    assert 'schedule="%SYNC_SCHEDULE%"' in FUNCTION_APP.read_text()
-    assert "SYNC_SCHEDULE: schedule" in BICEP.read_text()
-    assert 'schedule="$SCHEDULE"' in DEPLOY_SH.read_text()
-
-
-def test_default_schedules_agree_and_have_six_fields():
-    """NCRONTAB has a seconds field; a five-field cron is rejected by the
-    timer at startup, after the deploy has reported success."""
-    bicep = re.search(r"param schedule string = '([^']+)'", BICEP.read_text())
-    script = re.search(r'SCHEDULE="\$\{SCHEDULE:-([^}]+)\}"', DEPLOY_SH.read_text())
-    assert bicep and script
-    assert bicep.group(1) == script.group(1)
-    assert len(bicep.group(1).split()) == 6
-
-
-def test_timer_does_not_run_on_startup():
-    """run_on_startup=True fires on every cold start and every deploy: an
-    unscheduled live sync each time the platform moves the app."""
-    text = FUNCTION_APP.read_text()
-    assert "run_on_startup=False" in text
-    assert "run_on_startup=True" not in text
-
-
-def test_deploy_script_checks_the_function_it_actually_deploys():
-    """deploy.sh fails the deploy if the function did not register; the name it
-    looks for must be the one function_app.py defines."""
-    name = re.search(r'FUNCTION_NAME="([^"]+)"', DEPLOY_SH.read_text())
-    assert name, "FUNCTION_NAME is gone from deploy.sh"
-    assert f"def {name.group(1)}(" in FUNCTION_APP.read_text()
-    assert "az functionapp function list" in DEPLOY_SH.read_text()
-
-
-def test_at_most_one_instance_runs():
-    """Two concurrent runs would race on state.json, the Functions twin of the
-    Lambda's reserved concurrency of 1."""
-    assert "maximumInstanceCount: 1" in BICEP.read_text()
-
-
-def test_trace_sampling_is_off():
-    """Application Insights sampling can drop the one `run complete` trace a
-    day, and the absence alert then reports a run that happened as missing."""
-    host = json.loads(HOST_JSON.read_text())
-    assert host["logging"]["applicationInsights"]["samplingSettings"]["isEnabled"] is False
-
-
-def test_function_timeout_covers_a_large_tenant():
-    """Same 30-minute ceiling the Container Apps job had. Flex Consumption's
-    default is also 30, but an explicit value survives a platform change."""
-    host = json.loads(HOST_JSON.read_text())
-    assert host["functionTimeout"] == "00:30:00"
-
-
-def test_python_versions_agree_between_template_and_package_build():
-    """deploy.sh builds wheels for one Python ABI; the runtime must be the same
-    one, or compiled dependencies (cryptography) fail to import."""
-    offered = _bicep_allowed_values("pythonVersion")
-    case = re.search(r'case "\$PYTHON_VERSION" in\n\s+([0-9.|]+)\)', DEPLOY_SH.read_text())
-    assert case, "deploy.sh no longer validates PYTHON_VERSION"
-    assert set(case.group(1).split("|")) == offered
-    assert 'pythonVersion="$PYTHON_VERSION"' in DEPLOY_SH.read_text()
-    assert '--python-version "$PYTHON_VERSION"' in DEPLOY_SH.read_text()
-
-
-def test_package_is_built_for_linux_whatever_the_build_machine():
-    """Without --platform, a Mac packages macOS wheels and the function fails
-    to import on its first run."""
-    text = DEPLOY_SH.read_text()
-    assert "--platform manylinux" in text
-    assert "--only-binary=:all:" in text
-    assert '"${WHEEL}[azure]"' in text, "the azure extra carries azure-functions"
-    assert "--build-remote false" in text
-
-
-def test_secrets_reach_the_app_as_key_vault_references_only():
-    """A secret parameter written into app settings as a literal is readable by
-    anyone with read access to the app's configuration."""
-    text = BICEP.read_text()
-    settings = text[text.index("var graphEnvCommon"):text.index("resource appSettings")]
-    assert "serviceNowClientSecret" not in settings
-    assert "graphClientSecret" not in settings
-    assert "SNOW_CLIENT_SECRET: snowSecretRef" in settings
-    assert "@Microsoft.KeyVault(SecretUri=${serviceNowSecret.properties.secretUri})" in text
-    assert "keyVaultReferenceIdentity: identity.id" in text
-
-
-def test_state_lives_on_the_mounted_share():
-    """state.json must outlive the instance, or retirement silently stops."""
-    text = BICEP.read_text()
-    mount = re.search(r"var stateMountPath = '([^']+)'", text)
-    assert mount
-    assert "STATE_PATH: '${stateMountPath}/state.json'" in text
-    assert "mountPath: stateMountPath" in text
-    assert "type: 'AzureFiles'" in text
-
-
 def test_deploy_script_uses_an_existing_resource_group_and_never_creates_one():
     """Landing-zone resource groups are pre-provisioned (DEV is
     azc-obm-development). Creating one may be refused by policy, and a defaulted
@@ -433,7 +288,6 @@ def test_resources_deploy_to_east_us_by_default():
     text = DEPLOY_SH.read_text()
     assert 'LOCATION="${LOCATION:-eastus}"' in text
     assert 'location="$LOCATION"' in text
-    assert "list-flexconsumption-locations" in text
 
 
 def test_docs_never_suggest_deleting_the_shared_resource_group():
@@ -508,9 +362,13 @@ def test_certificate_verification_is_never_disabled():
 
 
 # ---------------------------------------------------------------------------
-# Landing-zone Key Vault and Storage policies, and the private networking they
-# force. Each was a RequestDisallowedByPolicy at the first real deploy.
+# App Service + scheduled WebJob host
+#
+# Each of these is a property whose failure is silent: the deploy succeeds and
+# then nothing runs, the alerts go blind, or a policy refuses the next deploy.
 # ---------------------------------------------------------------------------
+
+WEBJOB_RUN = REPO / "deploy" / "azure" / "webjob" / "run.py"
 
 
 def _resource_block(text: str, declaration: str) -> str:
@@ -519,60 +377,122 @@ def _resource_block(text: str, declaration: str) -> str:
     return text[start:end if end != -1 else None]
 
 
-def test_vault_meets_the_soft_delete_and_purge_protection_policy():
-    """vpcx-lzn-kv-enable-soft-delete-purge-retention-days-90."""
-    vault = _resource_block(BICEP.read_text(), "resource vault 'Microsoft.KeyVault/vaults@")
-    assert "enableSoftDelete: true" in vault
-    assert "enablePurgeProtection: true" in vault
-    assert "softDeleteRetentionInDays: 90" in vault
-
-
-def test_vault_and_storage_deny_public_network_access():
-    """vpcx-lzn-kv-restrict-network-access and vpcx-lzn-strg-restrict-network-access
-    both evaluate networkAcls.defaultAction."""
+def test_template_creates_nothing_the_landing_zone_refuses():
+    """ACR and Container Apps are denied outright. Key Vault and Storage are
+    allowed only with public access denied, which would force a VNet; avoiding
+    both is the reason this host was chosen."""
     text = BICEP.read_text()
-    for declaration in (
-        "resource vault 'Microsoft.KeyVault/vaults@",
-        "resource storage 'Microsoft.Storage/storageAccounts@",
+    for refused in (
+        "Microsoft.ContainerRegistry",
+        "Microsoft.App/",
+        "Microsoft.KeyVault",
+        "Microsoft.Storage",
+        "Microsoft.Network",
     ):
-        block = _resource_block(text, declaration)
-        assert "defaultAction: 'Deny'" in block, f"{declaration} allows public access"
-        assert "publicNetworkAccess: 'Enabled'" not in block
+        assert refused not in text, f"main.bicep creates {refused}"
+    for refused in ("az acr", "containerapp", "functionapp"):
+        assert refused not in DEPLOY_SH.read_text()
 
 
-def test_app_reaches_vault_and_storage_privately():
-    """With both firewalled, the app needs VNet integration and an endpoint for
-    every service it uses, or Key Vault references and host storage fail."""
+def test_app_service_runs_the_webjob_reliably():
+    """Without Always On a scheduled WebJob stops firing when the app idles,
+    which needs Basic or above; without the idle timeout a triggered job is
+    killed after two quiet minutes."""
     text = BICEP.read_text()
-    assert "virtualNetworkSubnetId: integrationSubnetId" in text
-    assert "groupId: 'vault'" in text
-    assert "concat(['blob', 'queue', 'table'], enableStatePersistence ? ['file'] : [])" in text
-    assert "privatelink.vaultcore.azure.net" in text
-    settings = _resource_block(text, "resource appSettings ")
-    assert "privateEndpoints" in settings and "dnsZoneGroups" in settings
+    site = _resource_block(text, "resource webApp 'Microsoft.Web/sites@")
+    assert "alwaysOn: true" in site
+    assert "linuxFxVersion: 'PYTHON|3.12'" in site
+    assert "name: 'B1'" in _resource_block(text, "resource plan 'Microsoft.Web/serverfarms@")
+    timeout = re.search(r"WEBJOBS_IDLE_TIMEOUT: '(\d+)'", text)
+    assert timeout and int(timeout.group(1)) >= 1800
+    assert "WEBSITE_SKIP_RUNNING_KUDUAGENT: 'false'" in text
 
 
-def test_private_dns_modes_agree_between_template_and_script():
-    assert _bicep_allowed_values("privateDnsMode") == {"central", "local"}
-    case = re.search(r'case "\$PRIVATE_DNS_MODE" in\n\s+([a-z|]+)\)', DEPLOY_SH.read_text())
-    assert case, "deploy.sh no longer validates PRIVATE_DNS_MODE"
-    assert set(case.group(1).split("|")) == {"central", "local"}
-    assert "param privateDnsMode string = 'central'" in BICEP.read_text()
-    assert 'PRIVATE_DNS_MODE="${PRIVATE_DNS_MODE:-central}"' in DEPLOY_SH.read_text()
+def test_site_is_hardened():
+    text = BICEP.read_text()
+    site = _resource_block(text, "resource webApp 'Microsoft.Web/sites@")
+    assert "httpsOnly: true" in site
+    assert "minTlsVersion: '1.2'" in site
+    assert "ftpsState: 'Disabled'" in site
+    assert "remoteDebuggingEnabled: false" in site
+    assert text.count("properties: { allow: false }") == 2, "basic-auth publishing must be off"
 
 
-def test_deploy_script_requires_and_checks_both_subnets():
-    """A wrong integration subnet otherwise deploys an app that cannot reach its
-    vault or storage, and never runs."""
+def test_python_version_agrees_between_app_and_package_build():
+    """deploy.sh builds wheels for one Python ABI; the app must run the same
+    one, or compiled dependencies (cryptography) fail to import."""
+    version = re.search(r"linuxFxVersion: 'PYTHON\|([0-9.]+)'", BICEP.read_text())
+    assert version
+    assert f'PYTHON_VERSION="{version.group(1)}"' in DEPLOY_SH.read_text()
+
+
+def test_package_is_built_for_linux_whatever_the_build_machine():
+    """Without --platform, a Mac packages macOS wheels and the WebJob fails to
+    import on its first run."""
     text = DEPLOY_SH.read_text()
-    assert "require INTEGRATION_SUBNET_ID" in text
-    assert "require PRIVATE_ENDPOINT_SUBNET_ID" in text
-    assert {"integrationSubnetId", "privateEndpointSubnetId", "privateDnsMode"} <= (
-        _deploy_sh_bicep_parameters()
-    )
-    assert 'index("Microsoft.App/environments")' in text, "delegation not checked"
-    assert "-le 27" in text, "subnet size not checked"
-    assert "*_*" in text, "underscore in subnet name not checked"
-    assert "az provider show --namespace Microsoft.App" in text
-    # Before anything is built or deployed.
-    assert text.index('echo "==> Network"') < text.index('echo "==> Building function package')
+    assert "--platform manylinux" in text
+    assert "--only-binary=:all:" in text
+    assert '"${WHEEL}[appservice]"' in text, "the appservice extra carries the telemetry"
+    assert "SCM_DO_BUILD_DURING_DEPLOYMENT: 'false'" in BICEP.read_text()
+
+
+def test_webjob_layout_matches_what_the_script_verifies():
+    """A job outside App_Data/jobs/triggered/<name>/ is never registered, and
+    then nothing runs and nothing errors."""
+    text = DEPLOY_SH.read_text()
+    assert re.search(r'WEBJOB_NAME="([^"]+)"', text), "WEBJOB_NAME is gone from deploy.sh"
+    assert 'JOB_DIR="${PACKAGE_DIR}/App_Data/jobs/triggered/${WEBJOB_NAME}"' in text
+    assert 'cp "$(dirname "$0")/webjob/run.py" "$JOB_DIR/"' in text
+    assert "az webapp webjob triggered list" in text
+
+
+def test_webjob_package_path_matches_the_install_target():
+    """run.py adds wwwroot/packages to sys.path; the build must install there."""
+    assert '"site", "wwwroot", "packages"' in WEBJOB_RUN.read_text()
+    assert '--target "${PACKAGE_DIR}/packages"' in DEPLOY_SH.read_text()
+
+
+def test_webjob_run_exits_with_the_sync_exit_code():
+    """A failed sync must be a failed WebJob run in the job history."""
+    assert "sys.exit(run())" in WEBJOB_RUN.read_text()
+
+
+def test_schedule_is_six_fields_and_reaches_settings_job():
+    """NCRONTAB has a seconds field; a five-field cron is rejected by the
+    scheduler only after the deploy has reported success."""
+    text = DEPLOY_SH.read_text()
+    default = re.search(r'SCHEDULE="\$\{SCHEDULE:-([^}]+)\}"', text)
+    assert default and len(default.group(1).split()) == 6
+    assert "{schedule: $schedule, is_singleton: true}" in text
+    assert '"${JOB_DIR}/settings.job"' in text
+
+
+def test_state_and_report_live_on_persistent_home():
+    """/home survives restarts and redeploys; anything else on App Service does
+    not, and a lost state.json silently stops retirement."""
+    text = BICEP.read_text()
+    assert "var dataDir = '/home/" in text
+    assert "STATE_PATH: '${dataDir}/state.json'" in text
+    assert "RUN_REPORT_PATH: '${dataDir}/run-report.json'" in text
+    assert "WEBSITES_ENABLE_APP_SERVICE_STORAGE: 'true'" in text
+
+
+def test_alert_queries_match_the_name_telemetry_carries():
+    """OTEL_SERVICE_NAME becomes AppRoleName on every trace. If it and the
+    alert filter disagree, the absence alert fires every hour and the error
+    alert never fires."""
+    text = BICEP.read_text()
+    assert "OTEL_SERVICE_NAME: webAppName" in text
+    assert text.count("| where AppRoleName == '{0}'") == 2
+    assert text.count("''', webAppName)") == 2
+    assert text.count("| extend p = parse_json(Message)") == 2
+
+
+def test_telemetry_publishes_with_the_identity():
+    """Application Insights keeps local auth off; the job authenticates as the
+    identity, which needs Monitoring Metrics Publisher before settings land."""
+    text = BICEP.read_text()
+    assert "DisableLocalAuth: true" in text
+    assert "AZURE_CLIENT_ID: identity.properties.clientId" in text
+    assert "3913510d-42f4-4e42-8a64-420c390055eb" in text
+    assert "appInsightsPublisher" in _resource_block(text, "resource appSettings ")

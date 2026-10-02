@@ -219,25 +219,23 @@ the per-device `sys_id`s before dropping the limit.
 
 ## Deploying
 
-### Azure Functions (Flex Consumption) — recommended
+### Azure App Service (scheduled WebJob) — recommended
 
 ```bash
 export SNOW_INSTANCE=acme SNOW_CLIENT_ID=... SNOW_CLIENT_SECRET=...
 DRY_RUN=true ./deploy/azure/deploy.sh
 ```
 
-Provisions a timer-triggered function app on the Flex Consumption plan, a
-user-assigned managed identity, Key Vault for the ServiceNow secret, an Azure
-Files share mounted for state, and Application Insights over Log Analytics —
-then grants the identity its Graph permissions. The landing zone denies public
-access to Key Vault and Storage, so the function joins the landing zone's
-network and reaches both through private endpoints; two subnets are
-prerequisites (see the Azure README's *Networking*).
+Provisions a Linux App Service app whose scheduled WebJob runs the sync once a
+day, a user-assigned managed identity, and Application Insights over Log
+Analytics, then grants the identity its Graph permissions. State and the run
+report live on the app's persistent `/home`.
 
-There is no container image and no registry. `deploy.sh` builds a zip package
-locally (the connector plus its Linux wheels) and deploys it into a blob
-container in the stack's own storage account. A run of a few minutes a day sits
-inside the Flex Consumption free grant.
+There is no container image, no registry, no storage account, no Key Vault and
+no VNet. The landing zone denies the first two, and allows Key Vault and Storage
+only with public access denied, which would force private networking. So
+secrets are app settings, and `deploy.sh` builds a zip locally (the connector
+plus its Linux wheels) and deploys it straight to the app.
 
 **Check which tenant topology you have first**, because it decides the
 credential model:
@@ -286,19 +284,17 @@ docker run --rm --env-file .env intune-cmdb-sync
 
 | | Azure | AWS |
 | --- | --- | --- |
-| Compute | $0.00 — inside the Flex Consumption free grant | ~$0.15 |
+| Compute | ~$13.14 — App Service plan, Linux B1 | ~$0.15 |
 | Registry | none — zip deploy | ~$0.04 (ECR) |
-| Scheduler | included | $0.00 — free tier |
-| Secrets | ~$0.00 — Key Vault standard | $0.00 — SSM Standard |
-| State and package | ~$0.10 — Azure Files and Blob | ~$0.00 — S3 |
-| Private networking | ~$36.50 — 5 private endpoints, required by the landing zone | n/a — not in a VPC |
+| Scheduler | included — WebJob | $0.00 — free tier |
+| Secrets | included — app settings | $0.00 — SSM Standard |
+| State | included — the app's `/home` | ~$0.00 — S3 |
 | Logs | $0.00 — under the 5 GB free tier | $0.00 — under the 5 GB free tier |
-| **Total** | **~$37/month** | **~$0.20/month** |
+| **Total** | **~$13/month** | **~$0.20/month** |
 
-List prices, single daily run, ~5 minutes. The Azure figure is almost entirely
-private endpoints. They are needed because the landing zone denies public
-access to Key Vault and Storage; without that policy Azure costs about
-$0.10/month. Full workings are in the deployment READMEs.
+List prices, single daily run, ~5 minutes. The Azure figure is the App Service
+plan: Basic B1 is the cheapest tier with "Always On", which a scheduled WebJob
+needs. Full workings are in the deployment READMEs.
 
 ---
 

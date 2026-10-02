@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Deploy intune-cmdb-sync to Azure Functions (Flex Consumption).
+# Deploy intune-cmdb-sync to Azure App Service, as a scheduled WebJob.
 #
-# There is no container image and no registry: this script builds a zip package
-# on this machine -- the connector, its Linux wheels, and the function entry
-# point -- and deploys it into a blob container in the stack's own storage
-# account. Re-running it redeploys both the infrastructure and the code from the
-# current checkout.
+# There is no container image, no registry, no storage account and no Key Vault:
+# the landing-zone policy denies the first two outright and denies public access
+# to the other two (see main.bicep). This script builds a zip package on this
+# machine -- the connector, its Linux wheels, and the WebJob -- and deploys it to
+# the app's own /home/site/wwwroot. Re-running it redeploys both the
+# infrastructure and the code from the current checkout.
 #
 # Three topologies, selected by GRAPH_AUTH_MODE:
 #
 #   client_secret     (default) Intune lives in a different tenant from this
 #                     subscription. The app authenticates as an app registration
-#                     from the Intune tenant; its secret goes into Key Vault.
+#                     from the Intune tenant; its secret becomes an app setting.
 #
 #   managed_identity  Intune and this subscription share a tenant. The app's
 #                     managed identity is granted Graph application permissions
@@ -51,18 +52,19 @@ set -euo pipefail
 # group is hard to see and harder to undo.
 RESOURCE_GROUP="${RESOURCE_GROUP:-}"
 # Region for every resource, independent of the resource group's own region.
-# East US by requirement; it offers Flex Consumption.
+# East US by requirement.
 LOCATION="${LOCATION:-eastus}"
 # Every resource name derives from this. Run once per ServiceNow environment
 # with a distinct prefix (intunecmdb-dev, intunecmdb-prod) to get fully separate
 # stacks in one resource group -- see README.md, "Multiple ServiceNow environments".
 NAME_PREFIX="${NAME_PREFIX:-intunecmdb}"
-# Six-field NCRONTAB (seconds first), UTC. Flex Consumption has no time zones.
+# Six-field NCRONTAB (seconds first), UTC. It goes into the WebJob's settings.job.
 SCHEDULE="${SCHEDULE:-0 15 3 * * *}"
-# The Functions runtime version; the package's wheels are built for the same one.
-PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
+# The app runs PYTHON|3.12 (main.bicep); the package's wheels must match it.
+PYTHON_VERSION="3.12"
 PYTHON="${PYTHON:-python3}"
-FUNCTION_NAME="intune_cmdb_sync"
+# Folder name under App_Data/jobs/triggered/, and the name `az webapp webjob` uses.
+WEBJOB_NAME="intune-cmdb-sync"
 GRAPH_AUTH_MODE="${GRAPH_AUTH_MODE:-client_secret}"
 # Extra root certificates, for a network that intercepts TLS (Zscaler): a PEM
 # file, or `macos-keychain` to use the macOS System keychain, where Zscaler
@@ -97,38 +99,17 @@ require SNOW_INSTANCE
 require SNOW_CLIENT_ID
 require SNOW_CLIENT_SECRET
 
-# CRON was the Container Apps setting: five fields. NCRONTAB has six, and a
-# five-field value is rejected by the timer at startup, after deployment.
+# CRON was the Container Apps setting: five fields. NCRONTAB has six, and the
+# WebJob scheduler rejects a five-field value only after deployment.
 [[ -z "${CRON:-}" ]] || die "CRON is no longer read. Set SCHEDULE to a six-field NCRONTAB
        expression instead, seconds first: CRON='15 3 * * *' becomes SCHEDULE='0 15 3 * * *'"
 read -ra SCHEDULE_FIELDS <<< "$SCHEDULE"
 [[ ${#SCHEDULE_FIELDS[@]} -eq 6 ]] \
   || die "SCHEDULE must have six fields, seconds first (got '${SCHEDULE}')"
 
-case "$PYTHON_VERSION" in
-  3.11|3.12) ;;
-  *) die "PYTHON_VERSION must be 3.11 or 3.12, the versions main.bicep offers (got '${PYTHON_VERSION}')" ;;
-esac
-
 for tool in jq zip "$PYTHON"; do
   command -v "$tool" >/dev/null || die "$tool is required"
 done
-
-# The landing zone denies public access to Key Vault and Storage, so the app
-# reaches them privately, through two subnets of the landing zone's network
-# (README.md, "Networking"):
-#   INTEGRATION_SUBNET_ID       Flex VNet integration; delegated to
-#                               Microsoft.App/environments, /27 or larger
-#   PRIVATE_ENDPOINT_SUBNET_ID  private endpoints for the vault and storage
-#   PRIVATE_DNS_MODE            central (hub zones, policy registers records;
-#                               default) or local (this stack creates the zones)
-require INTEGRATION_SUBNET_ID
-require PRIVATE_ENDPOINT_SUBNET_ID
-PRIVATE_DNS_MODE="${PRIVATE_DNS_MODE:-central}"
-case "$PRIVATE_DNS_MODE" in
-  central|local) ;;
-  *) die "PRIVATE_DNS_MODE must be 'central' or 'local' (got '${PRIVATE_DNS_MODE}')" ;;
-esac
 
 SNOW_WRITE_MODE="${SNOW_WRITE_MODE:-identify_reconcile}"
 case "$SNOW_WRITE_MODE" in
@@ -297,57 +278,6 @@ az group show --name "$RESOURCE_GROUP" --output none 2>/dev/null \
        the subscription (az account set --subscription <name>) and the name."
 echo "    deploying to ${LOCATION}"
 
-# Not every region offers Flex Consumption, and a region that does not fails the
-# deploy only after the identity, vault and storage exist. The listing's names
-# may be display names ("East US"), so both sides are normalised.
-normalise_region() { tr '[:upper:]' '[:lower:]' | tr -d ' '; }
-FLEX_REGIONS=$(az functionapp list-flexconsumption-locations --query "[].name" --output tsv 2>/dev/null \
-  | normalise_region || true)
-if [[ -z "$FLEX_REGIONS" ]]; then
-  echo "    WARNING: could not list Flex Consumption regions; continuing unchecked"
-elif ! grep -qx "$(normalise_region <<< "$LOCATION")" <<< "$FLEX_REGIONS"; then
-  die "${LOCATION} does not offer Flex Consumption. Set LOCATION to one that does
-       (az functionapp list-flexconsumption-locations -o table). Resources may
-       live in a different region from their resource group."
-fi
-
-# Each of these otherwise fails the deploy after the vault and storage exist, or
-# worse, deploys an app that cannot reach either and never runs.
-echo "==> Network"
-lower() { tr '[:upper:]' '[:lower:]'; }
-INTEGRATION_SUBNET=$(az network vnet subnet show --ids "$INTEGRATION_SUBNET_ID" --output json 2>/dev/null) \
-  || die "integration subnet not found: ${INTEGRATION_SUBNET_ID}
-       Ask the platform team for a /27 subnet delegated to Microsoft.App/environments;
-       see README.md, \"Networking\"."
-INTEGRATION_NAME=$(jq -r '.name' <<< "$INTEGRATION_SUBNET")
-INTEGRATION_PREFIX=$(jq -r '.addressPrefix // .addressPrefixes[0] // ""' <<< "$INTEGRATION_SUBNET")
-[[ "$INTEGRATION_NAME" != *_* ]] \
-  || die "integration subnet ${INTEGRATION_NAME} has an underscore in its name, which Flex
-       Consumption cannot use. It needs a subnet named without one."
-jq -e '[.delegations[]?.serviceName] | index("Microsoft.App/environments")' <<< "$INTEGRATION_SUBNET" >/dev/null \
-  || die "integration subnet ${INTEGRATION_NAME} is not delegated to Microsoft.App/environments
-       (Flex Consumption's delegation; Premium plans use Microsoft.Web/serverFarms instead)."
-[[ "${INTEGRATION_PREFIX#*/}" =~ ^[0-9]+$ && ${INTEGRATION_PREFIX#*/} -le 27 ]] \
-  || die "integration subnet ${INTEGRATION_NAME} is ${INTEGRATION_PREFIX:-unknown}; Flex Consumption needs /27 or larger"
-jq -e '((.privateEndpoints // []) + (.serviceEndpoints // [])) | length == 0' <<< "$INTEGRATION_SUBNET" >/dev/null \
-  || die "integration subnet ${INTEGRATION_NAME} holds private or service endpoints; Flex Consumption
-       needs it to itself. Put the private endpoints in PRIVATE_ENDPOINT_SUBNET_ID instead."
-echo "    integration  ${INTEGRATION_NAME} (${INTEGRATION_PREFIX}, Microsoft.App/environments)"
-
-[[ "$(lower <<< "$PRIVATE_ENDPOINT_SUBNET_ID")" != "$(lower <<< "$INTEGRATION_SUBNET_ID")" ]] \
-  || die "PRIVATE_ENDPOINT_SUBNET_ID must be a different subnet from INTEGRATION_SUBNET_ID"
-ENDPOINT_NAME=$(az network vnet subnet show --ids "$PRIVATE_ENDPOINT_SUBNET_ID" --query name --output tsv 2>/dev/null) \
-  || die "private endpoint subnet not found: ${PRIVATE_ENDPOINT_SUBNET_ID}"
-echo "    endpoints    ${ENDPOINT_NAME} (private DNS: ${PRIVATE_DNS_MODE})"
-
-# The delegation above needs the provider; registering it is a subscription-level
-# action the platform team may reserve.
-APP_PROVIDER=$(az provider show --namespace Microsoft.App --query registrationState --output tsv 2>/dev/null || echo unknown)
-[[ "$APP_PROVIDER" == Registered ]] \
-  || die "the Microsoft.App resource provider is ${APP_PROVIDER} in this subscription. Flex
-       Consumption VNet integration needs it registered:
-         az provider register --namespace Microsoft.App"
-
 GRAPH_TENANT_ID="${GRAPH_TENANT_ID:-$SUBSCRIPTION_TENANT}"
 
 case "$GRAPH_AUTH_MODE" in
@@ -391,20 +321,23 @@ PACKAGE_DIR="${BUILD_DIR}/package"
 PACKAGE_ZIP="${BUILD_DIR}/app.zip"
 SOURCE_REVISION=$(git -C "$REPO_ROOT" describe --always --dirty 2>/dev/null || echo unknown)
 
-echo "==> Building function package (Python ${PYTHON_VERSION}, source ${SOURCE_REVISION})"
-mkdir -p "$PACKAGE_DIR"
-cp "$(dirname "$0")/functions/function_app.py" "$(dirname "$0")/functions/host.json" "$PACKAGE_DIR/"
+echo "==> Building WebJob package (Python ${PYTHON_VERSION}, source ${SOURCE_REVISION})"
+JOB_DIR="${PACKAGE_DIR}/App_Data/jobs/triggered/${WEBJOB_NAME}"
+mkdir -p "$JOB_DIR"
+cp "$(dirname "$0")/webjob/run.py" "$JOB_DIR/"
+# is_singleton: never two runs at once, which would race on state.json.
+jq -n --arg schedule "$SCHEDULE" '{schedule: $schedule, is_singleton: true}' > "${JOB_DIR}/settings.job"
 "$PYTHON" -m pip wheel --quiet --no-deps --wheel-dir "${BUILD_DIR}/wheel" "$REPO_ROOT" \
   || die "could not build the connector wheel"
 WHEEL=$(ls "${BUILD_DIR}"/wheel/intune_cmdb_sync-*.whl)
 # Linux x86_64 wheels for the runtime's Python, whatever this machine is.
 # Without --platform, a Mac would package macOS builds of cryptography (pulled in
-# by azure-identity) and the function would fail to import at its first run.
+# by azure-identity) and the WebJob would fail to import at its first run.
 "$PYTHON" -m pip install --quiet \
-    --target "${PACKAGE_DIR}/.python_packages/lib/site-packages" \
+    --target "${PACKAGE_DIR}/packages" \
     --platform manylinux_2_28_x86_64 --platform manylinux2014_x86_64 \
     --implementation cp --python-version "$PYTHON_VERSION" --only-binary=:all: \
-    "${WHEEL}[azure]" \
+    "${WHEEL}[appservice]" \
   || die "could not install the connector's Linux dependencies"
 (cd "$PACKAGE_DIR" && zip --quiet --recurse-paths "$PACKAGE_ZIP" .)
 echo "    $(du -h "$PACKAGE_ZIP" | cut -f1) package"
@@ -415,12 +348,7 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
   --template-file "$(dirname "$0")/main.bicep" \
   --parameters \
       namePrefix="$NAME_PREFIX" \
-      integrationSubnetId="$INTEGRATION_SUBNET_ID" \
-      privateEndpointSubnetId="$PRIVATE_ENDPOINT_SUBNET_ID" \
-      privateDnsMode="$PRIVATE_DNS_MODE" \
       location="$LOCATION" \
-      schedule="$SCHEDULE" \
-      pythonVersion="$PYTHON_VERSION" \
       graphAuthMode="$GRAPH_AUTH_MODE" \
       graphTenantId="$GRAPH_TENANT_ID" \
       graphClientId="${GRAPH_CLIENT_ID:-}" \
@@ -440,38 +368,36 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
 
 PRINCIPAL_ID=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.managedIdentityPrincipalId.value')
 CLIENT_ID=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.managedIdentityClientId.value')
-APP_NAME=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.functionAppName.value')
+APP_NAME=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.webAppName.value')
 
-# The upload writes to the package container as the app's identity, whose role
-# assignments were created seconds ago and can take a minute or two to apply.
+# A brand-new app can refuse the first deploy while its site is still starting.
 echo "==> Deploying code to ${APP_NAME}"
 for attempt in 1 2 3 4 5; do
-  if az functionapp deployment source config-zip \
-      --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
-      --src "$PACKAGE_ZIP" --build-remote false --output none; then
+  if az webapp deploy --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
+      --src-path "$PACKAGE_ZIP" --type zip --clean true --output none; then
     break
   fi
   [[ $attempt -lt 5 ]] || die "code deployment failed; the infrastructure is deployed, so re-running
        this script is safe"
-  echo "    attempt ${attempt} failed; retrying in 30s (role assignments may still be propagating)"
+  echo "    attempt ${attempt} failed; retrying in 30s (the app may still be starting)"
   sleep 30
 done
 
-# A package that deploys fine but fails to import (a missing or wrong-platform
-# wheel) registers no function at all, and then nothing ever runs and nothing
-# errors. Make that a deploy-time failure instead.
-echo "==> Checking the timer function is registered"
+# A package that deploys fine but puts the job in the wrong folder registers no
+# WebJob at all, and then nothing ever runs and nothing errors. Make that a
+# deploy-time failure instead.
+echo "==> Checking the WebJob is registered"
 REGISTERED=""
 for attempt in 1 2 3 4 5 6; do
-  REGISTERED=$(az functionapp function list --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
-      --query "[?ends_with(name, '/${FUNCTION_NAME}')] | length(@)" --output tsv 2>/dev/null || echo 0)
+  REGISTERED=$(az webapp webjob triggered list --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
+      --query "[?ends_with(name, '${WEBJOB_NAME}')] | length(@)" --output tsv 2>/dev/null || echo 0)
   [[ "$REGISTERED" == "1" ]] && break
   sleep 20
 done
-[[ "$REGISTERED" == "1" ]] || die "${FUNCTION_NAME} is not registered on ${APP_NAME}. The package
-       deployed but did not load; check the host's startup traces:
-         AppTraces | where AppRoleName == '${APP_NAME}' | where SeverityLevel >= 3"
-echo "    ${FUNCTION_NAME} registered"
+[[ "$REGISTERED" == "1" ]] || die "WebJob ${WEBJOB_NAME} is not registered on ${APP_NAME}. Check the
+       package layout (App_Data/jobs/triggered/${WEBJOB_NAME}/run.py) and the Kudu log:
+         az webapp log tail --resource-group ${RESOURCE_GROUP} --name ${APP_NAME}"
+echo "    ${WEBJOB_NAME} registered (schedule ${SCHEDULE} UTC)"
 
 if [[ "$GRAPH_AUTH_MODE" == "managed_identity" ]]; then
   echo "==> Granting Graph permissions to managed identity ${CLIENT_ID}"
@@ -508,22 +434,19 @@ elif [[ "$GRAPH_AUTH_MODE" == "federated_managed_identity" ]]; then
   echo "        with audience api://AzureADTokenExchange"
   echo
   echo "    None of that is verifiable from this login, because it lives in the"
-  echo "    other tenant. Run the function once before trusting the schedule."
+  echo "    other tenant. Run the WebJob once before trusting the schedule."
 else
   echo "==> Graph permissions are carried by app registration ${GRAPH_CLIENT_ID}"
   echo "    in tenant ${GRAPH_TENANT_ID}. Confirm it has admin consent for:"
   printf '      %s\n' "${REQUIRED_ROLES[@]}"
-  echo "    The managed identity ${CLIENT_ID} is used only to read Key Vault."
+  echo "    The managed identity ${CLIENT_ID} only publishes telemetry."
 fi
-
-APP_HOST=$(az functionapp show --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
-    --query defaultHostName --output tsv)
 
 cat <<SUMMARY
 
 Deployed.
 
-  Function app     ${APP_NAME} (${FUNCTION_NAME})
+  Web app          ${APP_NAME} (WebJob ${WEBJOB_NAME})
   Source           ${SOURCE_REVISION}
   ServiceNow       ${SNOW_INSTANCE} (${SNOW_WRITE_MODE})
   Dry run          ${DRY_RUN}$([[ "$DRY_RUN" == false ]] && echo "  -- LIVE: the next run commits to the CMDB")
@@ -533,16 +456,13 @@ Deployed.
   Resource group   ${RESOURCE_GROUP} (${LOCATION})
   Schedule         ${SCHEDULE} (NCRONTAB, UTC)
   Graph auth       ${GRAPH_AUTH_MODE}
-  Network          ${INTEGRATION_NAME} (integration), ${ENDPOINT_NAME} (endpoints), DNS ${PRIVATE_DNS_MODE}
   Intune tenant    ${GRAPH_TENANT_ID}
   Alerts           ${ALERT_EMAIL:-NONE - set ALERT_EMAIL to be told when runs stop}
 
-Verify the whole path end to end before trusting the schedule. A timer function
-is started by hand through the host's admin endpoint (returns 202 at once):
+Verify the whole path end to end before trusting the schedule:
 
-  curl -sS -X POST "https://${APP_HOST}/admin/functions/${FUNCTION_NAME}" \\
-    -H "x-functions-key: \$(az functionapp keys list -g ${RESOURCE_GROUP} -n ${APP_NAME} --query masterKey -o tsv)" \\
-    -H "Content-Type: application/json" -d '{}'
+  az webapp webjob triggered run -g ${RESOURCE_GROUP} -n ${APP_NAME} --webjob-name ${WEBJOB_NAME}
+  az webapp webjob triggered log -g ${RESOURCE_GROUP} -n ${APP_NAME} --webjob-name ${WEBJOB_NAME}
 
 Logs (allow a few minutes for ingestion):
 

@@ -29,10 +29,11 @@ dependencies = [
 aws = [
   "boto3>=1.34",
 ]
-# The Azure Functions host. deploy/azure/deploy.sh installs it into the zip
-# package; nothing in src/ imports it, so tests run without it.
-azure = [
-  "azure-functions>=1.20,<2",
+# The Azure App Service WebJob host: telemetry to Application Insights.
+# deploy/azure/deploy.sh installs it into the zip package. appservice_job.py
+# imports it lazily, only when APPLICATIONINSIGHTS_CONNECTION_STRING is set.
+appservice = [
+  "azure-monitor-opentelemetry>=1.6,<2",
 ]
 dev = [
   "pytest>=8.0",
@@ -40,6 +41,8 @@ dev = [
   "respx>=0.21",
   "ruff>=0.6",
   "mypy>=1.11",
+  # In-memory log exporter, to pin what the WebJob's telemetry sends.
+  "opentelemetry-sdk>=1.27",
 ]
 
 [project.scripts]

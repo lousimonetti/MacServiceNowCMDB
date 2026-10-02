@@ -1,25 +1,27 @@
-// Azure Functions app (Flex Consumption) that runs intune-cmdb-sync on a daily
-// timer.
+// Azure App Service app whose scheduled (triggered) WebJob runs
+// intune-cmdb-sync once a day.
 //
-// Why Functions and not Container Apps: the target subscription's landing-zone
-// policy allows Microsoft.Web (Functions, App Service) but not Container Apps or
-// Azure Container Registry. A Flex Consumption app is zip-deployed into a blob
-// container in this stack's own storage account, so there is no image and no
-// registry anywhere in the path.
+// Why App Service: the landing-zone policy denies Azure Container Registry and
+// Container Apps, and denies public network access to Key Vault and Storage.
+// Every Azure Functions app needs a storage account, so Functions would need
+// VNet integration and private endpoints that the landing zone's network has no
+// room for. A Linux App Service app needs no storage account of ours: code and
+// files live on its built-in persistent /home. Nothing here is a Key Vault or a
+// storage account, so neither policy applies, and the app needs no VNet.
 //
-// Cost shape (as of writing, list prices):
-//   Flex Consumption      on-demand executions get a monthly free grant of
-//                         100,000 GB-s and 250,000 executions per subscription.
-//                         A 5-minute daily run at 2 GB uses roughly 18,000 GB-s
-//                         per month, inside the grant.                    $0.00
-//   Application Insights  ingested into the Log Analytics workspace below;
-//   + Log Analytics       first 5 GB per month is free and this produces a few
-//                         MB.                                              $0.00
-//   Key Vault (standard)  ~$0.03 per 10,000 operations.                  ~$0.00
-//   Storage               deployment package, host leases, and a few hundred
-//                         KB of state on a Standard LRS file share.      ~$0.10
-//                                                                    -------------
-//                                                                 ~$0.10/month
+// The trade-off is secrets: the ServiceNow client secret (and the Graph secret
+// in client_secret mode) are app settings, not Key Vault references. App
+// settings are encrypted at rest, but anyone who can read the app's
+// configuration can read them. Prefer graphAuthMode=managed_identity where the
+// tenant allows it, so the ServiceNow secret is the only one.
+//
+// Cost shape (list prices, East US):
+//   App Service plan B1   Linux, 1 instance. Basic is the lowest tier with
+//                         "Always On", which scheduled WebJobs need.   ~$13.14
+//   Application Insights  workspace-based; a few MB a month, inside the 5 GB
+//   + Log Analytics       free allowance.                               $0.00
+//                                                                    ---------
+//                                                                 ~$13/month
 //
 // TWO TOPOLOGIES, set by `graphAuthMode`:
 //
@@ -32,9 +34,8 @@
 //                       subscription (default). A managed identity is
 //                       single-tenant and cannot be granted app roles in another
 //                       directory, so the app authenticates as an app
-//                       registration from the Intune tenant, with its secret held
-//                       in Key Vault. The managed identity is still used - to
-//                       read Key Vault, not to reach Graph.
+//                       registration from the Intune tenant, with its secret in
+//                       app settings.
 
 targetScope = 'resourceGroup'
 
@@ -45,29 +46,8 @@ targetScope = 'resourceGroup'
 @maxLength(18)
 param namePrefix string = 'intunecmdb'
 
-@description('Azure region. Defaults to the resource group location. Must be one Flex Consumption supports.')
+@description('Azure region. deploy.sh passes eastus.')
 param location string = resourceGroup().location
-
-@description('''
-Six-field NCRONTAB schedule (seconds first), in UTC. Default: 03:15:00 every day.
-Flex Consumption does not support WEBSITE_TIME_ZONE, so there is no local time.
-''')
-param schedule string = '0 15 3 * * *'
-
-@description('Python version of the Functions runtime. deploy.sh builds the package for this same version.')
-@allowed([
-  '3.11'
-  '3.12'
-])
-param pythonVersion string = '3.12'
-
-@description('Instance memory. The workload is IO-bound on two REST APIs; 2048 is ample.')
-@allowed([
-  512
-  2048
-  4096
-])
-param instanceMemoryMB int = 2048
 
 @description('''
 Email address for alerts. Leave empty to skip creating alert rules entirely.
@@ -76,8 +56,8 @@ Two rules are created when set:
   - no successful run in the last 24 hours
   - a run finished with device-level errors, or degraded
 
-The first matters more. A function that stops running is otherwise invisible:
-there is no failure to notice, just a CMDB that quietly goes stale.
+The first matters more. A job that stops running is otherwise invisible: there
+is no failure to notice, just a CMDB that quietly goes stale.
 ''')
 param alertEmail string = ''
 
@@ -87,18 +67,18 @@ param serviceNowInstance string
 @description('ServiceNow OAuth client ID (client_credentials grant).')
 param serviceNowClientId string
 
-@description('ServiceNow OAuth client secret. Stored in Key Vault, never in app settings.')
+@description('ServiceNow OAuth client secret. Becomes an app setting; see the header for why not Key Vault.')
 @secure()
 param serviceNowClientSecret string
 
-@description('Tenant of this subscription. Used for Key Vault, not for Graph.')
+@description('Tenant of this subscription. Compared with graphTenantId to report a cross-tenant setup.')
 param tenantId string = subscription().tenantId
 
 @description('''
 How the app authenticates to Microsoft Graph.
 
 'client_secret'              Works everywhere, including cross-tenant. A secret
-                             in Key Vault that someone has to rotate.
+                             in app settings that someone has to rotate.
 'managed_identity'           No secret at all, but only when Intune is in the
                              SAME tenant as this subscription -- a managed
                              identity cannot be granted app roles in another
@@ -125,7 +105,7 @@ param graphTenantId string = subscription().tenantId
 @description('App registration client ID from the Intune tenant. Required for client_secret mode.')
 param graphClientId string = ''
 
-@description('App registration client secret. Stored in Key Vault, never in app settings.')
+@description('App registration client secret. Becomes an app setting in client_secret mode only.')
 @secure()
 param graphClientSecret string = ''
 
@@ -158,76 +138,31 @@ MAPPING_OVERRIDES_JSON. Empty object = no overrides.
 ''')
 param mappingOverrides object = {}
 
-@description('Set false to skip the Azure Files share used for retirement state.')
-param enableStatePersistence bool = true
-
 @description('Retire CIs for devices that have disappeared from Intune.')
 param retireMissingDevices bool = false
 
 @description('Run without committing anything to the CMDB.')
 param dryRun bool = false
 
-// ---------------------------------------------------------------------------
-// Networking
-//
-// The landing zone denies public network access to Key Vault and Storage
-// (vpcx-lzn-kv-restrict-network-access, vpcx-lzn-strg-restrict-network-access),
-// so the function reaches both privately: VNet integration out of one subnet,
-// private endpoints for the vault and storage in another. Both subnets belong to
-// the landing zone's network and are inputs, not created here.
-// ---------------------------------------------------------------------------
-
-@description('''
-Resource ID of the Flex Consumption integration subnet. Must be delegated to
-Microsoft.App/environments, /27 or larger, have no underscore in its name, and
-hold no private or service endpoints. All of the app's outbound traffic leaves
-through it, so the landing zone must allow egress from it to Entra, Graph,
-ServiceNow and Application Insights.
-''')
-param integrationSubnetId string
-
-@description('Resource ID of the subnet the private endpoints for the vault and storage go in. Not the integration subnet.')
-param privateEndpointSubnetId string
-
-@description('''
-Who owns the privatelink DNS zones.
-'central'  the landing zone's hub owns them and a policy registers each private
-           endpoint. This template creates the endpoints only.
-'local'    this template creates the zones in this resource group, links them to
-           the endpoint subnet's VNet, and registers the endpoints itself.
-''')
-@allowed([
-  'central'
-  'local'
-])
-param privateDnsMode string = 'central'
-
-// Both of these authenticate without a Key Vault secret, so neither creates one.
 var useManagedIdentityForGraph = graphAuthMode == 'managed_identity'
 var useFederatedIdentityForGraph = graphAuthMode == 'federated_managed_identity'
-var graphNeedsSecret = graphAuthMode == 'client_secret'
 
 var suffix = uniqueString(resourceGroup().id)
 var identityName = '${namePrefix}-id'
-var keyVaultName = take('${namePrefix}kv${suffix}', 24)
-// Storage account names allow only lowercase letters and digits, unlike every
-// other resource here, so a hyphenated prefix would otherwise fail on this one.
-var storageSafePrefix = toLower(replace(replace(namePrefix, '-', ''), '_', ''))
-var storageName = take('${storageSafePrefix}st${suffix}', 24)
 var workspaceName = '${namePrefix}-logs'
 var appInsightsName = '${namePrefix}-ai'
 var planName = '${namePrefix}-plan'
-// Function app names are global (<name>.azurewebsites.net), so the prefix alone
-// would collide with any other tenant's intunecmdb. At most 32 characters.
-var functionAppName = '${namePrefix}-fn-${take(suffix, 8)}'
+// Web app names are global (<name>.azurewebsites.net), so the prefix alone
+// would collide with any other tenant's intunecmdb.
+var webAppName = '${namePrefix}-app-${take(suffix, 8)}'
 var actionGroupName = '${namePrefix}-alerts'
 var enableAlerts = !empty(alertEmail)
-var packageContainerName = 'app-package'
-var shareName = 'state'
-var stateMountPath = '/mounts/state'
+// /home is the app's built-in persistent storage: it survives restarts,
+// redeploys and instance moves, and is not a storage account of ours.
+var dataDir = '/home/data/intune-cmdb-sync'
 
 // A user-assigned identity, rather than system-assigned, so the Graph app-role
-// grant survives the function app being deleted and recreated.
+// grant survives the app being deleted and recreated.
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: identityName
   location: location
@@ -245,8 +180,8 @@ resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
 }
 
 // Workspace-based, so traces land in the workspace's AppTraces table, which is
-// what the alert rules query. Local (key) auth is off: the app publishes with its
-// managed identity.
+// what the alert rules query. Local (key) auth is off: the job publishes as the
+// managed identity (appservice_job.py).
 resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   name: appInsightsName
   location: location
@@ -258,130 +193,7 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   }
 }
 
-resource vault 'Microsoft.KeyVault/vaults@2023-07-01' = {
-  name: keyVaultName
-  location: location
-  properties: {
-    tenantId: tenantId
-    sku: { family: 'A', name: 'standard' }
-    enableRbacAuthorization: true
-    // vpcx-lzn-kv-enable-soft-delete-purge-retention-days-90. Purge protection
-    // cannot be turned off again, and a deleted vault's name stays reserved for
-    // the full 90 days.
-    enableSoftDelete: true
-    enablePurgeProtection: true
-    softDeleteRetentionInDays: 90
-    // vpcx-lzn-kv-restrict-network-access. The app reads secrets through the
-    // private endpoint below. Secrets written by this template are unaffected:
-    // ARM deploys them through the control plane, which the firewall does not
-    // cover.
-    networkAcls: {
-      defaultAction: 'Deny'
-      bypass: 'AzureServices'
-    }
-  }
-}
-
-resource serviceNowSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: vault
-  name: 'servicenow-client-secret'
-  properties: {
-    value: serviceNowClientSecret
-  }
-}
-
-resource graphSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' =
-  if (graphNeedsSecret) {
-    parent: vault
-    name: 'graph-client-secret'
-    properties: {
-      value: graphClientSecret
-    }
-  }
-
-// Built-in role IDs.
-var secretsUserRoleId = '4633458b-17de-408a-b874-0445c86b69e6' // Key Vault Secrets User
-var blobDataOwnerRoleId = 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b' // Storage Blob Data Owner
-var queueDataContributorRoleId = '974c5e8b-45b9-4653-ba55-5f855dd0fb88' // Storage Queue Data Contributor
-var tableDataContributorRoleId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3' // Storage Table Data Contributor
 var metricsPublisherRoleId = '3913510d-42f4-4e42-8a64-420c390055eb' // Monitoring Metrics Publisher
-
-resource vaultAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  scope: vault
-  name: guid(vault.id, identity.id, secretsUserRoleId)
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', secretsUserRoleId)
-    principalId: identity.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// One account per stack holds the deployment package, the Functions host's own
-// storage (timer schedule status and the singleton lease), and the state share.
-// It is always created: the host cannot run without it. Shared key access stays
-// enabled because an Azure Files mount on Functions authenticates only with the
-// account key; everything else here uses the managed identity.
-resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
-  name: storageName
-  location: location
-  sku: { name: 'Standard_LRS' }
-  kind: 'StorageV2'
-  properties: {
-    allowBlobPublicAccess: false
-    minimumTlsVersion: 'TLS1_2'
-    supportsHttpsTrafficOnly: true
-    // vpcx-lzn-strg-restrict-network-access. Host storage, the package and the
-    // state share are all reached through the private endpoints below.
-    networkAcls: {
-      defaultAction: 'Deny'
-      bypass: 'AzureServices'
-    }
-  }
-}
-
-resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
-  parent: storage
-  name: 'default'
-}
-
-resource packageContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
-  parent: blobService
-  name: packageContainerName
-  properties: {
-    publicAccess: 'None'
-  }
-}
-
-resource fileService 'Microsoft.Storage/storageAccounts/fileServices@2023-05-01' =
-  if (enableStatePersistence) {
-    parent: storage
-    name: 'default'
-  }
-
-resource share 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-05-01' =
-  if (enableStatePersistence) {
-    parent: fileService
-    name: shareName
-    properties: {
-      // The state file is a few hundred KB; this is the smallest quota allowed.
-      shareQuota: 1
-      enabledProtocols: 'SMB'
-    }
-  }
-
-// AzureWebJobsStorage over the managed identity needs blob (package, leases),
-// queue and table access; these are the roles Microsoft's Flex template grants.
-resource storageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
-  for roleId in [blobDataOwnerRoleId, queueDataContributorRoleId, tableDataContributorRoleId]: {
-    scope: storage
-    name: guid(storage.id, identity.id, roleId)
-    properties: {
-      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
-      principalId: identity.properties.principalId
-      principalType: 'ServicePrincipal'
-    }
-  }
-]
 
 resource appInsightsPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: appInsights
@@ -396,20 +208,20 @@ resource appInsightsPublisher 'Microsoft.Authorization/roleAssignments@2022-04-0
 resource plan 'Microsoft.Web/serverfarms@2024-04-01' = {
   name: planName
   location: location
-  kind: 'functionapp'
+  kind: 'linux'
   sku: {
-    tier: 'FlexConsumption'
-    name: 'FC1'
+    name: 'B1'
+    tier: 'Basic'
   }
   properties: {
-    reserved: true
+    reserved: true // Linux
   }
 }
 
-resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
-  name: functionAppName
+resource webApp 'Microsoft.Web/sites@2024-04-01' = {
+  name: webAppName
   location: location
-  kind: 'functionapp,linux'
+  kind: 'app,linux'
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -419,116 +231,33 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
   properties: {
     serverFarmId: plan.id
     httpsOnly: true
-    // Key Vault references in app settings resolve as this identity.
-    keyVaultReferenceIdentity: identity.id
-    // Flex Consumption routes all outbound traffic through this subnet.
-    virtualNetworkSubnetId: integrationSubnetId
     siteConfig: {
+      // The WebJob runs with the app's own Python; deploy.sh builds the
+      // package's wheels for this same version.
+      linuxFxVersion: 'PYTHON|3.12'
+      // Scheduled WebJobs stop firing when the app idles out without this.
+      alwaysOn: true
       minTlsVersion: '1.2'
-    }
-    functionAppConfig: {
-      deployment: {
-        storage: {
-          type: 'blobContainer'
-          value: '${storage.properties.primaryEndpoints.blob}${packageContainerName}'
-          authentication: {
-            type: 'UserAssignedIdentity'
-            userAssignedIdentityResourceId: identity.id
-          }
-        }
-      }
-      scaleAndConcurrency: {
-        // One instance, like the Lambda's reserved concurrency of 1: two runs
-        // at once would race on state.json. A timer trigger is also a singleton
-        // by default; this makes it structural.
-        maximumInstanceCount: 1
-        instanceMemoryMB: instanceMemoryMB
-      }
-      runtime: {
-        name: 'python'
-        version: pythonVersion
-      }
+      ftpsState: 'Disabled'
+      remoteDebuggingEnabled: false
+      http20Enabled: true
     }
   }
 }
 
-// One private endpoint per service the app reaches: the vault, and each storage
-// service it uses (blob: package and leases; queue and table: host; file: the
-// state mount).
-var storageEndpointGroups = concat(['blob', 'queue', 'table'], enableStatePersistence ? ['file'] : [])
-var privateEndpointTargets = concat(
-  [
-    { name: 'vault', serviceId: vault.id, groupId: 'vault', zone: 'privatelink.vaultcore.azure.net' }
-  ],
-  map(storageEndpointGroups, group => {
-    name: group
-    serviceId: storage.id
-    groupId: group
-    zone: 'privatelink.${group}.${environment().suffixes.storage}'
-  })
-)
-var useLocalDns = privateDnsMode == 'local'
-var endpointVnetId = split(privateEndpointSubnetId, '/subnets/')[0]
+// No FTP and no basic-auth deploys. deploy.sh deploys with the caller's Entra
+// token through `az webapp deploy`.
+resource ftpPublishing 'Microsoft.Web/sites/basicPublishingCredentialsPolicies@2024-04-01' = {
+  parent: webApp
+  name: 'ftp'
+  properties: { allow: false }
+}
 
-resource privateEndpoints 'Microsoft.Network/privateEndpoints@2023-11-01' = [
-  for target in privateEndpointTargets: {
-    name: '${namePrefix}-pe-${target.name}'
-    location: location
-    properties: {
-      subnet: { id: privateEndpointSubnetId }
-      privateLinkServiceConnections: [
-        {
-          name: target.name
-          properties: {
-            privateLinkServiceId: target.serviceId
-            groupIds: [ target.groupId ]
-          }
-        }
-      ]
-    }
-  }
-]
-
-// 'local' DNS only. Zones are per resource group, not per stack, so a second
-// stack in the same group reuses them; the link is named after the VNet for the
-// same reason.
-resource dnsZones 'Microsoft.Network/privateDnsZones@2020-06-01' = [
-  for target in privateEndpointTargets: if (useLocalDns) {
-    name: target.zone
-    location: 'global'
-  }
-]
-
-resource dnsLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2020-06-01' = [
-  for (target, i) in privateEndpointTargets: if (useLocalDns) {
-    parent: dnsZones[i]
-    name: take('link-${last(split(endpointVnetId, '/'))}', 80)
-    location: 'global'
-    properties: {
-      registrationEnabled: false
-      virtualNetwork: { id: endpointVnetId }
-    }
-  }
-]
-
-resource dnsZoneGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = [
-  for (target, i) in privateEndpointTargets: if (useLocalDns) {
-    parent: privateEndpoints[i]
-    name: 'default'
-    properties: {
-      privateDnsZoneConfigs: [
-        {
-          name: replace(target.zone, '.', '-')
-          properties: { privateDnsZoneId: dnsZones[i].id }
-        }
-      ]
-    }
-  }
-]
-
-// Key Vault reference syntax. The versionless URI follows rotations; the
-// platform re-reads it within 24 hours or on restart.
-var snowSecretRef = '@Microsoft.KeyVault(SecretUri=${serviceNowSecret.properties.secretUri})'
+resource scmPublishing 'Microsoft.Web/sites/basicPublishingCredentialsPolicies@2024-04-01' = {
+  parent: webApp
+  name: 'scm'
+  properties: { allow: false }
+}
 
 // GRAPH_TENANT_ID is the Intune tenant, which is not necessarily this
 // subscription's tenant.
@@ -546,9 +275,7 @@ var graphEnvManagedIdentity = {
 var graphEnvClientSecret = {
   GRAPH_AUTH_MODE: 'client_secret'
   GRAPH_CLIENT_ID: graphClientId
-  GRAPH_CLIENT_SECRET: graphNeedsSecret
-    ? '@Microsoft.KeyVault(SecretUri=${graphSecret!.properties.secretUri})'
-    : ''
+  GRAPH_CLIENT_SECRET: graphClientSecret
 }
 
 // GRAPH_CLIENT_ID is the multi-tenant APP's client ID; the identity that signs
@@ -564,23 +291,31 @@ var graphEnv = useManagedIdentityForGraph
   ? graphEnvManagedIdentity
   : (useFederatedIdentityForGraph ? graphEnvFederatedIdentity : graphEnvClientSecret)
 
-// The Functions host itself: its storage and its telemetry, both over the
-// managed identity.
+// The host itself: where code and data live, how the WebJob runs, and where
+// its telemetry goes.
 var hostEnv = {
-  AzureWebJobsStorage__accountName: storage.name
-  AzureWebJobsStorage__credential: 'managedidentity'
-  AzureWebJobsStorage__clientId: identity.properties.clientId
+  // The package ships its own Linux wheels; no build on deploy.
+  SCM_DO_BUILD_DURING_DEPLOYMENT: 'false'
+  // Keep /home persistent (the default for code apps; explicit because state
+  // and the run report depend on it).
+  WEBSITES_ENABLE_APP_SERVICE_STORAGE: 'true'
+  // Linux WebJobs run through the Kudu agent.
+  WEBSITE_SKIP_RUNNING_KUDUAGENT: 'false'
+  // A triggered WebJob is killed after this many seconds without output or CPU
+  // (default 120). A sync spends long stretches waiting on two REST APIs.
+  WEBJOBS_IDLE_TIMEOUT: '1800'
   APPLICATIONINSIGHTS_CONNECTION_STRING: appInsights.properties.ConnectionString
-  APPLICATIONINSIGHTS_AUTHENTICATION_STRING: 'ClientId=${identity.properties.clientId};Authorization=AAD'
-  // Read by function_app.py's timer trigger as %SYNC_SCHEDULE%.
-  SYNC_SCHEDULE: schedule
+  // The identity that publishes telemetry (local auth is off).
+  AZURE_CLIENT_ID: identity.properties.clientId
+  // Becomes AppRoleName on every trace, which the alert rules filter on.
+  OTEL_SERVICE_NAME: webAppName
 }
 
 var baseEnv = {
   SNOW_INSTANCE: serviceNowInstance
   SNOW_AUTH_MODE: 'oauth_client_credentials'
   SNOW_CLIENT_ID: serviceNowClientId
-  SNOW_CLIENT_SECRET: snowSecretRef
+  SNOW_CLIENT_SECRET: serviceNowClientSecret
   SNOW_WRITE_MODE: writeMode
   SNOW_DISCOVERY_SOURCE: discoverySource
   SNOW_RETIRE_MISSING: string(retireMissingDevices)
@@ -589,6 +324,10 @@ var baseEnv = {
   FAIL_ON_ERROR: 'true'
   LOG_FORMAT: 'json'
   LOG_LEVEL: 'INFO'
+  // Retirement state and the per-device run report, both on /home.
+  STATE_PATH: '${dataDir}/state.json'
+  RUN_REPORT_PATH: '${dataDir}/run-report.json'
+  RUN_REPORT_DEVICES: 'true'
 }
 
 // Omitted rather than set empty, so the connector's own defaults apply.
@@ -597,55 +336,18 @@ var mappingEnv = union(
   empty(mappingOverrides) ? {} : { MAPPING_OVERRIDES_JSON: string(mappingOverrides) }
 )
 
-// The run report is the only per-device record of what happened. It lands on
-// the same persistent share as the state file so it outlives the instance.
-var stateEnv = enableStatePersistence
-  ? {
-      STATE_PATH: '${stateMountPath}/state.json'
-      RUN_REPORT_PATH: '${stateMountPath}/run-report.json'
-      RUN_REPORT_DEVICES: 'true'
-    }
-  : {}
-
 // The complete settings list. Deploying 'appsettings' replaces every setting, so
-// a change made in the portal or with `az functionapp config appsettings set`
-// lasts only until the next deploy.sh.
+// a change made in the portal or with `az webapp config appsettings set` lasts
+// only until the next deploy.sh.
 resource appSettings 'Microsoft.Web/sites/config@2024-04-01' = {
-  parent: functionApp
+  parent: webApp
   name: 'appsettings'
-  properties: union(hostEnv, graphEnvCommon, graphEnv, baseEnv, mappingEnv, stateEnv)
+  properties: union(hostEnv, graphEnvCommon, graphEnv, baseEnv, mappingEnv)
   dependsOn: [
-    // Key Vault references and identity-based host storage both fail to
-    // resolve until the identity holds its roles.
-    vaultAccess
-    storageRoles
+    // Telemetry is refused until the identity holds its role.
     appInsightsPublisher
-    // Both are reachable only through the private endpoints now; settings that
-    // land first resolve against nothing.
-    privateEndpoints
-    dnsZoneGroups
   ]
 }
-
-resource stateMount 'Microsoft.Web/sites/config@2024-04-01' =
-  if (enableStatePersistence) {
-    parent: functionApp
-    name: 'azurestorageaccounts'
-    properties: {
-      state: {
-        type: 'AzureFiles'
-        accountName: storage.name
-        shareName: shareName
-        mountPath: stateMountPath
-        accessKey: storage.listKeys().keys[0].value
-      }
-    }
-    dependsOn: [
-      share
-      privateEndpoints
-      dnsZoneGroups
-    ]
-  }
 
 // ---------------------------------------------------------------------------
 // Alerting
@@ -676,7 +378,7 @@ resource noRunAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' 
     name: '${namePrefix}-no-successful-run'
     location: location
     properties: {
-      displayName: '${functionAppName}: no successful run in 24 hours'
+      displayName: '${webAppName}: no successful run in 24 hours'
       description: '''
 The function has not logged a completed run in the last 24 hours. Either the schedule
 stopped firing, or every attempt failed before finishing. The CMDB is going
@@ -704,7 +406,7 @@ AppTraces
 | extend p = parse_json(Message)
 | where tostring(p.msg) == 'run complete'
 | summarize completed = count()
-''', functionAppName)
+''', webAppName)
             timeAggregation: 'Total'
             metricMeasureColumn: 'completed'
             operator: 'LessThan'
@@ -728,13 +430,13 @@ resource deviceErrorAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pre
     name: '${namePrefix}-device-errors'
     location: location
     properties: {
-      displayName: '${functionAppName}: run completed with device errors or degraded'
+      displayName: '${webAppName}: run completed with device errors or degraded'
       description: '''
 A run finished but individual devices failed to write, or it finished degraded:
 the mass-retirement guard tripped or the state file could not be saved, either
-of which leaves the next run unable to reason about the fleet. Read
-run-report.json on the state share; the summary line carries error_samples and
-the degraded conditions.
+of which leaves the next run unable to reason about the fleet. The summary
+line carries error_samples and the degraded conditions; run-report.json in
+/home/data/intune-cmdb-sync has the per-device detail.
 '''
       severity: 2
       enabled: true
@@ -752,7 +454,7 @@ AppTraces
 | extend failed = toint(p.errors), degraded = array_length(p.degraded)
 | where failed > 0 or degraded > 0
 | summarize problems = count()
-''', functionAppName)
+''', webAppName)
             timeAggregation: 'Total'
             metricMeasureColumn: 'problems'
             operator: 'GreaterThan'
@@ -775,8 +477,8 @@ output alertsEnabled bool = enableAlerts
 
 @description('''
 Client ID of the managed identity. In managed_identity mode this is the identity
-that must hold the Graph application permissions. In client_secret mode it reads
-Key Vault and host storage, and publishes telemetry.
+that must hold the Graph application permissions. It always publishes the
+job's telemetry.
 ''')
 output managedIdentityClientId string = identity.properties.clientId
 
@@ -789,7 +491,5 @@ output graphAuthMode string = graphAuthMode
 @description('True when Intune and this subscription are in different tenants.')
 output crossTenant bool = graphTenantId != tenantId
 
-output functionAppName string = functionApp.name
+output webAppName string = webApp.name
 output resourceGroupName string = resourceGroup().name
-output keyVaultName string = vault.name
-output storageAccountName string = storage.name

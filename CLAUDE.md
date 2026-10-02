@@ -55,45 +55,67 @@ behaviour change, particularly anything altering what gets written to a CI.
 - **Multiple ServiceNow environments = one Azure stack per `NAME_PREFIX`.**
   DEV and PROD run from one resource group by running `deploy.sh` once per
   instance with a distinct prefix. Every resource name derives from the prefix,
-  so each environment gets its own Key Vault, identity, function app and storage
-  account.
-  The separate storage account is load-bearing: `state.json` holds
-  instance-specific `sys_id`s, and a shared one would drive PROD retirement from
-  DEV IDs. Do not consolidate stacks onto shared storage. `storageName` strips
-  hyphens because storage account names allow none. See `deploy/azure/README.md`.
+  so each environment gets its own identity, App Service plan and app. The
+  separate app is load-bearing: `state.json` lives on that app's `/home` and
+  holds instance-specific `sys_id`s, and a shared one would drive PROD
+  retirement from DEV IDs. Do not point two environments at one app or one state
+  path. See `deploy/azure/README.md`.
 - **Resource groups are pre-provisioned; `deploy.sh` never creates or deletes
   one.** DEV deploys into the existing `azc-obm-development`. `RESOURCE_GROUP`
   has no default: when unset, `deploy.sh` lists the subscription's groups and
   asks the user to pick one, and a non-interactive run fails instead of
   prompting. The script fails if the group is missing. Resources go to
   **East US** (`LOCATION` defaults to `eastus`) by requirement, regardless of
-  the group's region; Flex Consumption is checked against it before anything is
-  created. Teardown is by prefix, never `az group delete`:
+  the group's region. Teardown is by prefix, never `az group delete`:
   the group may hold other teams' resources.
 
-- **Azure runs on Functions (Flex Consumption), zip-deployed, no image.**
-  The landing-zone policy denies Azure Container Registry and Container Apps,
-  and approved `Microsoft.Web` on 2026-10-02, so `deploy/azure/` is a
-  timer-triggered function app. `deploy.sh` builds the zip locally (the wheel,
-  plus Linux x86_64 wheels fetched with `pip --platform`) and deploys it with
-  `config-zip --build-remote false` into a blob container in the stack's own
-  storage account. Do not reintroduce a registry or a remote build. The timer
-  reads `%SYNC_SCHEDULE%` (six-field NCRONTAB, UTC; Flex has no time zones);
-  `maximumInstanceCount: 1` keeps two runs off `state.json`. State stays on an
-  Azure Files mount (`/mounts/state`), which on Functions authenticates only by
-  account key, so the storage account keeps shared-key access on. `deploy.sh`
-  fails if the function did not register after the zip deploy, since a package
-  that cannot import otherwise never runs and never errors. The root
-  `Dockerfile` now serves only AWS ECS and generic container hosts.
-- **On Functions, the worker's root log handler is the only route to
-  Application Insights.** `configure_logging` normally replaces root handlers
-  with a stdout one; `azure_function.run()` calls `adopt_host_handlers()` first
-  so the worker's handler is kept and given the JSON formatter. The worker sends
-  `handler.format(record)` as the trace `Message`, which is what the alert
-  queries `parse_json`. `host.json` turns sampling off, or a sampled-out
-  `run complete` line fires the absence alert. `run()` raises on a non-zero exit
-  (timer triggers have no retry here, so this cannot rerun a sync) and resets
-  `run_id` per invocation, as `aws_lambda.handler` now also does.
+- **Azure runs on App Service as a scheduled WebJob — because of the landing
+  zone, not by preference.** ACR and Container Apps are denied, and Key Vault
+  and Storage must deny public access (see Constraints). **Every Azure Functions
+  app needs a storage account**, so Functions forced VNet integration plus
+  private endpoints, and the landing zone's VNet (`vpcx-vnet-eastus`,
+  `10.52.46.0/26`, in `VPCXRG`) had no room for the /27 Flex needs. That
+  version is kept on branch `azure-functions-vnet`. A Linux App Service app
+  needs no storage account of ours: code, `state.json` and the run report live
+  on its persistent `/home` (`/home/data/intune-cmdb-sync/`). So there is no
+  Key Vault, no storage account, and no VNet. Do not add either resource back
+  without accepting the networking that comes with it.
+  - `deploy.sh` builds the zip locally (wheel + Linux x86_64 wheels via
+    `pip --platform`, into `packages/`) with the job at
+    `App_Data/jobs/triggered/intune-cmdb-sync/{run.py,settings.job}`, then runs
+    `az webapp deploy`. No registry, no remote build
+    (`SCM_DO_BUILD_DURING_DEPLOYMENT=false`).
+  - `settings.job` holds the six-field NCRONTAB schedule (written from
+    `SCHEDULE`) and `is_singleton: true`.
+  - `run.py` uses an absolute path to `packages/`, because Kudu copies a
+    triggered job to a temp dir before running it.
+  - Basic B1 because scheduled WebJobs need Always On (~$13/month).
+  - `WEBJOBS_IDLE_TIMEOUT=1800`: a triggered job is killed after 2 quiet
+    minutes otherwise.
+  - `deploy.sh` fails if `az webapp webjob triggered list` does not show the
+    job.
+- **Secrets are app settings, deliberately.** With no Key Vault, the ServiceNow
+  secret (and the Graph secret in `client_secret` mode) are plain app settings,
+  readable by anyone with config read on the app. Prefer
+  `GRAPH_AUTH_MODE=managed_identity` where the tenant allows it.
+- **On App Service, an OpenTelemetry handler is the only route to Application
+  Insights.** WebJob stdout reaches only the job's history.
+  `appservice_job.run()` calls `configure_azure_monitor` (as the identity, via
+  `AZURE_CLIENT_ID`; App Insights has local auth off), adds a stdout handler,
+  then `adopt_host_handlers()` so `configure_logging` keeps both and gives them
+  the JSON formatter. The handler sends `handler.format(record)` as the trace
+  body, which is what the alert queries `parse_json(Message)`. This is pinned by
+  `tests/test_appservice_job.py` with the in-memory exporter.
+  - The handler also copies `extra=` fields into attributes without the
+    formatter, so `_RedactFilter` masks secret-looking fields on the record
+    itself.
+  - `run()` flushes and shuts down the logger provider before returning, or the
+    process exit drops `run complete` and the absence alert fires.
+  - `OTEL_SERVICE_NAME` = the app name becomes `AppRoleName`, which both alerts
+    filter on.
+  - Per-request instrumentation (httpx, requests, azure_sdk, ...) is disabled:
+    logs only.
+  - `run_id` is reset per run here and in `aws_lambda.handler`.
 
 - **`deploy.sh` has no `DRY_RUN` default and accepts only `true` / `false`.**
   A default of `false` turned any redeploy that forgot `DRY_RUN=true` live.
@@ -147,11 +169,12 @@ behaviour change, particularly anything altering what gets written to a CI.
   - **Probably allowed, still load-bearing: `Microsoft.Insights/components`**
     (Application Insights). The 2026-10-02 preflight, which reports every
     refusal at once, refused only the vault and storage account. Without it the
-    function's logs reach nothing and both alerts are blind; if it is ever
-    refused, request it, and do not drop telemetry to get a deploy through.
-  - **Not yet confirmed: `Microsoft.Network/privateEndpoints`** (and
-    `privateDnsZones` in `local` DNS mode), which the vault and storage
-    firewall policies made necessary.
+    job's logs reach nothing and both alerts are blind; if it is ever refused,
+    request it, and do not drop telemetry to get a deploy through.
+  - **App Service's own policies are not yet known.** The template already sets
+    HTTPS-only, TLS 1.2, FTP off, remote debugging off and basic-auth publishing
+    off. A policy demanding App Service VNet integration or private inbound
+    access would bring networking back; the first preflight will show it.
 
 - **The deploying machine is behind Zscaler TLS inspection.** `az` and `pip`
   trust only certifi's public roots, so they fail with
@@ -167,24 +190,14 @@ behaviour change, particularly anything altering what gets written to a CI.
   (`AZURE_CLI_DISABLE_CONNECTION_VERIFICATION`, `--trusted-host`).
 
 - **The landing zone also denies public access to Key Vault and Storage.** The
-  first real deploy (2026-10-02) was refused in preflight by
+  first real Functions deploy (2026-10-02) was refused in preflight by
   `vpcx-lzn-kv-restrict-network-access`, `vpcx-lzn-strg-restrict-network-access`
   (both test `networkAcls.defaultAction != Deny`) and
   `vpcx-lzn-kv-enable-soft-delete-purge-retention-days-90` (purge protection,
-  90 days). Nothing else in the template was refused, so Application Insights
-  and `Microsoft.Web` very likely pass. The consequence is structural: the app
-  reaches the vault and storage only through private endpoints (`vault`,
-  `blob`, `queue`, `table`, `file`), and Flex VNet integration needs a
-  dedicated subnet delegated to `Microsoft.App/environments`, at least /27, with
-  no `_` in its name and no other endpoints. Both subnets are inputs
-  (`INTEGRATION_SUBNET_ID`, `PRIVATE_ENDPOINT_SUBNET_ID`), never created, and
-  `deploy.sh` validates them before building. Flex routes **all** outbound
-  traffic through the integration subnet, so Graph, Entra, ServiceNow and
-  Application Insights egress depends on the landing zone's firewall. Laptops
-  lose data-plane access: rotate secrets by redeploying (ARM writes them through
-  the control plane), and the share's `run-report.json` is unreadable from
-  outside. Private endpoints make Azure ~$37/month per environment, not ~$0.10.
-  Purge protection is irreversible and holds a deleted vault's name 90 days.
+  90 days). Nothing else was refused. Meeting them needs VNet integration and
+  private endpoints, which is why Azure moved to App Service with neither
+  resource (see Architecture notes). If a Key Vault or storage account is ever
+  added back, all three policies apply to it.
 
 - **`SNOW_CLASS_MAP` replaces the built-in default, it does not extend it.**
   `_env_kv_map` returns the parsed value or the default, never a merge, so a map
@@ -235,7 +248,7 @@ behaviour change, particularly anything altering what gets written to a CI.
   `GRAPH_ASSERTION_IDENTITY_CLIENT_ID` is the *identity*. Do not conflate them —
   the resulting AADSTS error names neither.
 - **`workload_identity` is not that mode.** It needs a projected federated token
-  file, which AKS and GitHub Actions provide and Azure Functions does not, which
+  file, which AKS and GitHub Actions provide and App Service does not, which
   is why `main.bicep` deliberately does not offer it.
 - **The federated credential can only be created after the first deploy.**
   `main.bicep` creates the user-assigned managed identity at deploy time, so
@@ -310,17 +323,19 @@ Green tests are weaker evidence here than they look.
 
 ## Next steps
 
-0. **First Azure Functions deploy (written 2026-10-02, never deployed).** The
-   stack in `deploy/azure/` replaced Container Apps the day `Microsoft.Web` was
-   approved. Nothing about it has run in Azure yet; green tests and a clean
-   `az bicep build` are all that back it. Things the first deploy must confirm:
-   the two subnets and private DNS (see Constraints; the platform-team asks are
-   in the Azure README's *Networking*); that the region supports Flex
-   Consumption; that the zip deploy registers
-   `intune_cmdb_sync` (deploy.sh checks); that `AppTraces` carries the JSON line
-   under `AppRoleName` = the app name (the alert queries assume both); and that
-   `state.json` is writable on the `/mounts/state` share. Follow
-   `deploy/azure/README.md` stages 3-5 with `DRY_RUN=true`.
+0. **First App Service deploy (written 2026-10-02, never deployed).** The
+   stack in `deploy/azure/` is an App Service app plus a scheduled WebJob,
+   chosen after Functions turned out to need private networking (see
+   Architecture notes). Nothing about it has run in Azure yet. Green tests, a
+   clean `az bicep build`, a stub-`az` run of `deploy.sh` and a local `run.py`
+   exit-2 check are all that back it. The first deploy must confirm:
+   - no App Service policy refuses the template
+   - `az webapp deploy` works with basic auth off
+   - the WebJob registers and fires on schedule with Always On
+   - `AppTraces` carries the JSON line under `AppRoleName` = the app name
+   - `state.json` persists on `/home`
+
+   Follow `deploy/azure/README.md` stages 3-5 with `DRY_RUN=true`.
 1. **Done on dpsnowdev (2026-09-25): the OAuth client is authorized for the IRE
    API.** `--check-api` shows every endpoint allowed. PROD's OAuth client will
    need the same REST API Auth Scope, so re-run the probe there before its first

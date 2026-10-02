@@ -87,10 +87,11 @@ jobs:
             exit 1
           fi
 
-  azure-function-package:
-    # Builds the zip exactly as deploy/azure/deploy.sh does, then imports it on
-    # Linux with the runtime's Python. A package that deploys but cannot import
-    # registers no function, so nothing runs and nothing errors.
+  azure-webjob-package:
+    # Builds the WebJob package exactly as deploy/azure/deploy.sh does, lays it
+    # out as App Service does under /home/site/wwwroot, and runs run.py with no
+    # configuration. It must exit 2 (invalid config): that proves the Linux
+    # wheels import with the app's Python and the job reaches main().
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -101,32 +102,34 @@ jobs:
 
       - name: Build the package
         run: |
-          mkdir -p build/package
-          cp deploy/azure/functions/function_app.py deploy/azure/functions/host.json build/package/
+          root="$RUNNER_TEMP/home/site/wwwroot"
+          mkdir -p "$root/App_Data/jobs/triggered/intune-cmdb-sync"
+          cp deploy/azure/webjob/run.py "$root/App_Data/jobs/triggered/intune-cmdb-sync/"
           python -m pip wheel --quiet --no-deps --wheel-dir build/wheel .
           wheel=$(ls build/wheel/intune_cmdb_sync-*.whl)
           python -m pip install --quiet \
-            --target build/package/.python_packages/lib/site-packages \
+            --target "$root/packages" \
             --platform manylinux_2_28_x86_64 --platform manylinux2014_x86_64 \
             --implementation cp --python-version 3.12 --only-binary=:all: \
-            "${wheel}[azure]"
+            "${wheel}[appservice]"
 
-      - name: Import it and check the timer binding
-        working-directory: build/package
+      - name: Run the WebJob entry point
         run: |
-          python - <<'EOF'
-          import sys
-          sys.path.insert(0, ".python_packages/lib/site-packages")
-          import cryptography.hazmat.bindings._rust  # compiled; proves the platform is right
-          import function_app
-          functions = function_app.app.get_functions()
-          assert [f.get_function_name() for f in functions] == ["intune_cmdb_sync"], functions
-          binding = functions[0].get_bindings()[0].get_dict_repr()
-          assert binding["type"] == "timerTrigger", binding
-          assert binding["schedule"] == "%SYNC_SCHEDULE%", binding
-          assert binding["runOnStartup"] is False, binding
-          print("ok", binding)
-          EOF
+          # Run from a copy, as Kudu does, so a path relative to run.py fails here.
+          job="$RUNNER_TEMP/kudu-copy"
+          cp -r "$RUNNER_TEMP/home/site/wwwroot/App_Data/jobs/triggered/intune-cmdb-sync" "$job"
+          set +e
+          HOME="$RUNNER_TEMP/home" LOG_FORMAT=text python -I "$job/run.py"
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            echo "expected exit code 2 for missing configuration, got $code" >&2
+            exit 1
+          fi
+          HOME="$RUNNER_TEMP/home" python -I -c "
+          import sys; sys.path.insert(0, '$RUNNER_TEMP/home/site/wwwroot/packages')
+          import cryptography.hazmat.bindings._rust, azure.monitor.opentelemetry
+          print('linux wheels and telemetry import ok')"
 
   infra:
     runs-on: ubuntu-latest

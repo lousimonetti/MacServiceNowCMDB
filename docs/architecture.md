@@ -120,8 +120,9 @@ Graph v1.0 exposes no delta query for `managedDevices`. Rather than simulate one
 with timestamp filtering — which silently misses devices whose properties change
 without a check-in — every run reads the full inventory.
 
-A daily full pass over even a large tenant is a few minutes of compute that
-sits inside the free grant. Correctness is worth more than the saving.
+A daily full pass over even a large tenant is a few minutes of compute on a
+host that is paid for whether it runs or not. Correctness is worth more than
+the saving.
 
 ### 4.3 Plain REST for Graph data, SDK for auth
 
@@ -207,14 +208,16 @@ a non-zero exit rather than scrolling past in a log. See `RunReport.degraded`.
 
 ## 7. Deployment topologies
 
-Both run the same `main()` on a schedule. Pick on credential model, not cost —
-both are well under a dollar a month.
+Both run the same `main()` on a schedule. Pick on credential model, not cost.
 
-**Azure Functions, Flex Consumption** (`deploy/azure/`) — a timer-triggered
-Python function, zip-deployed with no container registry (the landing-zone
-policy denies registries and Container Apps). Key Vault references for secrets,
-resolved by a user-assigned managed identity; an Azure Files mount for state;
-Application Insights over Log Analytics for output.
+**Azure App Service, scheduled WebJob** (`deploy/azure/`) — a triggered WebJob
+on a Linux B1 plan, zip-deployed with no container registry. The landing-zone
+policies shaped it: registries and Container Apps are denied, and Key Vault and
+Storage must deny public access. Every Functions app needs a storage account,
+so Functions would have required VNet integration and private endpoints. An App
+Service app needs neither: state lives on its persistent `/home`, secrets are
+app settings, and output goes to Application Insights over Log Analytics
+through OpenTelemetry, as a user-assigned managed identity.
 
 **AWS Lambda** (`deploy/aws/`) — container-image Lambda on an EventBridge
 schedule, SSM Parameter Store for secrets, S3 for state, deliberately outside a
@@ -240,7 +243,7 @@ implemented and supported by `main.bicep`, but the two-tenant setup it depends
 on cannot be automated from one login. See [entra-setup.md](entra-setup.md).
 
 `workload_identity` exists for AKS and GitHub Actions OIDC, which project a
-federated token file. Azure Functions does not, so `deploy/azure` deliberately
+federated token file. App Service does not, so `deploy/azure` deliberately
 does not offer it.
 
 ---

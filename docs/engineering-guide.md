@@ -156,7 +156,7 @@ enough that the percentage guard is not a reliable backstop. The limit path
 short-circuits retirement outright rather than relying on it.
 
 **`workload_identity` is not the cross-tenant answer.** It needs a projected
-federated token file, which AKS and GitHub Actions provide and Azure Functions
+federated token file, which AKS and GitHub Actions provide and App Service
 does not. For secretless cross-tenant use `federated_managed_identity`, which
 signs a client assertion with a managed identity.
 

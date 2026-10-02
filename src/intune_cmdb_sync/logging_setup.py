@@ -93,16 +93,36 @@ _host_handlers: tuple[logging.Handler, ...] = ()
 _run_id_filter = _RunIdFilter()
 
 
+class _RedactFilter(logging.Filter):
+    """Masks secret-looking `extra=` fields on the record itself.
+
+    JsonFormatter and TextFormatter redact when they render, but an OpenTelemetry
+    handler also copies every extra field into the telemetry's attributes
+    without going through the formatter. Masking the record covers both.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        for key, value in list(record.__dict__.items()):
+            if key not in _RESERVED:
+                masked = _redact(key, value)
+                if masked is not value:
+                    record.__dict__[key] = masked
+        return True
+
+
+_redact_filter = _RedactFilter()
+
+
 def adopt_host_handlers() -> None:
     """Keep the root handlers already installed, instead of replacing them.
 
-    The Azure Functions Python worker attaches a handler to the root logger, and
-    it is the only path a log record has to Application Insights; stdout goes
-    nowhere that the alert rules can see. Replacing it, as configure_logging
-    does everywhere else, would leave the function running with no logs and both
-    alerts blind. The worker sends `handler.format(record)` as the trace message,
-    so giving that handler the JSON formatter keeps the one-line summary the
-    alerts parse.
+    On Azure App Service the WebJob entry point (appservice_job.py) installs an
+    OpenTelemetry handler on the root logger, and it is the only path a log
+    record has to Application Insights. Replacing it, as configure_logging does
+    everywhere else, would leave the job running with no telemetry and both
+    alerts blind. That handler sends `handler.format(record)` as the trace
+    message when a formatter is set, so giving it the JSON formatter keeps the
+    one-line summary the alerts parse.
 
     Idempotent, and a no-op once captured: later calls would otherwise capture
     the stdout handler a previous configure_logging installed.
@@ -126,6 +146,7 @@ def configure_logging(level: str = "INFO", fmt: str = "json") -> None:
         # One shared instance, so a warm host calling this every run does not
         # stack a filter per invocation.
         handler.addFilter(_run_id_filter)
+        handler.addFilter(_redact_filter)
 
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
 
