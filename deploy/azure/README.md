@@ -69,6 +69,11 @@ downloads those wheels from PyPI on **your machine**. Nothing at runtime
 reaches outside Azure for code; the package is served from the stack's own
 storage account.
 
+**Behind Zscaler or another TLS-inspecting proxy?** `az` and `pip` fail with
+`SSL: CERTIFICATE_VERIFY_FAILED` until they trust the proxy's root. Set
+`CA_BUNDLE=macos-keychain` when running `deploy.sh`. See
+[Behind a TLS-inspecting proxy](#behind-a-tls-inspecting-proxy-zscaler).
+
 **Check the subscription before anything else.** `deploy.sh` deploys into
 whichever subscription `az` currently points at:
 
@@ -227,6 +232,7 @@ reuses exactly the values you tested. Keep it out of git.
 NAME_PREFIX=intunecmdb-dev
 RESOURCE_GROUP=azc-obm-development     # pre-existing, never created; omit to pick from a list
 # LOCATION is not set: resources go to East US (eastus) by default
+CA_BUNDLE=macos-keychain               # behind Zscaler; see "Behind a TLS-inspecting proxy"
 SNOW_INSTANCE=acmedev
 SNOW_CLIENT_ID=<from the Application Registry entry>
 SNOW_WRITE_MODE=identify_reconcile     # the mode --check-api allowed
@@ -631,6 +637,71 @@ next deploy.
   reports it. Put the expiry dates in a calendar.
 - **Rotating the storage account key breaks the state mount** until the next
   `deploy.sh`, which re-reads the key. Redeploy straight after a rotation.
+
+## Behind a TLS-inspecting proxy (Zscaler)
+
+Zscaler decrypts and re-signs HTTPS with its own root certificate. macOS trusts
+that root because Zscaler Client Connector installs it in the System keychain,
+but `az` and `pip` do not read the keychain. They ship their own list of public
+roots (certifi), so every request fails with
+`SSL: CERTIFICATE_VERIFY_FAILED`. The first one to fail is usually
+`az`'s Bicep version check:
+`Error while attempting to retrieve the latest Bicep version ... aka.ms`.
+
+**For `deploy.sh`:**
+
+```bash
+CA_BUNDLE=macos-keychain ./deploy.sh         # roots from the System keychain
+CA_BUNDLE=/path/to/zscaler-root.pem ./deploy.sh   # or a PEM file from IT
+```
+
+Put `CA_BUNDLE=macos-keychain` in your environment file to make it permanent.
+For that run only, the script builds one bundle of the public roots **plus**
+the extra ones and points `az`, `pip` and Python at it through
+`REQUESTS_CA_BUNDLE`, `PIP_CERT` and `SSL_CERT_FILE`. Nothing on the machine
+changes. `macos-keychain` takes every certificate in the System keychain: that
+is the set macOS already trusts, and it does not depend on the exact name
+Zscaler gives its root.
+
+`deploy.sh` also always skips the Bicep version check
+(`AZURE_BICEP_CHECK_VERSION=false`, for that run only). It is only a notice that
+a newer Bicep exists, and the deploy does not need it.
+
+Before its first `az` call, the script checks TLS to `management.azure.com` and
+`pypi.org` with the same trust `az` and `pip` will use. If something is
+intercepting HTTPS and `CA_BUNDLE` is unset or lacks the proxy's root, it stops
+there with one line saying so, before anything changes.
+
+**Finding the root,** if `macos-keychain` reports none or the check still
+fails:
+
+```bash
+# Is it in the System keychain, and under what name?
+security find-certificate -a -c Zscaler -p /Library/Keychains/System.keychain > zscaler-root.pem
+grep -c "BEGIN CERTIFICATE" zscaler-root.pem     # 1 or more = found
+
+# Which root does the proxy actually present?
+openssl s_client -connect management.azure.com:443 -showcerts </dev/null 2>/dev/null \
+  | grep -E "^ *[si]:"
+```
+
+If neither finds it, ask IT for the Zscaler root CA. A DER `.cer` file converts
+with `openssl x509 -inform der -in root.cer -out root.pem`.
+
+**For running the connector locally** (stage 2: `--check-api`, `--check`, the
+limited first write), the same applies to its HTTPS calls. Build the bundle
+once and export it in that shell. No code change is needed: `httpx` reads
+`SSL_CERT_FILE`, and the token libraries (`requests`) read `REQUESTS_CA_BUNDLE`.
+
+```bash
+{ cat "$(.venv/bin/python -c 'import certifi; print(certifi.where())')"; echo
+  security find-certificate -a -p /Library/Keychains/System.keychain; } > ~/.ca-bundle.pem
+export SSL_CERT_FILE=~/.ca-bundle.pem REQUESTS_CA_BUNDLE=~/.ca-bundle.pem
+```
+
+**Never switch verification off instead.** `AZURE_CLI_DISABLE_CONNECTION_VERIFICATION=1`
+and `pip --trusted-host` make the error go away by accepting any certificate at
+all, including the credentials this deploy sends to ServiceNow and Azure.
 
 ## Teardown
 

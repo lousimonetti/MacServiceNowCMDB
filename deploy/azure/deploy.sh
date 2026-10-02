@@ -64,6 +64,16 @@ PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 PYTHON="${PYTHON:-python3}"
 FUNCTION_NAME="intune_cmdb_sync"
 GRAPH_AUTH_MODE="${GRAPH_AUTH_MODE:-client_secret}"
+# Extra root certificates, for a network that intercepts TLS (Zscaler): a PEM
+# file, or `macos-keychain` to use the macOS System keychain, where Zscaler
+# Client Connector installs its root. Unset = the tools' own trust stores.
+CA_BUNDLE="${CA_BUNDLE:-}"
+
+# Skip az's "is there a newer Bicep?" lookup. It is only a notice, it is the
+# first request to fail behind TLS inspection, and the deploy does not need it.
+# The environment form of `az config set bicep.check_version=false`, so it
+# applies to this run only.
+export AZURE_BICEP_CHECK_VERSION=false
 
 # Graph's own service principal. This app ID is the same in every tenant.
 GRAPH_APP_ID="00000003-0000-0000-c000-000000000000"
@@ -139,6 +149,84 @@ if [[ -n "${MAPPING_OVERRIDES_FILE:-}" ]]; then
       "$MAPPING_OVERRIDES_FILE" 2>/dev/null) \
     || die "MAPPING_OVERRIDES_FILE must contain a JSON object: ${MAPPING_OVERRIDES_FILE}"
 fi
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+BUILD_DIR="$(mktemp -d)"
+trap 'rm -rf "$BUILD_DIR"' EXIT
+
+# Behind TLS inspection, az and pip trust only their bundled public roots
+# (certifi), not the proxy's, and fail with CERTIFICATE_VERIFY_FAILED. With
+# CA_BUNDLE set, build one bundle of the public roots PLUS the extra ones --
+# these variables replace a tool's default bundle, so the extra roots alone
+# would break every site the proxy does not inspect -- and point all three tools
+# at it, for this run only. Never disable verification instead.
+if [[ -n "$CA_BUNDLE" ]]; then
+  EXTRA_ROOTS="${BUILD_DIR}/extra-roots.pem"
+  if [[ "$CA_BUNDLE" == macos-keychain ]]; then
+    [[ "$(uname -s)" == Darwin ]] \
+      || die "CA_BUNDLE=macos-keychain works only on macOS; set CA_BUNDLE to a PEM file"
+    security find-certificate -a -p /Library/Keychains/System.keychain > "$EXTRA_ROOTS" 2>/dev/null || true
+    grep -q "BEGIN CERTIFICATE" "$EXTRA_ROOTS" \
+      || die "the macOS System keychain holds no certificates to add. Find the proxy's root
+       as described in README.md, \"Behind a TLS-inspecting proxy\", and set CA_BUNDLE
+       to that PEM file instead."
+  else
+    [[ -f "$CA_BUNDLE" ]] || die "CA_BUNDLE file not found: ${CA_BUNDLE}"
+    grep -q "BEGIN CERTIFICATE" "$CA_BUNDLE" \
+      || die "CA_BUNDLE must be PEM (text with BEGIN CERTIFICATE): ${CA_BUNDLE}. A DER .cer
+       file converts with: openssl x509 -inform der -in root.cer -out root.pem"
+    cp "$CA_BUNDLE" "$EXTRA_ROOTS"
+  fi
+  PUBLIC_ROOTS=$("$PYTHON" -c 'import certifi; print(certifi.where())' 2>/dev/null \
+    || echo /etc/ssl/cert.pem)
+  [[ -f "$PUBLIC_ROOTS" ]] || die "no public root bundle found (install certifi for ${PYTHON})"
+  # The echo keeps the last certificate of one file off the first line of the next.
+  { cat "$PUBLIC_ROOTS"; echo; cat "$EXTRA_ROOTS"; } > "${BUILD_DIR}/ca-bundle.pem"
+  export REQUESTS_CA_BUNDLE="${BUILD_DIR}/ca-bundle.pem"   # az (requests)
+  export PIP_CERT="${BUILD_DIR}/ca-bundle.pem"             # pip
+  export SSL_CERT_FILE="${BUILD_DIR}/ca-bundle.pem"        # python ssl, httpx
+  echo "==> Trusting extra root certificates from ${CA_BUNDLE}"
+fi
+
+# One TLS handshake per service, with the trust az and pip will use, so an
+# intercepted connection fails here with one actionable line instead of a stack
+# trace halfway through the deploy. Only a certificate failure stops the run;
+# anything else (no route, an explicit proxy) is left for az and pip to report.
+# X509_STRICT is cleared because az and pip do not set it, and some proxy roots
+# that they accept fail it.
+TLS_PROBE=$("$PYTHON" - "${REQUESTS_CA_BUNDLE:-}" <<'PY' 2>/dev/null
+import socket, ssl, sys
+bundle = sys.argv[1] or None
+if bundle is None:
+    try:
+        import certifi
+        bundle = certifi.where()
+    except ImportError:
+        pass
+ctx = ssl.create_default_context(cafile=bundle)
+if hasattr(ssl, "VERIFY_X509_STRICT"):
+    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+for host in ("management.azure.com", "pypi.org"):
+    try:
+        with socket.create_connection((host, 443), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host):
+                pass
+    except ssl.SSLCertVerificationError as exc:
+        print(f"{host}: {exc.verify_message}")
+        sys.exit(2)
+    except OSError:
+        pass
+PY
+) || {
+  if [[ -n "$CA_BUNDLE" ]]; then
+    die "TLS to ${TLS_PROBE%%:*} still fails certificate verification (${TLS_PROBE#*: })
+       with CA_BUNDLE=${CA_BUNDLE}. That bundle does not contain the proxy's root;
+       see README.md, \"Behind a TLS-inspecting proxy\"."
+  fi
+  die "TLS to ${TLS_PROBE%%:*} fails certificate verification (${TLS_PROBE#*: }).
+       Something is intercepting HTTPS (Zscaler?). Re-run with CA_BUNDLE=macos-keychain,
+       or CA_BUNDLE=/path/to/proxy-root.pem; see README.md, \"Behind a TLS-inspecting proxy\"."
+}
 
 SUBSCRIPTION_TENANT=$(az account show --query tenantId --output tsv)
 SUBSCRIPTION_NAME=$(az account show --query name --output tsv)
@@ -246,9 +334,6 @@ fi
 
 # Built before anything in Azure changes, so a package that cannot be built
 # fails the deploy with nothing half-done.
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-BUILD_DIR="$(mktemp -d)"
-trap 'rm -rf "$BUILD_DIR"' EXIT
 PACKAGE_DIR="${BUILD_DIR}/package"
 PACKAGE_ZIP="${BUILD_DIR}/app.zip"
 SOURCE_REVISION=$(git -C "$REPO_ROOT" describe --always --dirty 2>/dev/null || echo unknown)

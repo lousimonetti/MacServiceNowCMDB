@@ -150,6 +150,19 @@ behaviour change, particularly anything altering what gets written to a CI.
     rejects a denied type before creating anything, so the first deploy is the
     test. If refused, request it; do not drop telemetry to get a deploy through.
 
+- **The deploying machine is behind Zscaler TLS inspection.** `az` and `pip`
+  trust only certifi's public roots, so they fail with
+  `CERTIFICATE_VERIFY_FAILED`, first on the Bicep version check (`aka.ms`).
+  `deploy.sh` always exports `AZURE_BICEP_CHECK_VERSION=false`; with
+  `CA_BUNDLE=macos-keychain` (or a PEM path) it builds certifi + System-keychain
+  roots into one bundle and exports `REQUESTS_CA_BUNDLE`, `PIP_CERT` and
+  `SSL_CERT_FILE` for that run only. The bundle must include the public roots,
+  because those variables replace a tool's defaults. A TLS preflight with the
+  same trust stops the run before the first `az` call. The connector itself
+  needs no code change behind the proxy: `httpx` 0.28 reads `SSL_CERT_FILE` and
+  msal/`requests` read `REQUESTS_CA_BUNDLE`. Never disable verification
+  (`AZURE_CLI_DISABLE_CONNECTION_VERIFICATION`, `--trusted-host`).
+
 - **`SNOW_CLASS_MAP` replaces the built-in default, it does not extend it.**
   `_env_kv_map` returns the parsed value or the default, never a merge, so a map
   set as `windows=cmdb_ci_computer` silently drops the built-in

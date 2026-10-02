@@ -443,3 +443,55 @@ def test_deploy_script_survives_being_run_with_sh():
     assert guard < text.index("[[")
     # Process substitution fails to parse even in bash's own POSIX mode.
     assert "< <(" not in text
+
+
+# ---------------------------------------------------------------------------
+# TLS-inspecting proxy (Zscaler)
+# ---------------------------------------------------------------------------
+
+
+def _before_first_az_call(text: str, needle: str) -> bool:
+    first_az = text.index("$(az ")
+    return text.index(needle) < first_az
+
+
+def test_bicep_version_check_is_skipped_before_any_az_call():
+    """The check is the first request to fail behind TLS inspection, and it is
+    only a notice. The environment form keeps it to this run."""
+    text = DEPLOY_SH.read_text()
+    assert "export AZURE_BICEP_CHECK_VERSION=false" in text
+    assert _before_first_az_call(text, "export AZURE_BICEP_CHECK_VERSION=false")
+
+
+def test_ca_bundle_reaches_az_pip_and_python_before_any_az_call():
+    text = DEPLOY_SH.read_text()
+    for var in ("REQUESTS_CA_BUNDLE", "PIP_CERT", "SSL_CERT_FILE"):
+        line = f'export {var}="${{BUILD_DIR}}/ca-bundle.pem"'
+        assert line in text, f"{var} is not pointed at the combined bundle"
+        assert _before_first_az_call(text, line)
+    # The temp dir the bundle lives in must exist by then too.
+    assert _before_first_az_call(text, 'BUILD_DIR="$(mktemp -d)"')
+
+
+def test_combined_bundle_keeps_the_public_roots():
+    """These variables REPLACE a tool's default bundle. The proxy root alone
+    would break every site the proxy does not inspect."""
+    text = DEPLOY_SH.read_text()
+    assert "certifi.where()" in text
+    combine = '{ cat "$PUBLIC_ROOTS"; echo; cat "$EXTRA_ROOTS"; }'
+    assert f'{combine} > "${{BUILD_DIR}}/ca-bundle.pem"' in text
+    assert "security find-certificate -a -p /Library/Keychains/System.keychain" in text
+
+
+def test_tls_preflight_runs_before_any_az_call():
+    text = DEPLOY_SH.read_text()
+    assert _before_first_az_call(text, "TLS_PROBE=$(")
+    assert "ssl.SSLCertVerificationError" in text
+
+
+def test_certificate_verification_is_never_disabled():
+    for path in (DEPLOY_SH, REPO / ".github" / "workflows" / "ci.yml"):
+        text = path.read_text()
+        assert "AZURE_CLI_DISABLE_CONNECTION_VERIFICATION=1" not in text
+        assert "--trusted-host" not in text
+        assert "CERT_NONE" not in text
