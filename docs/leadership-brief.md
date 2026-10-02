@@ -68,12 +68,14 @@ Infrastructure cost is small in either cloud, for a daily sync of a full fleet:
 
 | | Azure | AWS |
 |---|---|---|
-| **Total** | **approximately $13 / month per environment** | **approximately $0.20 / month** |
+| **Total** | **approximately $20 / month per environment** | **approximately $0.20 / month** |
 
 These are list prices for a single daily run of roughly five minutes. The Azure
 deployment runs as a scheduled job on an Azure App Service plan, deployed from a
-zip package, so it needs no container registry and no private networking. The
-Azure figure is the smallest App Service plan that can run a job on a schedule.
+zip package, so it needs no container registry. The Azure figure is the
+smallest App Service plan that can run a job on a schedule, plus one private
+endpoint, which the landing zone requires so that the app is not reachable from
+the internet.
 Both are small on any IT budget; the platform choice should be made on
 credential and security model, not cost.
 

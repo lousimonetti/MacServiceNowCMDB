@@ -1,6 +1,13 @@
 // Azure App Service app whose scheduled (triggered) WebJob runs
 // intune-cmdb-sync once a day.
 //
+// Inbound is private: vpcx-lzn-app-service-deny-public-network denies any app
+// with public network access, so the app's only way in is one private endpoint
+// in an existing landing-zone subnet. That affects deploying and managing the
+// WebJob (deploy.sh and webjob.sh reach Kudu at the endpoint's private IP), not
+// the job: it only makes outbound calls, which public-access-disabled leaves
+// alone, so no VNet integration is needed.
+//
 // Why App Service: the landing-zone policy denies Azure Container Registry and
 // Container Apps, and denies public network access to Key Vault and Storage.
 // Every Azure Functions app needs a storage account, so Functions would need
@@ -20,8 +27,9 @@
 //                         "Always On", which scheduled WebJobs need.   ~$13.14
 //   Application Insights  workspace-based; a few MB a month, inside the 5 GB
 //   + Log Analytics       free allowance.                               $0.00
+//   Private endpoint      one, for the app's inbound.                    ~$7.30
 //                                                                    ---------
-//                                                                 ~$13/month
+//                                                                 ~$20/month
 //
 // TWO TOPOLOGIES, set by `graphAuthMode`:
 //
@@ -60,6 +68,15 @@ The first matters more. A job that stops running is otherwise invisible: there
 is no failure to notice, just a CMDB that quietly goes stale.
 ''')
 param alertEmail string = ''
+
+@description('''
+Resource ID of an existing subnet for the app's inbound private endpoint (in DEV,
+hybridsubnet-1 of vpcx-vnet-eastus). vpcx-lzn-app-service-deny-public-network
+requires public network access disabled, so this endpoint is the only way in --
+for deploys and for managing the WebJob, not for the job itself, which only
+makes outbound calls.
+''')
+param privateEndpointSubnetId string
 
 @description('ServiceNow instance: short name, host, or full https URL.')
 param serviceNowInstance string
@@ -231,6 +248,9 @@ resource webApp 'Microsoft.Web/sites@2024-04-01' = {
   properties: {
     serverFarmId: plan.id
     httpsOnly: true
+    // vpcx-lzn-app-service-deny-public-network. Covers the site and its Kudu
+    // (scm) endpoint; reach both through the private endpoint below.
+    publicNetworkAccess: 'Disabled'
     siteConfig: {
       // The WebJob runs with the app's own Python; deploy.sh builds the
       // package's wheels for this same version.
@@ -251,6 +271,27 @@ resource ftpPublishing 'Microsoft.Web/sites/basicPublishingCredentialsPolicies@2
   parent: webApp
   name: 'ftp'
   properties: { allow: false }
+}
+
+// The app's only inbound path. The 'sites' group covers both the site and its
+// scm endpoint. DNS records are left to the landing zone's central policy;
+// deploy.sh does not rely on them, because the deploying laptop's DNS (Zscaler)
+// does not resolve privatelink zones -- it connects to the private IP directly.
+resource appPrivateEndpoint 'Microsoft.Network/privateEndpoints@2023-11-01' = {
+  name: '${namePrefix}-app-pe'
+  location: location
+  properties: {
+    subnet: { id: privateEndpointSubnetId }
+    privateLinkServiceConnections: [
+      {
+        name: 'sites'
+        properties: {
+          privateLinkServiceId: webApp.id
+          groupIds: [ 'sites' ]
+        }
+      }
+    ]
+  }
 }
 
 resource scmPublishing 'Microsoft.Web/sites/basicPublishingCredentialsPolicies@2024-04-01' = {
@@ -492,4 +533,5 @@ output graphAuthMode string = graphAuthMode
 output crossTenant bool = graphTenantId != tenantId
 
 output webAppName string = webApp.name
+output privateEndpointName string = appPrivateEndpoint.name
 output resourceGroupName string = resourceGroup().name

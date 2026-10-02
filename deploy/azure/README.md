@@ -16,12 +16,18 @@ environment. Re-running it is how you change anything.
 - An App Service app needs **no storage account of ours**. Its code and files
   live on the app's built-in persistent `/home`. Secrets go in app settings
   rather than Key Vault (see [Secrets](#secrets)). With neither a storage
-  account nor a Key Vault, neither restricted policy applies, and the app needs
-  no VNet: it calls Graph and ServiceNow over App Service's normal outbound
-  internet access.
+  account nor a Key Vault, neither restricted policy applies. The job calls
+  Graph and ServiceNow over App Service's normal outbound internet access.
+- App Service itself must have **public network access disabled**
+  (`vpcx-lzn-app-service-deny-public-network`). That blocks inbound only, so the
+  job runs unaffected. But deploying code and managing the WebJob go *into* the
+  app, through its management endpoint (Kudu). So the app gets **one private
+  endpoint** in an existing landing-zone subnet (DEV: `hybridsubnet-1`), and
+  `deploy.sh` and `webjob.sh` reach Kudu through it. See
+  [Private access](#private-access).
 
 `deploy.sh` builds a zip on your machine: the connector, its Linux wheels, and
-the WebJob. It deploys the zip straight to the app. The root `Dockerfile` is
+the WebJob. It uploads the zip to the app through the private endpoint. The root `Dockerfile` is
 still there for the AWS ECS host, but the Azure path does not use it.
 
 This page is laid out in the order you do things. Read **Before you run
@@ -108,13 +114,20 @@ az account set --subscription <name or id>    # if it is the wrong one
   (`servicenow-setup.md` section 5, or `--register-discovery-source` in stage 2).
   Until it is, every write is rejected.
 
-No network, subnet or DNS setup is needed.
+- [ ] **A subnet for the app's private endpoint**, and a route to it from
+  your machine. In DEV that is `hybridsubnet-1` of `vpcx-vnet-eastus` (in
+  `VPCXRG`), which already holds the vault and storage endpoints of the
+  landing zone. Your Mac reaches its addresses through Zscaler Private
+  Access, tested on 2026-10-02. See [Private access](#private-access).
+
+No VNet integration, new subnet or DNS change is needed.
 
 **Roles the person deploying needs:**
 
 | Action | Needs |
 | --- | --- |
 | Deploy, and assign the stack's identity its role | Owner, or Contributor plus User Access Administrator (or Role Based Access Control Administrator), on the resource group |
+| Put the private endpoint in the subnet | `Microsoft.Network/virtualNetworks/subnets/join/action` on that subnet (in Network Contributor), which lives in `VPCXRG`, not your resource group |
 | `GRAPH_AUTH_MODE=managed_identity` (the script grants Graph app roles) | Privileged Role Administrator, Cloud Application Administrator, or Global Administrator in the subscription's tenant |
 
 The template gives the stack's managed identity permission to publish to
@@ -200,7 +213,8 @@ submitted. This stack creates only these resource types:
 
 | Resource type | Status as last recorded |
 | --- | --- |
-| `Microsoft.Web/serverfarms`, `Microsoft.Web/sites` (plus `sites/config`, `sites/basicPublishingCredentialsPolicies`) | Approved for App Service |
+| `Microsoft.Web/serverfarms`, `Microsoft.Web/sites` (plus `sites/config`, `sites/basicPublishingCredentialsPolicies`) | Approved, **with public network access disabled** (`vpcx-lzn-app-service-deny-public-network`); the template sets it |
+| `Microsoft.Network/privateEndpoints` | The app's one inbound path. Not yet confirmed by a preflight; the landing zone's own vault and storage use them in the same subnet |
 | `Microsoft.ManagedIdentity/userAssignedIdentities` | Allowed |
 | `Microsoft.OperationalInsights/workspaces` | Allowed |
 | `Microsoft.Insights/components` (Application Insights) | Probably allowed: the 2026-10-02 preflight refused only the vault and storage account, and it reports every refusal at once |
@@ -209,14 +223,13 @@ submitted. This stack creates only these resource types:
 There is no Key Vault and no storage account, the two types whose
 public-access policies blocked the Functions stack.
 
-App Service may have policies of its own that haven't been hit yet. Common ones
-in landing zones require HTTPS only, TLS 1.2, FTP off, remote debugging off and
-basic-auth publishing off; the template already sets all of those. If one still
-refuses, the cost is low: ARM evaluates deny policies during preflight, before
-it creates any resource, so `deploy.sh` stops with `RequestDisallowedByPolicy`
-and names the refused property. A policy demanding VNet integration or private
-inbound access for App Service would bring networking back; the preflight is
-where that would show.
+The 2026-10-02 App Service preflight refused only public network access, and it
+reports every refusal at once. The template also sets the other usual
+landing-zone requirements: HTTPS only, TLS 1.2, FTP off, remote debugging off
+and basic-auth publishing off. If something else refuses later, the cost is
+low: ARM evaluates deny policies during preflight, before it creates any
+resource, so `deploy.sh` stops with `RequestDisallowedByPolicy` and names the
+refused property.
 
 Gate: nothing in the table is known to be refused.
 
@@ -229,6 +242,9 @@ reuses exactly the values you tested. Keep it out of git.
 # dev.env: no secrets in this file
 NAME_PREFIX=intunecmdb-dev
 RESOURCE_GROUP=azc-obm-development     # pre-existing, never created; omit to pick from a list
+# The app's private endpoint goes here. Get the ID with:
+#   az network vnet subnet show -g VPCXRG --vnet-name vpcx-vnet-eastus -n hybridsubnet-1 --query id -o tsv
+PRIVATE_ENDPOINT_SUBNET_ID=/subscriptions/<sub>/resourceGroups/VPCXRG/providers/Microsoft.Network/virtualNetworks/vpcx-vnet-eastus/subnets/hybridsubnet-1
 # LOCATION is not set: resources go to East US (eastus) by default
 CA_BUNDLE=macos-keychain               # behind Zscaler; see "Behind a TLS-inspecting proxy"
 SNOW_INSTANCE=acmedev
@@ -276,9 +292,10 @@ What it does, in order:
    `settings.job` with your schedule, and `packages/` holds the connector and
    its Linux wheels.
 4. Deploys the infrastructure (`main.bicep`).
-5. Deploys the zip to the app, with your Entra login (basic-auth publishing is
-   off). It retries for a couple of minutes, because a brand-new app can refuse
-   the first deploy while it starts.
+5. Reaches the app's Kudu through its private endpoint, retrying for a few
+   minutes while a brand-new endpoint and app come up, then uploads the zip
+   with your Entra login (basic-auth publishing is off). See
+   [Private access](#private-access).
 6. **Checks that the WebJob registered.** A job in the wrong folder never runs
    and never errors, so `deploy.sh` fails instead.
 7. Grants Graph app roles (`managed_identity` mode only).
@@ -293,17 +310,20 @@ line. If `Alerts` says `NONE`, you will not be told when runs stop.
 
 ## 5. Trigger and verify a dry run
 
-Don't wait for the schedule. Start the WebJob now, then read its run history:
+Don't wait for the schedule. Start the WebJob now, then read its run history.
+The app accepts traffic only through its private endpoint, so use `webjob.sh`,
+not `az webapp webjob` or the portal's Kudu tools:
 
 ```bash
-APP=<Web app name from the deploy summary>
-az webapp webjob triggered run -g "$RESOURCE_GROUP" -n "$APP" --webjob-name intune-cmdb-sync
-az webapp webjob triggered log -g "$RESOURCE_GROUP" -n "$APP" --webjob-name intune-cmdb-sync
+export RESOURCE_GROUP=azc-obm-development NAME_PREFIX=intunecmdb-dev
+./webjob.sh run        # starts a run and returns
+./webjob.sh history    # status, start time and duration of recent runs
+./webjob.sh output     # the latest run's output
 ```
 
-The history shows each run's status (`Success` or `Failed`), its duration and
-its output. The output is the same log lines the run sends to Application
-Insights. Then read the run summary from Log Analytics:
+`history` shows each run's status (`Success` or `Failed`) and duration, and
+`output` shows the latest run's log lines, the same ones the run sends to
+Application Insights. Then read the run summary from Log Analytics:
 
 ```bash
 WORKSPACE=$(az monitor log-analytics workspace show \
@@ -470,7 +490,9 @@ logs.
 **Settings shared by both:** the Graph settings (one Intune tenant).
 
 **Resources each environment gets for itself:** managed identity, App Service
-plan and app, Application Insights and its workspace, and alert rules. Each app
+plan and app, its private endpoint, Application Insights and its workspace, and
+alert rules. Both environments can put their endpoints in the same subnet if it
+has room. Each app
 has its own `/home`, so each has its own `state.json`. That separation is a
 correctness requirement: `state.json` maps Intune device IDs to ServiceNow
 `sys_id`s, and a `sys_id` means something only on the instance that issued it.
@@ -510,7 +532,8 @@ For each `NAME_PREFIX`:
 | --- | --- | --- |
 | User-assigned managed identity | `<prefix>-id` | Publishes telemetry; Graph authentication in `managed_identity` mode |
 | App Service plan | `<prefix>-plan` | Linux, Basic B1, one instance |
-| Web app | `<prefix>-app-<hash>` | Hosts the scheduled WebJob `intune-cmdb-sync`. Python 3.12, Always On, HTTPS only, TLS 1.2, FTP and basic-auth publishing off |
+| Web app | `<prefix>-app-<hash>` | Hosts the scheduled WebJob `intune-cmdb-sync`. Python 3.12, Always On, HTTPS only, TLS 1.2, FTP and basic-auth publishing off, public network access disabled |
+| Private endpoint | `<prefix>-app-pe` | The app's only inbound path, for deploys and WebJob operations; in `PRIVATE_ENDPOINT_SUBNET_ID` |
 | Log Analytics workspace | `<prefix>-logs` | Where Application Insights stores traces, 30-day retention |
 | Application Insights | `<prefix>-ai` | Receives the job's logs; local auth disabled |
 | Alert rules + action group | `<prefix>-alerts` and others | Only when `ALERT_EMAIL` is set |
@@ -533,11 +556,13 @@ List prices, East US, one ~5-minute run per day.
 | | Usage/month | Cost |
 | --- | --- | --- |
 | App Service plan, Linux B1 | always on | **~$13.14** |
+| Private endpoint | one, ~730 hours | **~$7.30** |
 | Application Insights + Log Analytics | a few MB | **$0.00**: the first 5 GB/month is free |
-| **Per environment** | | **about $13/month** |
+| **Per environment** | | **about $20/month** |
 
-The plan is nearly the whole bill. Basic B1 is the cheapest tier with
-"Always On", which a scheduled WebJob needs to keep firing.
+Basic B1 is the cheapest tier with "Always On", which a scheduled WebJob needs
+to keep firing. The private endpoint is the policy's price: the app's only way
+in.
 
 ## Alerting
 
@@ -583,8 +608,13 @@ RG=azc-obm-development
 PREFIX=intunecmdb-dev
 APP=<web app name>
 
-az webapp webjob triggered run -g $RG -n $APP --webjob-name intune-cmdb-sync   # run now
-az webapp webjob triggered log -g $RG -n $APP --webjob-name intune-cmdb-sync   # history
+export RESOURCE_GROUP=$RG NAME_PREFIX=$PREFIX
+./webjob.sh run           # run now
+./webjob.sh history       # recent runs
+./webjob.sh output        # latest run's output
+./webjob.sh report        # latest run-report.json
+./webjob.sh state         # state.json
+./webjob.sh deployments   # recent code deployments
 
 WORKSPACE=$(az monitor log-analytics workspace show \
   -g $RG -n $PREFIX-logs --query customerId -o tsv)
@@ -615,16 +645,46 @@ AppTraces
 ```
 
 `run-report.json` and `state.json` are in `/home/data/intune-cmdb-sync/` on the
-app. The simplest way to read them is the portal: open the app, then
-**Advanced Tools** (Kudu), then the file browser under `data/intune-cmdb-sync`.
-Kudu's file API should work from a shell too, with your Entra login. This isn't
-verified yet; if it is refused, use the portal:
+app; `webjob.sh report` and `webjob.sh state` print them.
+
+## Private access
+
+The app has public network access disabled, as the landing zone requires, and
+one private endpoint (`<prefix>-app-pe`) in `PRIVATE_ENDPOINT_SUBNET_ID`. That
+endpoint serves both the site and its Kudu management endpoint, which is what
+deploys and WebJob operations use. The job itself only makes outbound calls,
+which are unaffected, so there is no VNet integration.
+
+**How your machine gets in.** On 2026-10-02 a Mac on Zscaler reached a private
+endpoint in `hybridsubnet-1` at its private IP (Zscaler Private Access routes
+it), but its DNS (`100.64.0.1`) resolved the name to the public address. So
+`kudu.sh` does not use DNS: it asks Azure for the endpoint's private IP and
+pins the Kudu hostname to it with `curl --resolve`. TLS is still verified
+against the real hostname, and nothing is written to `/etc/hosts`. The
+cleaner long-term fix is for IT to forward `privatelink.azurewebsites.net` (and
+the other `privatelink` zones) from Zscaler's DNS to the hub. Nothing here
+depends on that.
+
+Calls authenticate with your Entra login: an App Service token from `az`, the
+same one `az webapp deploy` would use. You need Contributor or Website
+Contributor on the app.
+
+**If Kudu is unreachable**, both scripts stop and print this check:
 
 ```bash
-SCM=$(az webapp show -g $RG -n $APP --query "hostNameSslStates[?hostType=='Repository'].name | [0]" -o tsv)
-az rest --method get --resource https://management.azure.com/ \
-  --url "https://${SCM}/api/vfs/data/intune-cmdb-sync/run-report.json"
+curl -sS -o /dev/null -w '%{http_code}\n' --max-time 10 \
+  --resolve <app>.scm.azurewebsites.net:443:<private IP> https://<app>.scm.azurewebsites.net/
 ```
+
+`000` or a timeout means no route to the private IP: connect Zscaler Private
+Access or the VPN. 401 or 403 means the route works but your login lacks a
+role on the app.
+
+**What no longer works:** anything that reaches the app publicly. That includes
+`az webapp deploy`, `az webapp webjob ...`, `az webapp log tail`, and the
+portal's **Advanced Tools** (Kudu) and **WebJobs** pages, unless your browser
+resolves the private address. App settings, restarts, stop and start still
+work: they go through Azure Resource Manager, not the app.
 
 ### Changing configuration
 

@@ -217,7 +217,10 @@ Storage must deny public access. Every Functions app needs a storage account,
 so Functions would have required VNet integration and private endpoints. An App
 Service app needs neither: state lives on its persistent `/home`, secrets are
 app settings, and output goes to Application Insights over Log Analytics
-through OpenTelemetry, as a user-assigned managed identity.
+through OpenTelemetry, as a user-assigned managed identity. App Service must
+also disable public network access, so the app's only inbound path (deploys,
+WebJob operations) is one private endpoint; the job's outbound calls are
+unaffected.
 
 **AWS Lambda** (`deploy/aws/`) — container-image Lambda on an EventBridge
 schedule, SSM Parameter Store for secrets, S3 for state, deliberately outside a

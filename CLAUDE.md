@@ -82,18 +82,34 @@ behaviour change, particularly anything altering what gets written to a CI.
   without accepting the networking that comes with it.
   - `deploy.sh` builds the zip locally (wheel + Linux x86_64 wheels via
     `pip --platform`, into `packages/`) with the job at
-    `App_Data/jobs/triggered/intune-cmdb-sync/{run.py,settings.job}`, then runs
-    `az webapp deploy`. No registry, no remote build
+    `App_Data/jobs/triggered/intune-cmdb-sync/{run.py,settings.job}`, then
+    uploads it through the private endpoint (below). No registry, no remote build
     (`SCM_DO_BUILD_DURING_DEPLOYMENT=false`).
   - `settings.job` holds the six-field NCRONTAB schedule (written from
     `SCHEDULE`) and `is_singleton: true`.
   - `run.py` uses an absolute path to `packages/`, because Kudu copies a
     triggered job to a temp dir before running it.
-  - Basic B1 because scheduled WebJobs need Always On (~$13/month).
+  - Basic B1 because scheduled WebJobs need Always On (~$13/month of the ~$20).
   - `WEBJOBS_IDLE_TIMEOUT=1800`: a triggered job is killed after 2 quiet
     minutes otherwise.
-  - `deploy.sh` fails if `az webapp webjob triggered list` does not show the
+  - `deploy.sh` fails if Kudu's `/api/triggeredwebjobs` does not list the
     job.
+- **Inbound to the app is private only; outbound is untouched.**
+  `vpcx-lzn-app-service-deny-public-network` (2026-10-02) requires
+  `publicNetworkAccess: 'Disabled'` on every App Service, Function and Logic
+  App. The app therefore has one private endpoint (`<prefix>-app-pe`, group
+  `sites`, covering site and scm) in `PRIVATE_ENDPOINT_SUBNET_ID` (DEV:
+  `hybridsubnet-1` of `vpcx-vnet-eastus`, in `VPCXRG`). There is no VNet
+  integration, because the job only calls out. The deploying Mac reaches
+  10.52.46.x through Zscaler Private Access, but its DNS (`100.64.0.1`)
+  resolves privatelink names publicly. So `kudu.sh` looks up the endpoint's IP
+  through ARM and pins the scm hostname with `curl --resolve`, keeping TLS
+  verification on the real name, with an App Service token
+  (`--resource https://appservice.azure.com`). `deploy.sh` uploads through
+  `POST /api/publish` that way, and `webjob.sh` runs and reads the job.
+  `az webapp deploy`, `az webapp webjob` and the portal's Kudu pages do not
+  work from outside the network; ARM operations (app settings, restart, stop)
+  still do. Cost is ~$20/month (B1 + one endpoint).
 - **Secrets are app settings, deliberately.** With no Key Vault, the ServiceNow
   secret (and the Graph secret in `client_secret` mode) are plain app settings,
   readable by anyone with config read on the app. Prefer
@@ -171,10 +187,13 @@ behaviour change, particularly anything altering what gets written to a CI.
     refusal at once, refused only the vault and storage account. Without it the
     job's logs reach nothing and both alerts are blind; if it is ever refused,
     request it, and do not drop telemetry to get a deploy through.
-  - **App Service's own policies are not yet known.** The template already sets
-    HTTPS-only, TLS 1.2, FTP off, remote debugging off and basic-auth publishing
-    off. A policy demanding App Service VNet integration or private inbound
-    access would bring networking back; the first preflight will show it.
+  - **App Service must have public network access disabled**
+    (`vpcx-lzn-app-service-deny-public-network`, found 2026-10-02; that
+    preflight refused nothing else). The template also sets HTTPS-only, TLS 1.2,
+    FTP off, remote debugging off and basic-auth publishing off.
+  - **Not yet confirmed: `Microsoft.Network/privateEndpoints` from our
+    resource group into `VPCXRG`'s subnet** (allowlist, and the deploying
+    login's `subnets/join/action`).
 
 - **The deploying machine is behind Zscaler TLS inspection.** `az` and `pip`
   trust only certifi's public roots, so they fail with
@@ -329,8 +348,9 @@ Green tests are weaker evidence here than they look.
    Architecture notes). Nothing about it has run in Azure yet. Green tests, a
    clean `az bicep build`, a stub-`az` run of `deploy.sh` and a local `run.py`
    exit-2 check are all that back it. The first deploy must confirm:
-   - no App Service policy refuses the template
-   - `az webapp deploy` works with basic auth off
+   - no further policy refuses the template, including the private endpoint
+   - Kudu is reachable at the endpoint's private IP over Zscaler Private Access,
+     and accepts the App Service token
    - the WebJob registers and fires on schedule with Always On
    - `AppTraces` carries the JSON line under `AppRoleName` = the app name
    - `state.json` persists on `/home`

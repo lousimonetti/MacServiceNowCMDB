@@ -235,7 +235,10 @@ There is no container image, no registry, no storage account, no Key Vault and
 no VNet. The landing zone denies the first two, and allows Key Vault and Storage
 only with public access denied, which would force private networking. So
 secrets are app settings, and `deploy.sh` builds a zip locally (the connector
-plus its Linux wheels) and deploys it straight to the app.
+plus its Linux wheels) and deploys it to the app. The landing zone also requires
+App Service to disable public network access, so the app has one private
+endpoint, and `deploy.sh` and `deploy/azure/webjob.sh` reach it at its private
+IP.
 
 **Check which tenant topology you have first**, because it decides the
 credential model:
@@ -285,16 +288,17 @@ docker run --rm --env-file .env intune-cmdb-sync
 | | Azure | AWS |
 | --- | --- | --- |
 | Compute | ~$13.14 — App Service plan, Linux B1 | ~$0.15 |
+| Private access | ~$7.30 — one private endpoint, required by the landing zone | n/a |
 | Registry | none — zip deploy | ~$0.04 (ECR) |
 | Scheduler | included — WebJob | $0.00 — free tier |
 | Secrets | included — app settings | $0.00 — SSM Standard |
 | State | included — the app's `/home` | ~$0.00 — S3 |
 | Logs | $0.00 — under the 5 GB free tier | $0.00 — under the 5 GB free tier |
-| **Total** | **~$13/month** | **~$0.20/month** |
+| **Total** | **~$20/month** | **~$0.20/month** |
 
-List prices, single daily run, ~5 minutes. The Azure figure is the App Service
-plan: Basic B1 is the cheapest tier with "Always On", which a scheduled WebJob
-needs. Full workings are in the deployment READMEs.
+List prices, single daily run, ~5 minutes. Most of the Azure figure is the App
+Service plan: Basic B1 is the cheapest tier with "Always On", which a scheduled
+WebJob needs. The rest is the private endpoint the landing zone requires. Full workings are in the deployment READMEs.
 
 ---
 

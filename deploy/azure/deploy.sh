@@ -8,6 +8,11 @@
 # the app's own /home/site/wwwroot. Re-running it redeploys both the
 # infrastructure and the code from the current checkout.
 #
+# The app has public network access disabled (landing-zone policy), so the code
+# goes in through the app's private endpoint: kudu.sh reaches Kudu at the
+# endpoint's private IP. This machine needs a route to that IP (Zscaler Private
+# Access or VPN); it does not need DNS for it.
+#
 # Three topologies, selected by GRAPH_AUTH_MODE:
 #
 #   client_secret     (default) Intune lives in a different tenant from this
@@ -63,7 +68,7 @@ SCHEDULE="${SCHEDULE:-0 15 3 * * *}"
 # The app runs PYTHON|3.12 (main.bicep); the package's wheels must match it.
 PYTHON_VERSION="3.12"
 PYTHON="${PYTHON:-python3}"
-# Folder name under App_Data/jobs/triggered/, and the name `az webapp webjob` uses.
+# Folder name under App_Data/jobs/triggered/, and the job name Kudu reports.
 WEBJOB_NAME="intune-cmdb-sync"
 GRAPH_AUTH_MODE="${GRAPH_AUTH_MODE:-client_secret}"
 # Extra root certificates, for a network that intercepts TLS (Zscaler): a PEM
@@ -95,6 +100,9 @@ require() {
   [[ -n "${!1:-}" ]] || die "$1 must be set"
 }
 
+# An existing subnet for the app's inbound private endpoint (DEV: hybridsubnet-1
+# of vpcx-vnet-eastus in VPCXRG). Never created here.
+require PRIVATE_ENDPOINT_SUBNET_ID
 require SNOW_INSTANCE
 require SNOW_CLIENT_ID
 require SNOW_CLIENT_SECRET
@@ -107,7 +115,7 @@ read -ra SCHEDULE_FIELDS <<< "$SCHEDULE"
 [[ ${#SCHEDULE_FIELDS[@]} -eq 6 ]] \
   || die "SCHEDULE must have six fields, seconds first (got '${SCHEDULE}')"
 
-for tool in jq zip "$PYTHON"; do
+for tool in jq zip curl "$PYTHON"; do
   command -v "$tool" >/dev/null || die "$tool is required"
 done
 
@@ -278,6 +286,16 @@ az group show --name "$RESOURCE_GROUP" --output none 2>/dev/null \
        the subscription (az account set --subscription <name>) and the name."
 echo "    deploying to ${LOCATION}"
 
+# Before anything is built: the endpoint goes in this subnet, and the deploy
+# fails late and confusingly if it does not exist or this login cannot use it.
+ENDPOINT_SUBNET_NAME=$(az network vnet subnet show --ids "$PRIVATE_ENDPOINT_SUBNET_ID" \
+    --query name --output tsv 2>/dev/null) \
+  || die "private endpoint subnet not found, or not visible to this login:
+       ${PRIVATE_ENDPOINT_SUBNET_ID}
+       In DEV it is hybridsubnet-1 of vpcx-vnet-eastus:
+         az network vnet subnet show -g VPCXRG --vnet-name vpcx-vnet-eastus -n hybridsubnet-1 --query id -o tsv"
+echo "    app private endpoint in ${ENDPOINT_SUBNET_NAME}"
+
 GRAPH_TENANT_ID="${GRAPH_TENANT_ID:-$SUBSCRIPTION_TENANT}"
 
 case "$GRAPH_AUTH_MODE" in
@@ -348,6 +366,7 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
   --template-file "$(dirname "$0")/main.bicep" \
   --parameters \
       namePrefix="$NAME_PREFIX" \
+      privateEndpointSubnetId="$PRIVATE_ENDPOINT_SUBNET_ID" \
       location="$LOCATION" \
       graphAuthMode="$GRAPH_AUTH_MODE" \
       graphTenantId="$GRAPH_TENANT_ID" \
@@ -369,19 +388,31 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
 PRINCIPAL_ID=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.managedIdentityPrincipalId.value')
 CLIENT_ID=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.managedIdentityClientId.value')
 APP_NAME=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.webAppName.value')
+ENDPOINT_NAME=$(echo "$DEPLOYMENT_OUTPUT" | jq -r '.privateEndpointName.value')
 
-# A brand-new app can refuse the first deploy while its site is still starting.
-echo "==> Deploying code to ${APP_NAME}"
-for attempt in 1 2 3 4 5; do
-  if az webapp deploy --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
-      --src-path "$PACKAGE_ZIP" --type zip --clean true --output none; then
-    break
+# shellcheck source=kudu.sh
+. "$(dirname "$0")/kudu.sh"
+
+echo "==> Reaching Kudu for ${APP_NAME} through its private endpoint"
+kudu_init "$RESOURCE_GROUP" "$APP_NAME" "$ENDPOINT_NAME" || die "could not resolve the app's private endpoint"
+echo "    ${KUDU_HOST} at ${KUDU_IP}"
+# A new endpoint and a new app can take a minute or two to answer.
+for attempt in 1 2 3 4 5 6; do
+  kudu_reachable && break
+  if [[ $attempt -eq 6 ]]; then
+    kudu_unreachable_help
+    die "the infrastructure is deployed; re-run this script once Kudu is reachable"
   fi
-  [[ $attempt -lt 5 ]] || die "code deployment failed; the infrastructure is deployed, so re-running
-       this script is safe"
-  echo "    attempt ${attempt} failed; retrying in 30s (the app may still be starting)"
+  echo "    not answering yet; retrying in 30s"
   sleep 30
 done
+
+echo "==> Deploying code to ${APP_NAME}"
+kudu POST "/api/publish?type=zip&clean=true&restart=true" \
+    --data-binary "@${PACKAGE_ZIP}" --header "Content-Type: application/zip" \
+    --max-time 900 --output /dev/null \
+  || die "code deployment failed; the infrastructure is deployed, so re-running
+       this script is safe"
 
 # A package that deploys fine but puts the job in the wrong folder registers no
 # WebJob at all, and then nothing ever runs and nothing errors. Make that a
@@ -389,14 +420,14 @@ done
 echo "==> Checking the WebJob is registered"
 REGISTERED=""
 for attempt in 1 2 3 4 5 6; do
-  REGISTERED=$(az webapp webjob triggered list --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" \
-      --query "[?ends_with(name, '${WEBJOB_NAME}')] | length(@)" --output tsv 2>/dev/null || echo 0)
+  REGISTERED=$(kudu GET /api/triggeredwebjobs --max-time 30 2>/dev/null \
+      | jq --arg name "$WEBJOB_NAME" '[.[]? | select(.name == $name)] | length' 2>/dev/null || echo 0)
   [[ "$REGISTERED" == "1" ]] && break
   sleep 20
 done
 [[ "$REGISTERED" == "1" ]] || die "WebJob ${WEBJOB_NAME} is not registered on ${APP_NAME}. Check the
-       package layout (App_Data/jobs/triggered/${WEBJOB_NAME}/run.py) and the Kudu log:
-         az webapp log tail --resource-group ${RESOURCE_GROUP} --name ${APP_NAME}"
+       package layout (App_Data/jobs/triggered/${WEBJOB_NAME}/run.py) and Kudu's
+       deployment log: $(dirname "$0")/webjob.sh deployments"
 echo "    ${WEBJOB_NAME} registered (schedule ${SCHEDULE} UTC)"
 
 if [[ "$GRAPH_AUTH_MODE" == "managed_identity" ]]; then
@@ -454,15 +485,18 @@ Deployed.
   Class map        ${SNOW_CLASS_MAP:-built-in (windows, macos)}
   Mapping override ${MAPPING_OVERRIDES_FILE:-none}
   Resource group   ${RESOURCE_GROUP} (${LOCATION})
+  Inbound          private only: ${ENDPOINT_NAME} in ${ENDPOINT_SUBNET_NAME} (${KUDU_IP})
   Schedule         ${SCHEDULE} (NCRONTAB, UTC)
   Graph auth       ${GRAPH_AUTH_MODE}
   Intune tenant    ${GRAPH_TENANT_ID}
   Alerts           ${ALERT_EMAIL:-NONE - set ALERT_EMAIL to be told when runs stop}
 
-Verify the whole path end to end before trusting the schedule:
+Verify the whole path end to end before trusting the schedule. The app is
+reachable only through its private endpoint, so use webjob.sh (it finds the
+app from RESOURCE_GROUP and NAME_PREFIX):
 
-  az webapp webjob triggered run -g ${RESOURCE_GROUP} -n ${APP_NAME} --webjob-name ${WEBJOB_NAME}
-  az webapp webjob triggered log -g ${RESOURCE_GROUP} -n ${APP_NAME} --webjob-name ${WEBJOB_NAME}
+  RESOURCE_GROUP=${RESOURCE_GROUP} NAME_PREFIX=${NAME_PREFIX} $(dirname "$0")/webjob.sh run
+  RESOURCE_GROUP=${RESOURCE_GROUP} NAME_PREFIX=${NAME_PREFIX} $(dirname "$0")/webjob.sh history
 
 Logs (allow a few minutes for ingestion):
 

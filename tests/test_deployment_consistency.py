@@ -387,9 +387,12 @@ def test_template_creates_nothing_the_landing_zone_refuses():
         "Microsoft.App/",
         "Microsoft.KeyVault",
         "Microsoft.Storage",
-        "Microsoft.Network",
     ):
         assert refused not in text, f"main.bicep creates {refused}"
+    # The one network resource is the app's inbound private endpoint; no VNet
+    # integration, subnets, DNS zones or NAT.
+    network_types = set(re.findall(r"'(Microsoft\.Network/[A-Za-z/]+)@", text))
+    assert network_types == {"Microsoft.Network/privateEndpoints"}, network_types
     for refused in ("az acr", "containerapp", "functionapp"):
         assert refused not in DEPLOY_SH.read_text()
 
@@ -443,7 +446,7 @@ def test_webjob_layout_matches_what_the_script_verifies():
     assert re.search(r'WEBJOB_NAME="([^"]+)"', text), "WEBJOB_NAME is gone from deploy.sh"
     assert 'JOB_DIR="${PACKAGE_DIR}/App_Data/jobs/triggered/${WEBJOB_NAME}"' in text
     assert 'cp "$(dirname "$0")/webjob/run.py" "$JOB_DIR/"' in text
-    assert "az webapp webjob triggered list" in text
+    assert "kudu GET /api/triggeredwebjobs" in text
 
 
 def test_webjob_package_path_matches_the_install_target():
@@ -496,3 +499,72 @@ def test_telemetry_publishes_with_the_identity():
     assert "AZURE_CLIENT_ID: identity.properties.clientId" in text
     assert "3913510d-42f4-4e42-8a64-420c390055eb" in text
     assert "appInsightsPublisher" in _resource_block(text, "resource appSettings ")
+
+
+# ---------------------------------------------------------------------------
+# vpcx-lzn-app-service-deny-public-network: inbound only through a private
+# endpoint, and deploys that use it without depending on DNS.
+# ---------------------------------------------------------------------------
+
+KUDU_SH = REPO / "deploy" / "azure" / "kudu.sh"
+WEBJOB_SH = REPO / "deploy" / "azure" / "webjob.sh"
+
+
+def test_app_has_public_network_access_disabled():
+    site = _resource_block(BICEP.read_text(), "resource webApp 'Microsoft.Web/sites@")
+    assert "publicNetworkAccess: 'Disabled'" in site
+
+
+def test_app_private_endpoint_covers_site_and_scm():
+    """The 'sites' group serves both the app and its Kudu endpoint; without it
+    nothing can deploy or manage the WebJob."""
+    text = BICEP.read_text()
+    endpoint = _resource_block(text, "resource appPrivateEndpoint ")
+    assert "privateLinkServiceId: webApp.id" in endpoint
+    assert "groupIds: [ 'sites' ]" in endpoint
+    assert "subnet: { id: privateEndpointSubnetId }" in endpoint
+    assert "output privateEndpointName string = appPrivateEndpoint.name" in text
+
+
+def test_no_vnet_integration_for_outbound():
+    """Public access disabled is inbound only; the job's outbound calls need no
+    VNet. Adding integration would route them through the landing zone's
+    firewall for no reason."""
+    assert "virtualNetworkSubnetId" not in BICEP.read_text()
+
+
+def test_deploy_script_requires_and_checks_the_endpoint_subnet():
+    text = DEPLOY_SH.read_text()
+    assert "require PRIVATE_ENDPOINT_SUBNET_ID" in text
+    assert 'privateEndpointSubnetId="$PRIVATE_ENDPOINT_SUBNET_ID"' in text
+    assert 'az network vnet subnet show --ids "$PRIVATE_ENDPOINT_SUBNET_ID"' in text
+    # Checked before the package is built.
+    assert text.index('--ids "$PRIVATE_ENDPOINT_SUBNET_ID"') < text.index(
+        'echo "==> Building WebJob package'
+    )
+
+
+def test_kudu_calls_pin_the_hostname_to_the_private_ip():
+    """The laptop's DNS (Zscaler) resolves privatelink names to public
+    addresses. Every Kudu call must connect to the endpoint's IP while still
+    verifying TLS against the real hostname."""
+    text = KUDU_SH.read_text()
+    assert '--resolve "${KUDU_HOST}:443:${KUDU_IP}"' in text
+    assert '"https://${KUDU_HOST}${path}"' in text
+    assert "--insecure" not in text and " -k " not in text
+    assert "--resource https://appservice.azure.com" in text, "same token az webapp deploy uses"
+
+
+def test_deploys_and_operations_go_through_the_private_path():
+    """`az webapp deploy` and `az webapp webjob` reach Kudu publicly, which the
+    policy refuses."""
+    for path in (DEPLOY_SH, WEBJOB_SH):
+        text = path.read_text()
+        code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+        assert '. "$(dirname "$0")/kudu.sh"' in code
+        assert "az webapp deploy" not in code
+        assert "az webapp webjob" not in code
+    deploy = DEPLOY_SH.read_text()
+    assert 'kudu POST "/api/publish?type=zip' in deploy
+    assert "kudu GET /api/triggeredwebjobs" in deploy
+    assert deploy.index("kudu_reachable") < deploy.index('kudu POST "/api/publish')
