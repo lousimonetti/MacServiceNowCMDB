@@ -167,6 +167,41 @@ param retireMissingDevices bool = false
 @description('Run without committing anything to the CMDB.')
 param dryRun bool = false
 
+// ---------------------------------------------------------------------------
+// Networking
+//
+// The landing zone denies public network access to Key Vault and Storage
+// (vpcx-lzn-kv-restrict-network-access, vpcx-lzn-strg-restrict-network-access),
+// so the function reaches both privately: VNet integration out of one subnet,
+// private endpoints for the vault and storage in another. Both subnets belong to
+// the landing zone's network and are inputs, not created here.
+// ---------------------------------------------------------------------------
+
+@description('''
+Resource ID of the Flex Consumption integration subnet. Must be delegated to
+Microsoft.App/environments, /27 or larger, have no underscore in its name, and
+hold no private or service endpoints. All of the app's outbound traffic leaves
+through it, so the landing zone must allow egress from it to Entra, Graph,
+ServiceNow and Application Insights.
+''')
+param integrationSubnetId string
+
+@description('Resource ID of the subnet the private endpoints for the vault and storage go in. Not the integration subnet.')
+param privateEndpointSubnetId string
+
+@description('''
+Who owns the privatelink DNS zones.
+'central'  the landing zone's hub owns them and a policy registers each private
+           endpoint. This template creates the endpoints only.
+'local'    this template creates the zones in this resource group, links them to
+           the endpoint subnet's VNet, and registers the endpoints itself.
+''')
+@allowed([
+  'central'
+  'local'
+])
+param privateDnsMode string = 'central'
+
 // Both of these authenticate without a Key Vault secret, so neither creates one.
 var useManagedIdentityForGraph = graphAuthMode == 'managed_identity'
 var useFederatedIdentityForGraph = graphAuthMode == 'federated_managed_identity'
@@ -230,9 +265,20 @@ resource vault 'Microsoft.KeyVault/vaults@2023-07-01' = {
     tenantId: tenantId
     sku: { family: 'A', name: 'standard' }
     enableRbacAuthorization: true
+    // vpcx-lzn-kv-enable-soft-delete-purge-retention-days-90. Purge protection
+    // cannot be turned off again, and a deleted vault's name stays reserved for
+    // the full 90 days.
     enableSoftDelete: true
-    softDeleteRetentionInDays: 7
-    publicNetworkAccess: 'Enabled'
+    enablePurgeProtection: true
+    softDeleteRetentionInDays: 90
+    // vpcx-lzn-kv-restrict-network-access. The app reads secrets through the
+    // private endpoint below. Secrets written by this template are unaffected:
+    // ARM deploys them through the control plane, which the firewall does not
+    // cover.
+    networkAcls: {
+      defaultAction: 'Deny'
+      bypass: 'AzureServices'
+    }
   }
 }
 
@@ -284,6 +330,12 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
     allowBlobPublicAccess: false
     minimumTlsVersion: 'TLS1_2'
     supportsHttpsTrafficOnly: true
+    // vpcx-lzn-strg-restrict-network-access. Host storage, the package and the
+    // state share are all reached through the private endpoints below.
+    networkAcls: {
+      defaultAction: 'Deny'
+      bypass: 'AzureServices'
+    }
   }
 }
 
@@ -369,6 +421,8 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
     httpsOnly: true
     // Key Vault references in app settings resolve as this identity.
     keyVaultReferenceIdentity: identity.id
+    // Flex Consumption routes all outbound traffic through this subnet.
+    virtualNetworkSubnetId: integrationSubnetId
     siteConfig: {
       minTlsVersion: '1.2'
     }
@@ -397,6 +451,80 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
     }
   }
 }
+
+// One private endpoint per service the app reaches: the vault, and each storage
+// service it uses (blob: package and leases; queue and table: host; file: the
+// state mount).
+var storageEndpointGroups = concat(['blob', 'queue', 'table'], enableStatePersistence ? ['file'] : [])
+var privateEndpointTargets = concat(
+  [
+    { name: 'vault', serviceId: vault.id, groupId: 'vault', zone: 'privatelink.vaultcore.azure.net' }
+  ],
+  map(storageEndpointGroups, group => {
+    name: group
+    serviceId: storage.id
+    groupId: group
+    zone: 'privatelink.${group}.${environment().suffixes.storage}'
+  })
+)
+var useLocalDns = privateDnsMode == 'local'
+var endpointVnetId = split(privateEndpointSubnetId, '/subnets/')[0]
+
+resource privateEndpoints 'Microsoft.Network/privateEndpoints@2023-11-01' = [
+  for target in privateEndpointTargets: {
+    name: '${namePrefix}-pe-${target.name}'
+    location: location
+    properties: {
+      subnet: { id: privateEndpointSubnetId }
+      privateLinkServiceConnections: [
+        {
+          name: target.name
+          properties: {
+            privateLinkServiceId: target.serviceId
+            groupIds: [ target.groupId ]
+          }
+        }
+      ]
+    }
+  }
+]
+
+// 'local' DNS only. Zones are per resource group, not per stack, so a second
+// stack in the same group reuses them; the link is named after the VNet for the
+// same reason.
+resource dnsZones 'Microsoft.Network/privateDnsZones@2020-06-01' = [
+  for target in privateEndpointTargets: if (useLocalDns) {
+    name: target.zone
+    location: 'global'
+  }
+]
+
+resource dnsLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2020-06-01' = [
+  for (target, i) in privateEndpointTargets: if (useLocalDns) {
+    parent: dnsZones[i]
+    name: take('link-${last(split(endpointVnetId, '/'))}', 80)
+    location: 'global'
+    properties: {
+      registrationEnabled: false
+      virtualNetwork: { id: endpointVnetId }
+    }
+  }
+]
+
+resource dnsZoneGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = [
+  for (target, i) in privateEndpointTargets: if (useLocalDns) {
+    parent: privateEndpoints[i]
+    name: 'default'
+    properties: {
+      privateDnsZoneConfigs: [
+        {
+          name: replace(target.zone, '.', '-')
+          properties: { privateDnsZoneId: dnsZones[i].id }
+        }
+      ]
+    }
+  }
+]
 
 // Key Vault reference syntax. The versionless URI follows rotations; the
 // platform re-reads it within 24 hours or on restart.
@@ -492,6 +620,10 @@ resource appSettings 'Microsoft.Web/sites/config@2024-04-01' = {
     vaultAccess
     storageRoles
     appInsightsPublisher
+    // Both are reachable only through the private endpoints now; settings that
+    // land first resolve against nothing.
+    privateEndpoints
+    dnsZoneGroups
   ]
 }
 
@@ -510,6 +642,8 @@ resource stateMount 'Microsoft.Web/sites/config@2024-04-01' =
     }
     dependsOn: [
       share
+      privateEndpoints
+      dnsZoneGroups
     ]
   }
 

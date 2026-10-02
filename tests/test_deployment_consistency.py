@@ -286,10 +286,20 @@ HOST_JSON = FUNCTIONS / "host.json"
 
 def test_no_container_registry_or_container_apps_anywhere_in_the_azure_stack():
     """The landing-zone policy denies both. The stack deploys code as a zip
-    package into its own storage account; nothing may reintroduce an image."""
+    package into its own storage account; nothing may reintroduce an image.
+    (Microsoft.App/environments may appear: it is the Flex subnet delegation,
+    not a Container Apps resource.)"""
+    denied_types = (
+        "Microsoft.ContainerRegistry",
+        "Microsoft.App/managedEnvironments",
+        "Microsoft.App/jobs",
+        "Microsoft.App/containerApps",
+        "az acr",
+        "containerapp",
+    )
     for path in (BICEP, DEPLOY_SH):
         text = path.read_text()
-        for denied in ("Microsoft.ContainerRegistry", "Microsoft.App/", "az acr", "containerapp"):
+        for denied in denied_types:
             assert denied not in text, f"{path.name} references {denied}"
     assert "'FlexConsumption'" in BICEP.read_text()
     assert "Microsoft.Web/sites@" in BICEP.read_text()
@@ -495,3 +505,74 @@ def test_certificate_verification_is_never_disabled():
         assert "AZURE_CLI_DISABLE_CONNECTION_VERIFICATION=1" not in text
         assert "--trusted-host" not in text
         assert "CERT_NONE" not in text
+
+
+# ---------------------------------------------------------------------------
+# Landing-zone Key Vault and Storage policies, and the private networking they
+# force. Each was a RequestDisallowedByPolicy at the first real deploy.
+# ---------------------------------------------------------------------------
+
+
+def _resource_block(text: str, declaration: str) -> str:
+    start = text.index(declaration)
+    end = text.find("\nresource ", start + 1)
+    return text[start:end if end != -1 else None]
+
+
+def test_vault_meets_the_soft_delete_and_purge_protection_policy():
+    """vpcx-lzn-kv-enable-soft-delete-purge-retention-days-90."""
+    vault = _resource_block(BICEP.read_text(), "resource vault 'Microsoft.KeyVault/vaults@")
+    assert "enableSoftDelete: true" in vault
+    assert "enablePurgeProtection: true" in vault
+    assert "softDeleteRetentionInDays: 90" in vault
+
+
+def test_vault_and_storage_deny_public_network_access():
+    """vpcx-lzn-kv-restrict-network-access and vpcx-lzn-strg-restrict-network-access
+    both evaluate networkAcls.defaultAction."""
+    text = BICEP.read_text()
+    for declaration in (
+        "resource vault 'Microsoft.KeyVault/vaults@",
+        "resource storage 'Microsoft.Storage/storageAccounts@",
+    ):
+        block = _resource_block(text, declaration)
+        assert "defaultAction: 'Deny'" in block, f"{declaration} allows public access"
+        assert "publicNetworkAccess: 'Enabled'" not in block
+
+
+def test_app_reaches_vault_and_storage_privately():
+    """With both firewalled, the app needs VNet integration and an endpoint for
+    every service it uses, or Key Vault references and host storage fail."""
+    text = BICEP.read_text()
+    assert "virtualNetworkSubnetId: integrationSubnetId" in text
+    assert "groupId: 'vault'" in text
+    assert "concat(['blob', 'queue', 'table'], enableStatePersistence ? ['file'] : [])" in text
+    assert "privatelink.vaultcore.azure.net" in text
+    settings = _resource_block(text, "resource appSettings ")
+    assert "privateEndpoints" in settings and "dnsZoneGroups" in settings
+
+
+def test_private_dns_modes_agree_between_template_and_script():
+    assert _bicep_allowed_values("privateDnsMode") == {"central", "local"}
+    case = re.search(r'case "\$PRIVATE_DNS_MODE" in\n\s+([a-z|]+)\)', DEPLOY_SH.read_text())
+    assert case, "deploy.sh no longer validates PRIVATE_DNS_MODE"
+    assert set(case.group(1).split("|")) == {"central", "local"}
+    assert "param privateDnsMode string = 'central'" in BICEP.read_text()
+    assert 'PRIVATE_DNS_MODE="${PRIVATE_DNS_MODE:-central}"' in DEPLOY_SH.read_text()
+
+
+def test_deploy_script_requires_and_checks_both_subnets():
+    """A wrong integration subnet otherwise deploys an app that cannot reach its
+    vault or storage, and never runs."""
+    text = DEPLOY_SH.read_text()
+    assert "require INTEGRATION_SUBNET_ID" in text
+    assert "require PRIVATE_ENDPOINT_SUBNET_ID" in text
+    assert {"integrationSubnetId", "privateEndpointSubnetId", "privateDnsMode"} <= (
+        _deploy_sh_bicep_parameters()
+    )
+    assert 'index("Microsoft.App/environments")' in text, "delegation not checked"
+    assert "-le 27" in text, "subnet size not checked"
+    assert "*_*" in text, "underscore in subnet name not checked"
+    assert "az provider show --namespace Microsoft.App" in text
+    # Before anything is built or deployed.
+    assert text.index('echo "==> Network"') < text.index('echo "==> Building function package')

@@ -120,8 +120,8 @@ Graph v1.0 exposes no delta query for `managedDevices`. Rather than simulate one
 with timestamp filtering — which silently misses devices whose properties change
 without a check-in — every run reads the full inventory.
 
-A daily full pass over even a large tenant is a few minutes of a process that
-costs under $0.10/month to run. Correctness is worth more than the saving.
+A daily full pass over even a large tenant is a few minutes of compute that
+sits inside the free grant. Correctness is worth more than the saving.
 
 ### 4.3 Plain REST for Graph data, SDK for auth
 

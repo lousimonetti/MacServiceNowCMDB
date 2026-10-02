@@ -114,6 +114,22 @@ for tool in jq zip "$PYTHON"; do
   command -v "$tool" >/dev/null || die "$tool is required"
 done
 
+# The landing zone denies public access to Key Vault and Storage, so the app
+# reaches them privately, through two subnets of the landing zone's network
+# (README.md, "Networking"):
+#   INTEGRATION_SUBNET_ID       Flex VNet integration; delegated to
+#                               Microsoft.App/environments, /27 or larger
+#   PRIVATE_ENDPOINT_SUBNET_ID  private endpoints for the vault and storage
+#   PRIVATE_DNS_MODE            central (hub zones, policy registers records;
+#                               default) or local (this stack creates the zones)
+require INTEGRATION_SUBNET_ID
+require PRIVATE_ENDPOINT_SUBNET_ID
+PRIVATE_DNS_MODE="${PRIVATE_DNS_MODE:-central}"
+case "$PRIVATE_DNS_MODE" in
+  central|local) ;;
+  *) die "PRIVATE_DNS_MODE must be 'central' or 'local' (got '${PRIVATE_DNS_MODE}')" ;;
+esac
+
 SNOW_WRITE_MODE="${SNOW_WRITE_MODE:-identify_reconcile}"
 case "$SNOW_WRITE_MODE" in
   identify_reconcile|cmdb_instance) ;;
@@ -295,6 +311,43 @@ elif ! grep -qx "$(normalise_region <<< "$LOCATION")" <<< "$FLEX_REGIONS"; then
        live in a different region from their resource group."
 fi
 
+# Each of these otherwise fails the deploy after the vault and storage exist, or
+# worse, deploys an app that cannot reach either and never runs.
+echo "==> Network"
+lower() { tr '[:upper:]' '[:lower:]'; }
+INTEGRATION_SUBNET=$(az network vnet subnet show --ids "$INTEGRATION_SUBNET_ID" --output json 2>/dev/null) \
+  || die "integration subnet not found: ${INTEGRATION_SUBNET_ID}
+       Ask the platform team for a /27 subnet delegated to Microsoft.App/environments;
+       see README.md, \"Networking\"."
+INTEGRATION_NAME=$(jq -r '.name' <<< "$INTEGRATION_SUBNET")
+INTEGRATION_PREFIX=$(jq -r '.addressPrefix // .addressPrefixes[0] // ""' <<< "$INTEGRATION_SUBNET")
+[[ "$INTEGRATION_NAME" != *_* ]] \
+  || die "integration subnet ${INTEGRATION_NAME} has an underscore in its name, which Flex
+       Consumption cannot use. It needs a subnet named without one."
+jq -e '[.delegations[]?.serviceName] | index("Microsoft.App/environments")' <<< "$INTEGRATION_SUBNET" >/dev/null \
+  || die "integration subnet ${INTEGRATION_NAME} is not delegated to Microsoft.App/environments
+       (Flex Consumption's delegation; Premium plans use Microsoft.Web/serverFarms instead)."
+[[ "${INTEGRATION_PREFIX#*/}" =~ ^[0-9]+$ && ${INTEGRATION_PREFIX#*/} -le 27 ]] \
+  || die "integration subnet ${INTEGRATION_NAME} is ${INTEGRATION_PREFIX:-unknown}; Flex Consumption needs /27 or larger"
+jq -e '((.privateEndpoints // []) + (.serviceEndpoints // [])) | length == 0' <<< "$INTEGRATION_SUBNET" >/dev/null \
+  || die "integration subnet ${INTEGRATION_NAME} holds private or service endpoints; Flex Consumption
+       needs it to itself. Put the private endpoints in PRIVATE_ENDPOINT_SUBNET_ID instead."
+echo "    integration  ${INTEGRATION_NAME} (${INTEGRATION_PREFIX}, Microsoft.App/environments)"
+
+[[ "$(lower <<< "$PRIVATE_ENDPOINT_SUBNET_ID")" != "$(lower <<< "$INTEGRATION_SUBNET_ID")" ]] \
+  || die "PRIVATE_ENDPOINT_SUBNET_ID must be a different subnet from INTEGRATION_SUBNET_ID"
+ENDPOINT_NAME=$(az network vnet subnet show --ids "$PRIVATE_ENDPOINT_SUBNET_ID" --query name --output tsv 2>/dev/null) \
+  || die "private endpoint subnet not found: ${PRIVATE_ENDPOINT_SUBNET_ID}"
+echo "    endpoints    ${ENDPOINT_NAME} (private DNS: ${PRIVATE_DNS_MODE})"
+
+# The delegation above needs the provider; registering it is a subscription-level
+# action the platform team may reserve.
+APP_PROVIDER=$(az provider show --namespace Microsoft.App --query registrationState --output tsv 2>/dev/null || echo unknown)
+[[ "$APP_PROVIDER" == Registered ]] \
+  || die "the Microsoft.App resource provider is ${APP_PROVIDER} in this subscription. Flex
+       Consumption VNet integration needs it registered:
+         az provider register --namespace Microsoft.App"
+
 GRAPH_TENANT_ID="${GRAPH_TENANT_ID:-$SUBSCRIPTION_TENANT}"
 
 case "$GRAPH_AUTH_MODE" in
@@ -362,6 +415,9 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
   --template-file "$(dirname "$0")/main.bicep" \
   --parameters \
       namePrefix="$NAME_PREFIX" \
+      integrationSubnetId="$INTEGRATION_SUBNET_ID" \
+      privateEndpointSubnetId="$PRIVATE_ENDPOINT_SUBNET_ID" \
+      privateDnsMode="$PRIVATE_DNS_MODE" \
       location="$LOCATION" \
       schedule="$SCHEDULE" \
       pythonVersion="$PYTHON_VERSION" \
@@ -477,6 +533,7 @@ Deployed.
   Resource group   ${RESOURCE_GROUP} (${LOCATION})
   Schedule         ${SCHEDULE} (NCRONTAB, UTC)
   Graph auth       ${GRAPH_AUTH_MODE}
+  Network          ${INTEGRATION_NAME} (integration), ${ENDPOINT_NAME} (endpoints), DNS ${PRIVATE_DNS_MODE}
   Intune tenant    ${GRAPH_TENANT_ID}
   Alerts           ${ALERT_EMAIL:-NONE - set ALERT_EMAIL to be told when runs stop}
 

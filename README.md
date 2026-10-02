@@ -229,7 +229,10 @@ DRY_RUN=true ./deploy/azure/deploy.sh
 Provisions a timer-triggered function app on the Flex Consumption plan, a
 user-assigned managed identity, Key Vault for the ServiceNow secret, an Azure
 Files share mounted for state, and Application Insights over Log Analytics —
-then grants the identity its Graph permissions.
+then grants the identity its Graph permissions. The landing zone denies public
+access to Key Vault and Storage, so the function joins the landing zone's
+network and reaches both through private endpoints; two subnets are
+prerequisites (see the Azure README's *Networking*).
 
 There is no container image and no registry. `deploy.sh` builds a zip package
 locally (the connector plus its Linux wheels) and deploys it into a blob
@@ -288,11 +291,14 @@ docker run --rm --env-file .env intune-cmdb-sync
 | Scheduler | included | $0.00 — free tier |
 | Secrets | ~$0.00 — Key Vault standard | $0.00 — SSM Standard |
 | State and package | ~$0.10 — Azure Files and Blob | ~$0.00 — S3 |
+| Private networking | ~$36.50 — 5 private endpoints, required by the landing zone | n/a — not in a VPC |
 | Logs | $0.00 — under the 5 GB free tier | $0.00 — under the 5 GB free tier |
-| **Total** | **~$0.10/month** | **~$0.20/month** |
+| **Total** | **~$37/month** | **~$0.20/month** |
 
-List prices, single daily run, ~5 minutes. Full workings are in the deployment
-READMEs.
+List prices, single daily run, ~5 minutes. The Azure figure is almost entirely
+private endpoints. They are needed because the landing zone denies public
+access to Key Vault and Storage; without that policy Azure costs about
+$0.10/month. Full workings are in the deployment READMEs.
 
 ---
 

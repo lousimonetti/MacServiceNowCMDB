@@ -144,11 +144,14 @@ behaviour change, particularly anything altering what gets written to a CI.
   - **Still denied:** `ContainerRegistry/registries`, `App/managedEnvironments`,
     `App/jobs`, `Microsoft.Logic`, `Microsoft.Automation`,
     `Insights/dataCollectionRules`, `Network/natGateways`.
-  - **Unconfirmed and load-bearing: `Microsoft.Insights/components`**
-    (Application Insights). It was not on the recorded allowlist, and without it
-    the function's logs reach nothing and both alerts are blind. ARM preflight
-    rejects a denied type before creating anything, so the first deploy is the
-    test. If refused, request it; do not drop telemetry to get a deploy through.
+  - **Probably allowed, still load-bearing: `Microsoft.Insights/components`**
+    (Application Insights). The 2026-10-02 preflight, which reports every
+    refusal at once, refused only the vault and storage account. Without it the
+    function's logs reach nothing and both alerts are blind; if it is ever
+    refused, request it, and do not drop telemetry to get a deploy through.
+  - **Not yet confirmed: `Microsoft.Network/privateEndpoints`** (and
+    `privateDnsZones` in `local` DNS mode), which the vault and storage
+    firewall policies made necessary.
 
 - **The deploying machine is behind Zscaler TLS inspection.** `az` and `pip`
   trust only certifi's public roots, so they fail with
@@ -162,6 +165,26 @@ behaviour change, particularly anything altering what gets written to a CI.
   needs no code change behind the proxy: `httpx` 0.28 reads `SSL_CERT_FILE` and
   msal/`requests` read `REQUESTS_CA_BUNDLE`. Never disable verification
   (`AZURE_CLI_DISABLE_CONNECTION_VERIFICATION`, `--trusted-host`).
+
+- **The landing zone also denies public access to Key Vault and Storage.** The
+  first real deploy (2026-10-02) was refused in preflight by
+  `vpcx-lzn-kv-restrict-network-access`, `vpcx-lzn-strg-restrict-network-access`
+  (both test `networkAcls.defaultAction != Deny`) and
+  `vpcx-lzn-kv-enable-soft-delete-purge-retention-days-90` (purge protection,
+  90 days). Nothing else in the template was refused, so Application Insights
+  and `Microsoft.Web` very likely pass. The consequence is structural: the app
+  reaches the vault and storage only through private endpoints (`vault`,
+  `blob`, `queue`, `table`, `file`), and Flex VNet integration needs a
+  dedicated subnet delegated to `Microsoft.App/environments`, at least /27, with
+  no `_` in its name and no other endpoints. Both subnets are inputs
+  (`INTEGRATION_SUBNET_ID`, `PRIVATE_ENDPOINT_SUBNET_ID`), never created, and
+  `deploy.sh` validates them before building. Flex routes **all** outbound
+  traffic through the integration subnet, so Graph, Entra, ServiceNow and
+  Application Insights egress depends on the landing zone's firewall. Laptops
+  lose data-plane access: rotate secrets by redeploying (ARM writes them through
+  the control plane), and the share's `run-report.json` is unreadable from
+  outside. Private endpoints make Azure ~$37/month per environment, not ~$0.10.
+  Purge protection is irreversible and holds a deleted vault's name 90 days.
 
 - **`SNOW_CLASS_MAP` replaces the built-in default, it does not extend it.**
   `_env_kv_map` returns the parsed value or the default, never a merge, so a map
@@ -291,8 +314,9 @@ Green tests are weaker evidence here than they look.
    stack in `deploy/azure/` replaced Container Apps the day `Microsoft.Web` was
    approved. Nothing about it has run in Azure yet; green tests and a clean
    `az bicep build` are all that back it. Things the first deploy must confirm:
-   that `Microsoft.Insights/components` is allowed (see Constraints); that the
-   region supports Flex Consumption; that the zip deploy registers
+   the two subnets and private DNS (see Constraints; the platform-team asks are
+   in the Azure README's *Networking*); that the region supports Flex
+   Consumption; that the zip deploy registers
    `intune_cmdb_sync` (deploy.sh checks); that `AppTraces` carries the JSON line
    under `AppRoleName` = the app name (the alert queries assume both); and that
    `state.json` is writable on the `/mounts/state` share. Follow

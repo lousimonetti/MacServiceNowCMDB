@@ -89,6 +89,11 @@ az account set --subscription <name or id>    # if it is the wrong one
   unset, `deploy.sh` lists the groups in the current subscription and asks you
   to pick one by number. It checks the group exists, and never creates one.
   There is no default group.
+- [ ] **Two subnets in the landing zone's network**, because the policy denies
+  public access to Key Vault and Storage: a `/27` (or larger) delegated to
+  `Microsoft.App/environments` for the function's VNet integration, and one for
+  private endpoints. Usually the platform team provides them. See
+  [Networking](#networking) for what to ask for and how to find out what exists.
 - [ ] **A Graph credential that matches your tenant topology.** See
   [Choosing Graph authentication](#choosing-graph-authentication) below and
   [docs/entra-setup.md](../../docs/entra-setup.md).
@@ -198,16 +203,18 @@ stack creates these, and every one must be on it:
 | Resource type | Status as last recorded |
 | --- | --- |
 | `Microsoft.Web/serverfarms`, `Microsoft.Web/sites` (and `sites/config`) | Approved for Functions and App Service |
-| `Microsoft.Storage/storageAccounts` (blob container, file share) | Allowed |
-| `Microsoft.KeyVault/vaults` | Allowed |
+| `Microsoft.Storage/storageAccounts` (blob container, file share) | Allowed **with public network access denied** (`vpcx-lzn-strg-restrict-network-access`); the template sets `networkAcls.defaultAction: Deny` |
+| `Microsoft.KeyVault/vaults` | Allowed **with public network access denied, purge protection on and 90-day retention** (`vpcx-lzn-kv-restrict-network-access`, `vpcx-lzn-kv-enable-soft-delete-purge-retention-days-90`); the template sets all three |
+| `Microsoft.Network/privateEndpoints` (and `privateDnsZones` in `local` DNS mode) | **Not confirmed.** Needed because of the two rows above |
 | `Microsoft.ManagedIdentity/userAssignedIdentities` | Allowed |
 | `Microsoft.OperationalInsights/workspaces` | Allowed |
 | `Microsoft.Insights/actionGroups`, `Microsoft.Insights/scheduledQueryRules` | Allowed |
-| **`Microsoft.Insights/components`** (Application Insights) | **Not confirmed.** It was not on the allowlist when last recorded. |
+| `Microsoft.Insights/components` (Application Insights) | Probably allowed: the 2026-10-02 preflight refused only the vault and storage account |
 
-Application Insights is how a Python function's logs leave the host. Without it
-there are no logs to query and nothing for the alerts to read. If the policy
-still refuses it, ask for it alongside the `Microsoft.Web` approval.
+Preflight evaluates every resource in the template and reports every refusal at
+once, so the two rows it refused on 2026-10-02 are good evidence that the
+others passed. Application Insights matters most of those: it is how a Python
+function's logs leave the host, and without it the alerts have nothing to read.
 
 A denied type costs nothing to discover: ARM evaluates deny policies during
 preflight, before it creates any resource, so `deploy.sh` stops with
@@ -233,6 +240,11 @@ NAME_PREFIX=intunecmdb-dev
 RESOURCE_GROUP=azc-obm-development     # pre-existing, never created; omit to pick from a list
 # LOCATION is not set: resources go to East US (eastus) by default
 CA_BUNDLE=macos-keychain               # behind Zscaler; see "Behind a TLS-inspecting proxy"
+
+# Networking: both required; see "Networking"
+INTEGRATION_SUBNET_ID=/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<delegated /27>
+PRIVATE_ENDPOINT_SUBNET_ID=/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<endpoints>
+PRIVATE_DNS_MODE=central               # or local; see "Networking"
 SNOW_INSTANCE=acmedev
 SNOW_CLIENT_ID=<from the Application Registry entry>
 SNOW_WRITE_MODE=identify_reconcile     # the mode --check-api allowed
@@ -397,6 +409,71 @@ the run degraded when more than 10% of known devices vanish at once. That
 catches a partial Graph response or a wrong tenant before they turn into a
 mass retirement.
 
+## Networking
+
+The landing zone denies public network access to Key Vault and Storage. The
+function therefore reaches its own vault and storage privately:
+
+- **Outbound:** VNet integration through `INTEGRATION_SUBNET_ID`. Flex
+  Consumption sends **all** of the app's outbound traffic through that subnet,
+  not only traffic to the vault and storage. So the landing zone's firewall
+  must allow it out to Entra, Graph, ServiceNow and Application Insights, or
+  every run fails at its first HTTP call.
+- **To the vault and storage:** five private endpoints in
+  `PRIVATE_ENDPOINT_SUBNET_ID`: `vault`, plus storage `blob` (the code package
+  and the timer's lease), `queue` and `table` (the Functions host), and `file`
+  (the state share).
+- **Name resolution:** the `privatelink.*` DNS zones. With
+  `PRIVATE_DNS_MODE=central` (the default), the landing zone's hub owns them
+  and a policy registers each endpoint. With `local`, this stack creates the
+  zones in its resource group and links them to the endpoint subnet's VNet.
+
+`deploy.sh` checks the integration subnet before anything is built: it must be
+delegated to `Microsoft.App/environments`, be `/27` or larger, have no
+underscore in its name, and hold no other endpoints. It also checks that the
+endpoint subnet exists and that the `Microsoft.App` provider is registered.
+
+**Find out what exists** (read-only):
+
+```bash
+az network vnet list --query "[].{name:name, rg:resourceGroup, prefixes:addressSpace.addressPrefixes}" -o table
+az network vnet subnet list -g <vnet resource group> --vnet-name <vnet> \
+  --query "[].{name:name, prefix:addressPrefix, delegations:delegations[].serviceName, id:id}" -o table
+az network private-dns zone list --query "[?starts_with(name,'privatelink')].{name:name, rg:resourceGroup}" -o table
+az provider show -n Microsoft.App --query registrationState -o tsv
+```
+
+If `privatelink.vaultcore.azure.net` and the `privatelink.*.core.windows.net`
+zones show up in a resource group you don't own, DNS is central: keep the
+default. If none exist anywhere, ask before choosing `local`. A local zone
+shadows a central one for the linked VNet.
+
+**What to ask the platform team for:**
+
+1. Two subnets in the spoke VNet: a `/27` delegated to
+   `Microsoft.App/environments`, named without underscores, for Flex
+   Consumption VNet integration; and one for private endpoints. Their resource
+   IDs go in `INTEGRATION_SUBNET_ID` and `PRIVATE_ENDPOINT_SUBNET_ID`.
+2. How private DNS works: central `privatelink` zones with a policy that
+   registers endpoints, or zones we create.
+3. Egress from the integration subnet, HTTPS (443) to:
+   `login.microsoftonline.com`, `graph.microsoft.com`,
+   `<instance>.service-now.com`, `*.in.applicationinsights.azure.com`,
+   `*.livediagnostics.monitor.azure.com`.
+4. `Microsoft.Network/privateEndpoints` on the allowed-resource list, and the
+   `Microsoft.App` resource provider registered in the subscription.
+
+**What no longer works from your laptop.** The vault and the storage data plane
+now accept only private traffic:
+- Setting a secret with `az keyvault secret set`: rotate by redeploying instead.
+  The template writes secrets through ARM, which the vault firewall does not
+  cover.
+- Reading `run-report.json` or `state.json` from the share, including through
+  Storage Explorer and the portal's file browser.
+
+The run summary in Application Insights is unaffected and stays the place to
+look.
+
 ## Emergency stop
 
 To stop writes **immediately**:
@@ -499,8 +576,8 @@ az resource list -g "$RESOURCE_GROUP" \
 
 The second pattern matches the storage account, whose name has the hyphen
 removed. If a delete fails because the function app still depends on its plan,
-run the command again. Key Vault soft-delete keeps the vault name reserved for
-7 days afterwards (see [Teardown](#teardown)).
+run the command again. The deleted vault's name stays reserved for 90 days
+afterwards (see [Teardown](#teardown)).
 
 ## What gets created
 
@@ -509,12 +586,14 @@ For each `NAME_PREFIX`:
 | Resource | Name | Purpose |
 | --- | --- | --- |
 | User-assigned managed identity | `<prefix>-id` | Key Vault references, host storage, telemetry, and Graph authentication in `managed_identity` mode |
-| Key Vault | `<prefix>kv<hash>` | The ServiceNow secret, and the Graph secret in `client_secret` mode |
+| Key Vault | `<prefix>kv<hash>` | The ServiceNow secret, and the Graph secret in `client_secret` mode. Public access denied, purge protection on, 90-day retention |
+| Private endpoints | `<prefix>-pe-{vault,blob,queue,table,file}` | Private access to the vault and storage, in `PRIVATE_ENDPOINT_SUBNET_ID` |
+| Private DNS zones | `privatelink.*` | `local` DNS mode only; shared by every stack in the resource group |
 | Log Analytics workspace | `<prefix>-logs` | Where Application Insights stores traces, 30-day retention |
 | Application Insights | `<prefix>-ai` | Collects the function's logs and invocations; local auth disabled |
 | Flex Consumption plan | `<prefix>-plan` | One app per plan, scales to zero |
 | Function app | `<prefix>-fn-<hash>` | The timer-triggered sync. At most one instance, 30-minute timeout, no retry. |
-| Storage account | `<prefix>st<hash>` | The deployment package (blob), the host's timer state, and the `state` file share for `state.json` and `run-report.json` |
+| Storage account | `<prefix>st<hash>` | The deployment package (blob), the host's timer state, and the `state` file share for `state.json` and `run-report.json`. Public access denied |
 | Alert rules + action group | `<prefix>-alerts` and others | Only when `ALERT_EMAIL` is set |
 
 The function app name carries a hash because function app names are global
@@ -537,10 +616,14 @@ List prices, one 5-minute run per day on a 2 GB instance.
 | Application Insights + Log Analytics | a few MB | **$0.00**: the first 5 GB/month is free |
 | Key Vault (standard) | ~30–60 secret reads | **~$0.00**: no monthly fee, ~$0.03/10,000 operations |
 | Storage (Standard LRS) | ~11 MB package, 1 GiB share quota, a few hundred KB used | **~$0.10** |
-| **Per environment** | | **about $0.10/month** |
+| Private endpoints | 5 × ~730 hours, a few MB processed | **~$36.50**: ~$0.01/hour each |
+| Private DNS zones | 5 zones, `local` mode only | **~$2.50**, or $0 with central DNS |
+| **Per environment** | | **about $37/month** |
 
-The free grant is per subscription, so environments share it. There is no
-registry to pay for.
+The private endpoints are nearly the whole bill. The landing zone requires them
+(see [Networking](#networking)); without that policy this stack costs about
+$0.10/month. The free grant is per subscription, so environments share it.
+There is no registry to pay for.
 
 To drop the file share, deploy with `enableStatePersistence=false`. You lose
 retirement and the persisted run report. Everything else works. The storage
@@ -618,8 +701,9 @@ AppTraces
 ```
 
 `run-report.json` and `state.json` are on the `state` file share of the stack's
-storage account. Read them with Storage Explorer, or
-`az storage file download --account-name <account> --share-name state --path run-report.json`.
+storage account. That share now accepts only private traffic, so they can't be
+read from a laptop (see [Networking](#networking)). The `run complete` trace
+carries the counts and `error_samples`, which covers most questions.
 
 ### Changing configuration
 
@@ -629,10 +713,11 @@ next deploy.
 
 ### Secret rotation
 
-- **ServiceNow or Graph secret:** redeploy with the new value. Or set the new
-  version directly in Key Vault: the app settings reference the secret without a
-  version, so the app picks it up within 24 hours, or at once on
-  `az functionapp restart`.
+- **ServiceNow or Graph secret:** redeploy with the new value. The vault denies
+  public access, so `az keyvault secret set` from a laptop no longer works. The
+  template writes the secret through ARM, which the vault firewall does not
+  cover. The app settings reference the secret without a version, so the app
+  picks up the new one within 24 hours, or at once on `az functionapp restart`.
 - **An expired Graph secret stops runs.** The *no successful run* alert is what
   reports it. Put the expiry dates in a calendar.
 - **Rotating the storage account key breaks the state mount** until the next
@@ -710,6 +795,10 @@ did not create it, and it may hold resources that are not this connector's.
 Remove a stack by its prefix, as in
 [Removing one environment](#multiple-servicenow-environments). Role assignments
 made to the deleted identity are left behind as "Identity not found" entries;
-remove them from the group's Access control blade if they bother you. Key Vault
-soft-delete keeps the vault name reserved for 7 days. Use `az keyvault purge`
-if you need to reuse it sooner.
+remove them from the group's Access control blade if they bother you.
+
+**A deleted vault cannot be purged.** The policy requires purge protection,
+which keeps a deleted vault, and its name, for the full 90-day retention, and
+`az keyvault purge` is refused. Redeploying the same `NAME_PREFIX` into the
+same resource group within those 90 days needs the old vault recovered
+(`az keyvault recover --name <vault>`), not recreated.
