@@ -7,6 +7,7 @@
 #   webjob.sh report       the latest run-report.json
 #   webjob.sh state        state.json (device id -> CI sys_id)
 #   webjob.sh deployments  recent code deployments
+#   webjob.sh files [DIR]  list wwwroot, or a folder in it (e.g. packages)
 #
 # Needs RESOURCE_GROUP and NAME_PREFIX, the same values deploy.sh used, plus
 # CA_BUNDLE if you are behind Zscaler and it is not already handled. The app has
@@ -60,10 +61,13 @@ case "${1:-}" in
     ;;
   deployments)
     kudu GET /api/deployments \
-      | jq -r '.[:5][] | [.received_time, .status_text // (.status | tostring), .message // ""] | @tsv'
+      | jq -r '.[:5][] | [.received_time, (.status | tostring), .status_text // "", .message // ""] | @tsv'
+    ;;
+  files)
+    kudu GET "/api/vfs/site/wwwroot/${2:+${2%/}/}" | jq -r '.[] | [.mime, .name] | @tsv'
     ;;
   *)
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

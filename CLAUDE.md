@@ -87,8 +87,11 @@ behaviour change, particularly anything altering what gets written to a CI.
     (`SCM_DO_BUILD_DURING_DEPLOYMENT=false`).
   - `settings.job` holds the six-field NCRONTAB schedule (written from
     `SCHEDULE`) and `is_singleton: true`.
-  - `run.py` uses an absolute path to `packages/`, because Kudu copies a
-    triggered job to a temp dir before running it.
+  - `run.py` finds `packages/` by absolute path: `WEBROOT_PATH`, then
+    `/home/site/wwwroot`, then `$HOME/site/wwwroot`. Kudu copies a triggered job
+    to a temp dir before running it, and Kudu, not the app container, runs it,
+    so `HOME` alone was not reliable (`ModuleNotFoundError` on 2026-10-02).
+    When nothing is found it prints where it looked and exits 3.
   - Basic B1 because scheduled WebJobs need Always On (~$13/month of the ~$20).
   - `WEBJOBS_IDLE_TIMEOUT=1800`: a triggered job is killed after 2 quiet
     minutes otherwise.
@@ -110,7 +113,10 @@ behaviour change, particularly anything altering what gets written to a CI.
   certificate. The reachability check uses `/api/deployments`: on Linux,
   `/api/environment` returns the Kudu dashboard with HTTP 500. That stopped the
   first real deploy (2026-10-02) on a healthy app. `deploy.sh` uploads through
-  `POST /api/publish` that way, and `webjob.sh` runs and reads the job.
+  `POST /api/publish?...&async=true` that way, then polls
+  `/api/deployments/latest` (status 4 = success) against the previous
+  deployment's id. The synchronous publish got a gateway 502 mid-extract on
+  2026-10-02. `webjob.sh` runs and reads the job.
   `az webapp deploy`, `az webapp webjob` and the portal's Kudu pages do not
   work from outside the network; ARM operations (app settings, restart, stop)
   still do. Cost is ~$20/month (B1 + one endpoint).

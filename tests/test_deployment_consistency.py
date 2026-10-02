@@ -451,7 +451,10 @@ def test_webjob_layout_matches_what_the_script_verifies():
 
 def test_webjob_package_path_matches_the_install_target():
     """run.py adds wwwroot/packages to sys.path; the build must install there."""
-    assert '"site", "wwwroot", "packages"' in WEBJOB_RUN.read_text()
+    text = WEBJOB_RUN.read_text()
+    assert '"/home/site/wwwroot"' in text
+    assert 'os.environ.get("WEBROOT_PATH")' in text
+    assert 'os.path.join(_root, "packages")' in text
     assert '--target "${PACKAGE_DIR}/packages"' in DEPLOY_SH.read_text()
 
 
@@ -592,3 +595,22 @@ def test_kudu_reachability_uses_an_endpoint_linux_kudu_serves():
     assert "kudu GET /api/deployments --max-time 20" in code
     assert "/api/environment" not in code
 
+
+
+
+def test_webjob_finds_packages_without_trusting_home():
+    """Kudu runs the job, and its HOME is not reliably /home; trusting HOME
+    alone gave ModuleNotFoundError on the first real run (2026-10-02)."""
+    text = WEBJOB_RUN.read_text()
+    assert text.index('os.environ.get("WEBROOT_PATH")') < text.index('"/home/site/wwwroot"')
+    assert "sys.exit(3)" in text, "a missing package must explain itself, not traceback"
+
+
+def test_code_upload_is_asynchronous_and_polled():
+    """A synchronous publish of the 14 MB package got a gateway 502 mid-extract
+    on the first real deploy, leaving the outcome unknown."""
+    text = DEPLOY_SH.read_text()
+    assert "/api/publish?type=zip&clean=true&restart=true&async=true" in text
+    assert "kudu GET /api/deployments/latest" in text
+    assert '"$PREVIOUS_DEPLOYMENT"' in text, "must not mistake the previous deploy for this one"
+    assert '== "4" ]]' in text, "only Kudu status 4 is success"

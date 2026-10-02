@@ -408,11 +408,34 @@ for attempt in 1 2 3 4 5 6; do
 done
 
 echo "==> Deploying code to ${APP_NAME}"
-kudu POST "/api/publish?type=zip&clean=true&restart=true" \
+# Asynchronous, then polled. A synchronous publish holds the request open until
+# Kudu has extracted the whole package, and the gateway in front of it answered
+# 502 before that finished on the first real deploy (2026-10-02), leaving the
+# outcome unknown. Kudu deployment status: 3 = failed, 4 = success.
+PREVIOUS_DEPLOYMENT=$(kudu GET /api/deployments/latest --max-time 30 2>/dev/null \
+  | jq -r '.id // empty' 2>/dev/null || true)
+kudu POST "/api/publish?type=zip&clean=true&restart=true&async=true" \
     --data-binary "@${PACKAGE_ZIP}" --header "Content-Type: application/zip" \
-    --max-time 900 --output /dev/null \
-  || die "code deployment failed; the infrastructure is deployed, so re-running
+    --max-time 600 --output /dev/null \
+  || die "the package upload failed; the infrastructure is deployed, so re-running
        this script is safe"
+DEPLOYMENT=""
+for attempt in $(seq 1 60); do
+  LATEST=$(kudu GET /api/deployments/latest --max-time 30 2>/dev/null || true)
+  if [[ -n "$LATEST" ]] \
+      && [[ "$(jq -r '.id // empty' <<< "$LATEST" 2>/dev/null)" != "$PREVIOUS_DEPLOYMENT" ]] \
+      && [[ "$(jq -r '.complete' <<< "$LATEST" 2>/dev/null)" == "true" ]]; then
+    DEPLOYMENT="$LATEST"
+    break
+  fi
+  sleep "${DEPLOY_POLL_SECONDS:-10}"  # overridable for tests only
+done
+[[ -n "$DEPLOYMENT" ]] || die "the package was uploaded but Kudu has not finished deploying it after
+       10 minutes. Check: $(dirname "$0")/webjob.sh deployments"
+[[ "$(jq -r '.status' <<< "$DEPLOYMENT")" == "4" ]] \
+  || die "Kudu could not deploy the package: $(jq -r '.status_text // .message // "no detail"' <<< "$DEPLOYMENT")
+       Details: $(dirname "$0")/webjob.sh deployments"
+echo "    deployed ($(jq -r '.id' <<< "$DEPLOYMENT" | cut -c1-12))"
 
 # A package that deploys fine but puts the job in the wrong folder registers no
 # WebJob at all, and then nothing ever runs and nothing errors. Make that a
