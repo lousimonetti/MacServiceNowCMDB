@@ -8,6 +8,8 @@
 #   webjob.sh state        state.json (device id -> CI sys_id)
 #   webjob.sh deployments  recent code deployments
 #   webjob.sh files [DIR]  list wwwroot, or a folder in it (e.g. packages)
+#   webjob.sh schedule ["SEC MIN HOUR DAY MONTH WEEKDAY"]
+#                          show settings.job, or change its schedule in place (UTC)
 #
 # Needs RESOURCE_GROUP and NAME_PREFIX, the same values deploy.sh used, plus
 # CA_BUNDLE if you are behind Zscaler and it is not already handled. The app has
@@ -66,8 +68,30 @@ case "${1:-}" in
   files)
     kudu GET "/api/vfs/site/wwwroot/${2:+${2%/}/}" | jq -r '.[] | [.mime, .name] | @tsv'
     ;;
+  schedule)
+    job_file="/api/vfs/site/wwwroot/App_Data/jobs/triggered/${WEBJOB_NAME}/settings.job"
+    if [[ -z "${2:-}" ]]; then
+      kudu GET "$job_file" | jq .
+    else
+      # Same rule as deploy.sh: six fields, seconds first. Kudu would accept five
+      # and then never fire.
+      read -ra fields <<<"$2"
+      [[ ${#fields[@]} -eq 6 ]] \
+        || die "schedule must have six fields (sec min hour day month weekday), got ${#fields[@]}: '$2'"
+      # Keep every other key (is_singleton) and replace only the schedule.
+      current=$(kudu GET "$job_file")
+      echo "$current" | jq -e 'type == "object"' >/dev/null || die "settings.job is not a JSON object"
+      echo "$current" | jq --arg s "$2" '.schedule = $s' \
+        | kudu PUT "$job_file" --header 'If-Match: *' \
+            --header 'Content-Type: application/json' --data-binary @- --output /dev/null
+      echo "schedule is now:"
+      kudu GET "$job_file" | jq .
+      echo "Temporary: the next deploy.sh rewrites it from SCHEDULE. Set SCHEDULE='$2' in your environment file too."
+      echo "Confirm Kudu picked it up: $0 history after the new time."
+    fi
+    ;;
   *)
-    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

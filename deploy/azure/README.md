@@ -133,6 +133,51 @@ No VNet integration, new subnet or DNS change is needed.
 The template gives the stack's managed identity permission to publish to
 Application Insights, so plain Contributor is not enough.
 
+### Finding the private endpoint subnet
+
+`PRIVATE_ENDPOINT_SUBNET_ID` is the Azure resource ID of a subnet in a
+landing-zone VNet. It is usually **not** in your own resource group, and it can
+differ per environment, so look it up against the subscription you are deploying
+into.
+
+```bash
+# 1. Be in the right subscription.
+az account show --query "{name:name, id:id, tenant:tenantId}" -o table
+
+# 2. Find the VNet and its subnets. DEV used vpcx-vnet-eastus in VPCXRG.
+az network vnet list \
+  --query "[].{name:name, rg:resourceGroup, location:location, space:addressSpace.addressPrefixes[0]}" -o table
+az network vnet subnet list -g <vnet-rg> --vnet-name <vnet-name> \
+  --query "[].{name:name, prefix:addressPrefix, privateEndpointPolicies:privateEndpointNetworkPolicies}" -o table
+
+# 3. Print the ID of the one you chose, and put it in the environment file.
+az network vnet subnet show -g <vnet-rg> --vnet-name <vnet-name> -n <subnet-name> --query id -o tsv
+```
+
+The ID looks like
+`/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<subnet>`.
+
+Choosing the subnet:
+
+- It must be in East US and have a free address: the endpoint takes one IP.
+- Prefer the subnet that already holds the landing zone's other private
+  endpoints (DEV: `hybridsubnet-1`). If you do not know which, ask the network
+  team.
+- Your machine must be able to reach that subnet's addresses, through Zscaler
+  Private Access or the VPN, because `kudu.sh` deploys through the endpoint.
+- You need `Microsoft.Network/virtualNetworks/subnets/join/action` on it (part of
+  Network Contributor), which is often granted on the VNet's resource group and
+  not yours. Check it with:
+
+  ```bash
+  az role assignment list --assignee "$(az ad signed-in-user show --query id -o tsv)" \
+    --scope <subnet-id> --include-inherited -o table
+  ```
+
+If `az network vnet list` returns nothing, your login cannot see the network
+subscription or resource group. Ask the network team for the subnet ID and the
+join permission.
+
 ### Choosing Graph authentication
 
 This choice decides the credential model. A wrong choice produces a deployment
@@ -499,6 +544,69 @@ correctness requirement: `state.json` maps Intune device IDs to ServiceNow
 If DEV and PROD shared a state file, DEV's IDs would drive PROD's retirement
 decisions. **Do not point two environments at one app or one state path.**
 
+### Deploying each environment, step by step
+
+Repeat these steps once per environment, with that environment's own file
+(`dev.env`, `prod.env`). Nothing is shared between runs except the code revision.
+
+**What differs per environment** (everything else in the stage 4 file can match):
+
+| Setting | DEV | PROD |
+| --- | --- | --- |
+| `NAME_PREFIX` | `intunecmdb-dev` | `intunecmdb-prod` |
+| `RESOURCE_GROUP` | `azc-obm-development` | PROD's pre-provisioned group |
+| `PRIVATE_ENDPOINT_SUBNET_ID` | `hybridsubnet-1` of `vpcx-vnet-eastus` | look it up, see [Finding the private endpoint subnet](#finding-the-private-endpoint-subnet) |
+| `SNOW_INSTANCE`, `SNOW_CLIENT_ID`, `SNOW_CLIENT_SECRET` | the DEV instance and its OAuth client | the PROD instance and its own OAuth client |
+| `SNOW_DISCOVERY_SOURCE` | registered on DEV | registered separately on PROD |
+| `SCHEDULE` | e.g. `0 15 3 * * *` | offset, e.g. `0 45 3 * * *` |
+| `GRAPH_AUTH_MODE` | `client_secret` (Intune is in another tenant) | `managed_identity` if the subscription and Intune share a tenant |
+| `ALERT_EMAIL` | optional | set it |
+
+**Steps:**
+
+1. **Select the subscription.** `az account show`, then `az account set
+   --subscription <name or id>`. The script deploys into whatever `az` points at.
+2. **Check out the revision to ship.** PROD gets a revision only after DEV has
+   run it cleanly. The summary prints it as `Source`.
+3. **Probe the instance from your workstation** (stage 2), with that
+   environment's `.env`: `--check-api`, `--check`, and a `--dry-run --limit 5`.
+   Auth scopes are per instance, so a pass on DEV says nothing about PROD. Fix
+   anything it reports (REST API Auth Scope, discovery source, class map) first.
+4. **Write the environment file** (stage 4) with `DRY_RUN=true` and
+   `RETIRE_MISSING=false`, and the same `SNOW_CLASS_MAP` and
+   `MAPPING_OVERRIDES_FILE` that passed step 3.
+5. **Deploy in dry-run:**
+
+   ```bash
+   set -a && . ./prod.env && set +a
+   read -rs -p "ServiceNow client secret: " SNOW_CLIENT_SECRET; echo; export SNOW_CLIENT_SECRET
+   # client_secret mode only:
+   # read -rs -p "Graph client secret: " GRAPH_CLIENT_SECRET; echo; export GRAPH_CLIENT_SECRET
+   ./deploy.sh
+   ```
+
+   Read the summary: subscription, instance, `Source`, `Dry run true`, and an
+   `Alerts` line that is not `NONE`.
+6. **Trigger and verify** (stage 5):
+   `RESOURCE_GROUP=<group> NAME_PREFIX=<prefix> ./webjob.sh run`, then `history`
+   and `output`, and query `AppTraces`. Gate: `dry_run: true`, `errors: 0`.
+7. **First limited real write** (stage 6) from your workstation against that
+   instance, with `--limit 5` and retirement off. Re-run it: no duplicates.
+8. **Go live** (stage 7): set `DRY_RUN=false` in the environment file and rerun
+   step 5. The summary must read `Dry run  false  -- LIVE`. Trigger one run and
+   check `errors: 0`.
+9. **Daily operation.** The schedule runs the job every day with no further
+   action. The two alerts report a missed or failing run. Put the secret expiry
+   dates in a calendar.
+10. **Retirement** (stage 8) stays off until several clean live runs, and
+    `install_status=7` is confirmed as retired on **that** instance.
+
+To add a third environment, give it a new prefix and environment file and start at
+step 1. Day-to-day commands for any environment take `RESOURCE_GROUP` and
+`NAME_PREFIX` from the shell (`export RESOURCE_GROUP=... NAME_PREFIX=...`), so
+check them before running `webjob.sh` or any `az webapp` command, because the
+wrong pair acts on the wrong environment.
+
 **Promote independently.** DEV runs through every stage before PROD starts. A
 new build follows the same path: redeploy DEV from the new revision, and
 redeploy PROD from that same revision only after DEV has run cleanly. Re-running
@@ -615,6 +723,8 @@ export RESOURCE_GROUP=$RG NAME_PREFIX=$PREFIX
 ./webjob.sh report        # latest run-report.json
 ./webjob.sh state         # state.json
 ./webjob.sh deployments   # recent code deployments
+./webjob.sh schedule      # show the live schedule (settings.job)
+./webjob.sh schedule "0 30 6 * * *"   # change it in place, UTC, no redeploy
 
 WORKSPACE=$(az monitor log-analytics workspace show \
   -g $RG -n $PREFIX-logs --query customerId -o tsv)
@@ -685,6 +795,18 @@ role on the app.
 portal's **Advanced Tools** (Kudu) and **WebJobs** pages, unless your browser
 resolves the private address. App settings, restarts, stop and start still
 work: they go through Azure Resource Manager, not the app.
+
+### Changing the schedule
+
+Permanent: change `SCHEDULE` in the environment file and redeploy.
+
+Without a redeploy: `./webjob.sh schedule "0 30 6 * * *"` rewrites only the
+`schedule` key of the WebJob's `settings.job` through Kudu (six fields, UTC) and
+prints the result. It is temporary, because the next `deploy.sh` writes
+`settings.job` from `SCHEDULE`, so set the same value in the environment file.
+Whether Kudu reloads the schedule without a restart is not verified yet: after the
+new time passes, check `./webjob.sh history`, and run `az webapp restart` if no run
+appears.
 
 ### Changing configuration
 
