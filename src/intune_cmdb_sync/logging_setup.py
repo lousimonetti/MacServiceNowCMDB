@@ -151,5 +151,15 @@ def configure_logging(level: str = "INFO", fmt: str = "json") -> None:
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
 
     # These libraries log a line per request at INFO, which drowns the run log.
-    for noisy in ("httpx", "httpcore", "azure.identity", "azure.core.pipeline"):
+    # The Azure Monitor exporter logs "Transmission succeeded" per batch, and
+    # with its own handler on the root logger each line is exported, which logs
+    # again: an endless loop that kept the WebJob from ever reaching the sync.
+    for noisy in (
+        "httpx",
+        "httpcore",
+        "azure.identity",
+        "azure.core.pipeline",
+        "azure.monitor.opentelemetry.exporter",
+        "opentelemetry",
+    ):
         logging.getLogger(noisy).setLevel(logging.WARNING)

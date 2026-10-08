@@ -97,6 +97,13 @@ def test_configure_logging_silences_chatty_dependencies():
     assert len(logging.getLogger().handlers) == 1
 
 
+def test_exporter_logger_is_silenced_so_export_cannot_feed_itself(capsys):
+    configure_logging("INFO", "json")
+    exporter = logging.getLogger("azure.monitor.opentelemetry.exporter.export._base")
+    exporter.info("Transmission succeeded: Item received: 1. Items accepted: 1")
+    assert "Transmission succeeded" not in capsys.readouterr().out
+
+
 class TestRunId:
     """Every log line carries the same id, so a run can be isolated in a log
     store holding weeks of them, and joined to the report it produced."""
