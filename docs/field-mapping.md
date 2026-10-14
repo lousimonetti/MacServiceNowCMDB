@@ -67,14 +67,10 @@ connector reads that output when `INTUNE_MAC_RAM_ATTRIBUTE` names the attribute.
 It fills `ram` only where Graph reported none, so Windows values are untouched.
 
 1. In Intune: **Devices > macOS > Custom attributes > Add**. Name it (for
-   example `RAM bytes`), set the data type to **Integer**, and use this script:
-
-   ```sh
-   #!/bin/sh
-   sysctl -n hw.memsize
-   ```
-
-   Assign it to the Macs.
+   example `RAM bytes`), set the data type to **Integer**, and upload
+   [`deploy/intune/mac-ram-bytes.sh`](../deploy/intune/mac-ram-bytes.sh). It
+   prints `sysctl -n hw.memsize`, and exits non-zero rather than print anything
+   that is not a whole number. Assign it to the Macs.
 2. Grant the Graph app `DeviceManagementScripts.Read.All` (Application), with
    admin consent. In `managed_identity` mode, `deploy.sh` grants it when the
    setting is set.
