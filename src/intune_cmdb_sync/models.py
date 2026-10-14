@@ -70,9 +70,14 @@ class DeviceOutcome:
     user_matched_on: str | None = None
     assigned_to: str | None = None
     message: str | None = None
+    # Exactly what went to ServiceNow. Without it, "unchanged" cannot be told
+    # apart from "the field was never sent" -- see docs/field-mapping.md.
+    sent_values: dict[str, Any] | None = None
+    # Anything in IRE's per-item result beyond operation and sysId, verbatim.
+    ire_detail: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "intune_id": self.intune_id,
             "device_name": self.device_name,
             "serial_number": self.serial_number,
@@ -83,6 +88,11 @@ class DeviceOutcome:
             "assigned_to": self.assigned_to,
             "message": self.message,
         }
+        if self.sent_values is not None:
+            out["sent_values"] = self.sent_values
+        if self.ire_detail:
+            out["ire_detail"] = self.ire_detail
+        return out
 
 
 @dataclass
@@ -96,6 +106,9 @@ class RunReport:
     finished_at: datetime | None = None
     dry_run: bool = False
     write_mode: str = ""
+    # Whether RAM / ethernet MAC were requested at all. A setting that never
+    # reached the process looks identical to Graph returning nothing.
+    fetch_hardware_detail: bool = False
     devices_fetched: int = 0
     devices_after_ownership_filter: int = 0
     devices_skipped_no_class: int = 0
@@ -149,6 +162,7 @@ class RunReport:
             "duration_seconds": self.duration_seconds,
             "dry_run": self.dry_run,
             "write_mode": self.write_mode,
+            "fetch_hardware_detail": self.fetch_hardware_detail,
             "devices_fetched": self.devices_fetched,
             "devices_after_ownership_filter": self.devices_after_ownership_filter,
             "devices_skipped_no_class": self.devices_skipped_no_class,

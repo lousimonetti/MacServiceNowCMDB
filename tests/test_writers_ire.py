@@ -268,6 +268,28 @@ class TestUnrecognisedOperation:
         assert results[0].errors == []
 
 
+class TestIreDetail:
+    """Whatever IRE says about an item beyond operation and sysId goes to the
+    report verbatim, because a NO_CHANGE with no explanation is undebuggable."""
+
+    def test_extra_item_keys_are_kept(self, config):
+        writer = IdentifyReconcileWriter(ServiceNowClient(config.servicenow), config.servicenow)
+        attempts = [{"identifierName": "Hardware Rule", "attemptResult": "MATCHED"}]
+        results = writer._parse_results(
+            [payload()],
+            {"items": [{"className": "cmdb_ci_computer", "operation": "NO_CHANGE",
+                        "sysId": "abc", "identificationAttempts": attempts}]},
+        )
+        assert results[0].detail == {"identificationAttempts": attempts}
+
+    def test_nothing_extra_means_no_detail(self, config):
+        writer = IdentifyReconcileWriter(ServiceNowClient(config.servicenow), config.servicenow)
+        results = writer._parse_results(
+            [payload()], {"items": [{"className": "x", "operation": "UPDATE", "sysId": "abc"}]}
+        )
+        assert results[0].detail is None
+
+
 class TestLogContextId:
     """IRE's logContextId is the only handle tying a request to what ServiceNow
     recorded on its own side. Without it a support case starts from a timestamp."""

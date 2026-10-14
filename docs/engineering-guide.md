@@ -178,7 +178,11 @@ intune-cmdb-sync --dry-run --report-devices --report ./run.json
 ```
 
 `--report-devices` writes a per-device outcome list: action, CI sys_id, which
-key the owner matched on, and any error message. That file is the first thing to
+key the owner matched on, and any error message. It also carries `sent_values`,
+the exact attributes sent for each device, and `ire_detail`, anything IRE
+returned about the item beyond its operation and sys_id. The summary records
+`fetch_hardware_detail`. Together they separate "IRE kept the CI as it was" from
+"the field was never sent". That file is the first thing to
 look at when the summary counters look wrong. Both deployments enable it via
 `RUN_REPORT_DEVICES=true`, writing to the state volume (Azure) or the state
 bucket (AWS).

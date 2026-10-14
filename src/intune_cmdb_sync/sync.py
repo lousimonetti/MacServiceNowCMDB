@@ -40,7 +40,9 @@ class SyncRunner:
         # Exposed so that a run which raises partway still leaves a report the
         # caller can persist; see __main__._run.
         self.report = RunReport(
-            dry_run=cfg.runtime.dry_run, write_mode=cfg.servicenow.write_mode
+            dry_run=cfg.runtime.dry_run,
+            write_mode=cfg.servicenow.write_mode,
+            fetch_hardware_detail=cfg.servicenow.fetch_hardware_detail,
         )
         self.references = ReferenceResolver(
             snow,
@@ -304,6 +306,7 @@ class SyncRunner:
                     source_recency=to_snow_datetime(device.get("lastSyncDateTime")),
                 )
             )
+            outcome.sent_values = values
             outcomes[intune_id] = outcome
 
         return payloads, outcomes
@@ -345,6 +348,7 @@ class SyncRunner:
             else:
                 outcome.action = action
             outcome.ci_sys_id = result.sys_id
+            outcome.ire_detail = result.detail
             if result.message:
                 outcome.message = result.message
             report.record(outcome)

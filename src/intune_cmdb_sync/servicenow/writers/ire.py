@@ -45,6 +45,10 @@ _OPERATION_TO_ACTION = {
     "DELETE": "updated",
 }
 
+# Item keys the report already carries elsewhere; everything else IRE sends
+# about an item is kept as `ire_detail`, so a NO_CHANGE can be explained.
+_ITEM_KEYS_REPORTED = frozenset({"className", "operation", "sysId"})
+
 
 @dataclass
 class CiPayload:
@@ -64,6 +68,8 @@ class WriteResult:
     action: str
     sys_id: str | None = None
     errors: list[str] = field(default_factory=list)
+    # The rest of the IRE item, for the run report. Only IRE fills it.
+    detail: dict[str, Any] | None = None
 
     @property
     def message(self) -> str | None:
@@ -227,6 +233,9 @@ class IdentifyReconcileWriter:
                     intune_id=payload.intune_id,
                     action=action,
                     sys_id=item.get("sysId") or None,
+                    detail={
+                        k: v for k, v in item.items() if k not in _ITEM_KEYS_REPORTED
+                    } or None,
                 )
             )
         return results

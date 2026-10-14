@@ -436,9 +436,13 @@ class TestHardwareDetail:
         mock_snow_plumbing()
         ire = respx.post(IRE).mock(return_value=ire_response("INSERT"))
 
-        runner_factory(cfg).run()
+        report = runner_factory(cfg).run()
         assert single.call_count == 0, "hardware detail must go through $batch"
         assert batches.called
+        # The report shows the lookup ran and what was actually sent.
+        assert report.as_dict()["fetch_hardware_detail"] is True
+        sent = report.as_dict()["devices"][0]["sent_values"]
+        assert sent["ram"] == 65536
         values = json.loads(ire.calls[0].request.read())["items"][0]["values"]
         assert values["ram"] == 65536
 
