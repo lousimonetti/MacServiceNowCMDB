@@ -159,7 +159,10 @@ behaviour change, particularly anything altering what gets written to a CI.
   `mapping_overrides_file` / `class_map` and a required `dry_run` for both of
   its hosts (`host = "lambda" | "ecs"`), checked offline by `terraform test`
   against a mocked provider. The ECS image needs `--build-arg EXTRAS=aws`,
-  because S3 state imports boto3.
+  because S3 state imports boto3. `INTUNE_FETCH_HARDWARE_DETAIL` passes
+  through both stacks the same way (`fetchHardwareDetail` /
+  `fetch_hardware_detail`, default `false`). Before 2026-10-14 it did not, so
+  a deployed job never sent `ram`.
 - **AWS secrets are referenced by SSM parameter name, never passed to
   Terraform.** As variables they landed in plaintext in `terraform.tfvars` and
   the (backend-less, local) state. The parameter ARNs are built from the names

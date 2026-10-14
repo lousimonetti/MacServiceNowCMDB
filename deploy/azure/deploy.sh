@@ -140,6 +140,11 @@ require_bool() {
 require_bool DRY_RUN " -- true for a first deploy; false commits to the CMDB"
 RETIRE_MISSING="${RETIRE_MISSING:-false}"
 require_bool RETIRE_MISSING ""
+# Off by default: one extra Graph $batch request per 20 devices. Without it
+# `ram` and the ethernet MAC never reach the CMDB, because Graph omits them from
+# the listing.
+INTUNE_FETCH_HARDWARE_DETAIL="${INTUNE_FETCH_HARDWARE_DETAIL:-false}"
+require_bool INTUNE_FETCH_HARDWARE_DETAIL ""
 
 # The app receives only what main.bicep sets, so local tuning has to be passed
 # through explicitly or the Azure run differs from the one tested locally.
@@ -380,6 +385,7 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
       classMap="${SNOW_CLASS_MAP:-}" \
       mappingOverrides="$MAPPING_OVERRIDES" \
       retireMissingDevices="$RETIRE_MISSING" \
+      fetchHardwareDetail="$INTUNE_FETCH_HARDWARE_DETAIL" \
       dryRun="$DRY_RUN" \
       alertEmail="${ALERT_EMAIL:-}" \
   --query properties.outputs \
@@ -505,6 +511,7 @@ Deployed.
   ServiceNow       ${SNOW_INSTANCE} (${SNOW_WRITE_MODE})
   Dry run          ${DRY_RUN}$([[ "$DRY_RUN" == false ]] && echo "  -- LIVE: the next run commits to the CMDB")
   Retire missing   ${RETIRE_MISSING}
+  Hardware detail  ${INTUNE_FETCH_HARDWARE_DETAIL}
   Class map        ${SNOW_CLASS_MAP:-built-in (windows, macos)}
   Mapping override ${MAPPING_OVERRIDES_FILE:-none}
   Resource group   ${RESOURCE_GROUP} (${LOCATION})

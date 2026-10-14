@@ -399,7 +399,7 @@ class TestHardwareDetail:
         respx.get(DEVICES).mock(
             return_value=httpx.Response(200, json={"value": [make_device(id="d1")]})
         )
-        respx.post(f"{GRAPH}/$batch").mock(
+        batches = respx.post(f"{GRAPH}/$batch").mock(
             return_value=httpx.Response(200, json={"responses": []})
         )
         mock_snow_plumbing()
@@ -408,26 +408,37 @@ class TestHardwareDetail:
 
         runner_factory().run()
         assert detail.call_count == 0
+        urls = [
+            r["url"] for call in batches.calls
+            for r in json.loads(call.request.read())["requests"]
+        ]
+        assert not any("/managedDevices/" in u for u in urls)
 
     @respx.mock
     def test_enriches_ram_when_enabled(self, set_env, runner_factory):
         set_env(INTUNE_FETCH_HARDWARE_DETAIL="true")
         cfg = Config.from_env()
-        respx.get(f"{DEVICES}/d1").mock(
-            return_value=httpx.Response(
-                200, json={"id": "d1", "physicalMemoryInBytes": 68719476736}
-            )
-        )
         respx.get(DEVICES).mock(
             return_value=httpx.Response(200, json={"value": [make_device(id="d1")]})
         )
-        respx.post(f"{GRAPH}/$batch").mock(
-            return_value=httpx.Response(200, json={"responses": []})
-        )
+
+        def batch(request: httpx.Request) -> httpx.Response:
+            # Hardware detail and user lookups share /$batch; answer only the former.
+            requests = json.loads(request.read())["requests"]
+            return httpx.Response(200, json={"responses": [
+                {"id": r["id"], "status": 200,
+                 "body": {"id": "d1", "physicalMemoryInBytes": 68719476736}}
+                for r in requests if r["url"].startswith("/deviceManagement/managedDevices/d1?")
+            ]})
+
+        batches = respx.post(f"{GRAPH}/$batch").mock(side_effect=batch)
+        single = respx.get(f"{DEVICES}/d1")
         mock_snow_plumbing()
         ire = respx.post(IRE).mock(return_value=ire_response("INSERT"))
 
         runner_factory(cfg).run()
+        assert single.call_count == 0, "hardware detail must go through $batch"
+        assert batches.called
         values = json.loads(ire.calls[0].request.read())["items"][0]["values"]
         assert values["ram"] == 65536
 

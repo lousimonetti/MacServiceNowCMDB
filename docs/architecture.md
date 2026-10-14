@@ -72,7 +72,7 @@ A single run is a linear pipeline, orchestrated by `SyncRunner.run` in
 | 1 | Verify ServiceNow connectivity | `servicenow/client.py` | Fails fast before touching Graph |
 | 2 | Fetch managed devices | `graph.py` | Paged via `@odata.nextLink` |
 | 3 | Filter by ownership | `graph.py` | Client-side, always |
-| 4 | Optional hardware detail | `graph.py` | One call per device; off by default |
+| 4 | Optional hardware detail | `graph.py` | One `$batch` request per 20 devices; off by default |
 | 5 | Resolve owners | `user_resolver.py` | Entra user → `sys_user` |
 | 6 | Prime reference caches | `reference_resolver.py` | Manufacturer, model |
 | 7 | Build payloads | `mapping.py` | Pure; no I/O |

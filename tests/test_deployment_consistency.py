@@ -252,6 +252,26 @@ def test_class_map_and_mapping_overrides_reach_the_job():
     assert 'classMap="${SNOW_CLASS_MAP:-}"' in DEPLOY_SH.read_text()
 
 
+def test_hardware_detail_setting_reaches_every_host():
+    """`physicalMemoryInBytes` and `ethernetMacAddress` come only from the
+    per-device GET that INTUNE_FETCH_HARDWARE_DETAIL enables. Before this was
+    passed through, a deployed job could never send `ram`, whatever the local
+    `.env` said."""
+    bicep = BICEP.read_text()
+    assert "param fetchHardwareDetail bool = false" in bicep
+    assert "INTUNE_FETCH_HARDWARE_DETAIL: string(fetchHardwareDetail)" in bicep
+    assert "fetchHardwareDetail" in _deploy_sh_bicep_parameters()
+    deploy_sh = DEPLOY_SH.read_text()
+    assert "require_bool INTUNE_FETCH_HARDWARE_DETAIL" in deploy_sh
+    assert 'fetchHardwareDetail="$INTUNE_FETCH_HARDWARE_DETAIL"' in deploy_sh
+    assert (
+        "INTUNE_FETCH_HARDWARE_DETAIL = tostring(var.fetch_hardware_detail)"
+        in TERRAFORM.read_text()
+    )
+    config = (REPO / "src" / "intune_cmdb_sync" / "config.py").read_text()
+    assert '_env_bool("INTUNE_FETCH_HARDWARE_DETAIL"' in config
+
+
 def test_empty_class_map_is_omitted_not_blanked():
     """SNOW_CLASS_MAP replaces the built-in map. Setting it to '' on the app
     would be at best a no-op; omitting it keeps the default unambiguous."""

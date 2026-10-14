@@ -119,7 +119,7 @@ coverage that does not exist.
    moves, it belongs in an opt-in custom column, not the defaults.
 2. Add it to `DEVICE_SELECT_FIELDS` in `graph.py` if it is not already
    requested. Non-default Graph properties additionally require
-   `INTUNE_FETCH_HARDWARE_DETAIL`, which costs one call per device.
+   `INTUNE_FETCH_HARDWARE_DETAIL`, which costs one `$batch` request per 20 devices.
 3. Add it to `build_values` in `mapping.py`. **Preserve the omit-when-empty
    property** — the final dict comprehension strips `None` and `""`, so do not
    bypass it. Sending an empty value overwrites good data from another source.

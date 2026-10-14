@@ -33,6 +33,23 @@ entirely rather than sent as blanks. That matters: an empty value in an IRE
 payload is a value, and it will overwrite good data that another discovery
 source contributed.
 
+### When a field is sent but does not change on the CI
+
+Sending a field is not the same as IRE writing it. If another discovery source
+(SCCM, Jamf, ServiceNow Discovery) also writes these CIs, IRE reconciliation
+rules for `cmdb_ci_computer` (or a parent class) can give that source authority
+over attributes such as `ram`, `disk_space` and `mac_address`. IRE then drops
+those attributes from our payload and still applies the rest, with no error.
+Check the class's reconciliation rules in CI Class Manager before you assume a
+mapping bug. The fix there is a ServiceNow configuration decision, not a code
+change.
+
+### CPU
+
+Nothing is mapped to `cpu_name`, `cpu_type`, `cpu_count`, `cpu_speed` or
+`cpu_core_count`. Microsoft Graph v1.0 `managedDevice` has no processor
+properties to map from. Leave those fields to a source that collects them.
+
 ## Identity
 
 Two independent mechanisms, and the distinction matters more than any single

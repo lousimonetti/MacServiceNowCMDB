@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 
@@ -107,22 +108,97 @@ class TestIterManagedDevices:
         assert list(graph.iter_managed_devices()) == []
 
 
+def _batch_echo(status_for=lambda url: 200, body_for=lambda url: {}):
+    """A `$batch` responder that answers every sub-request from its URL."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        requests = json.loads(request.read())["requests"]
+        assert len(requests) <= 20
+        return httpx.Response(
+            200,
+            json={
+                "responses": [
+                    {"id": r["id"], "status": status_for(r["url"]), "body": body_for(r["url"])}
+                    for r in requests
+                ]
+            },
+        )
+
+    return responder
+
+
+def _device_id(url: str) -> str:
+    return url.split("/managedDevices/")[1].split("?")[0]
+
+
 class TestHardwareDetail:
     @respx.mock
-    def test_selects_non_default_properties(self, graph: GraphClient):
-        route = respx.get(f"{DEVICES}/dev-1").mock(
-            return_value=httpx.Response(
-                200, json={"id": "dev-1", "physicalMemoryInBytes": 17179869184}
+    def test_batches_twenty_devices_per_request(self, graph: GraphClient):
+        ids = [f"dev-{i}" for i in range(45)]
+        route = respx.post(f"{GRAPH}/$batch").mock(
+            side_effect=_batch_echo(
+                body_for=lambda url: {"id": _device_id(url), "physicalMemoryInBytes": 8 << 30}
             )
         )
-        detail = graph.fetch_device_hardware_detail("dev-1")
-        assert detail["physicalMemoryInBytes"] == 17179869184
-        assert "physicalMemoryInBytes" in route.calls[0].request.url.params["$select"]
+        details = graph.get_hardware_details(ids)
+        assert set(details) == set(ids)
+        assert route.call_count == 3
 
     @respx.mock
-    def test_failure_degrades_to_empty(self, graph: GraphClient):
-        respx.get(f"{DEVICES}/dev-1").mock(return_value=httpx.Response(404, text="gone"))
-        assert graph.fetch_device_hardware_detail("dev-1") == {}
+    def test_selects_non_default_properties(self, graph: GraphClient):
+        route = respx.post(f"{GRAPH}/$batch").mock(
+            side_effect=_batch_echo(
+                body_for=lambda url: {"id": "dev-1", "physicalMemoryInBytes": 17179869184}
+            )
+        )
+        detail = graph.get_hardware_details(["dev-1"])["dev-1"]
+        assert detail["physicalMemoryInBytes"] == 17179869184
+        url = json.loads(route.calls[0].request.read())["requests"][0]["url"]
+        assert url.startswith("/deviceManagement/managedDevices/dev-1?$select=")
+        assert "physicalMemoryInBytes" in url and "ethernetMacAddress" in url
+
+    @respx.mock
+    def test_failed_sub_request_leaves_the_device_out(self, graph: GraphClient):
+        respx.post(f"{GRAPH}/$batch").mock(
+            side_effect=_batch_echo(
+                status_for=lambda url: 404 if "dev-2" in url else 200,
+                body_for=lambda url: {"id": _device_id(url)},
+            )
+        )
+        assert set(graph.get_hardware_details(["dev-1", "dev-2"])) == {"dev-1"}
+
+    @respx.mock
+    def test_throttled_sub_requests_are_retried(self, graph: GraphClient, monkeypatch):
+        monkeypatch.setattr("intune_cmdb_sync.graph.time.sleep", lambda _s: None)
+        respx.post(f"{GRAPH}/$batch").mock(
+            side_effect=[
+                httpx.Response(200, json={"responses": [{"id": "0", "status": 429, "body": {}}]}),
+                httpx.Response(
+                    200, json={"responses": [{"id": "0", "status": 200, "body": {"id": "dev-1"}}]}
+                ),
+            ]
+        )
+        assert set(graph.get_hardware_details(["dev-1"])) == {"dev-1"}
+
+    @respx.mock
+    def test_batch_level_failure_degrades_instead_of_raising(self, graph: GraphClient):
+        """Hardware detail is optional; losing it must not fail the whole sync."""
+        respx.post(f"{GRAPH}/$batch").mock(return_value=httpx.Response(401, text="unauth"))
+        assert graph.get_hardware_details(["dev-1"]) == {}
+
+    @respx.mock
+    def test_exhausted_retries_degrade_instead_of_raising(self, graph: GraphClient):
+        """A batch throttled past the retry budget raises inside the HTTP client.
+        For optional hardware detail that must cost the fields, not the run."""
+        graph._http._sleep = lambda _s: None
+        respx.post(f"{GRAPH}/$batch").mock(return_value=httpx.Response(503, text="busy"))
+        assert graph.get_hardware_details(["dev-1"]) == {}
+
+    @respx.mock
+    def test_empty_input_makes_no_request(self, graph: GraphClient):
+        route = respx.post(f"{GRAPH}/$batch")
+        assert graph.get_hardware_details([]) == {}
+        assert route.call_count == 0
 
 
 class TestGetUsers:

@@ -125,6 +125,12 @@ variable "retire_missing_devices" {
   default     = false
 }
 
+variable "fetch_hardware_detail" {
+  description = "Fetch RAM / ethernet MAC / UDID with one Graph $batch request per 20 devices. Without it `ram` is never sent."
+  type        = bool
+  default     = false
+}
+
 variable "dry_run" {
   description = <<-DESC
     Run without committing anything to the CMDB. Required, deliberately: a
@@ -249,6 +255,8 @@ locals {
       GRAPH_TENANT_ID  = var.graph_tenant_id
       GRAPH_CLIENT_ID  = var.graph_client_id
       INTUNE_OWNERSHIP = "company"
+
+      INTUNE_FETCH_HARDWARE_DETAIL = tostring(var.fetch_hardware_detail)
 
       SNOW_INSTANCE         = var.servicenow_instance
       SNOW_AUTH_MODE        = "oauth_client_credentials"

@@ -23,7 +23,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
 from .config import GraphConfig
-from .errors import AuthError, GraphError
+from .errors import AuthError, GraphError, RetryableHTTPError
 from .http import RetryingClient, describe_error
 from .models import EntraUser
 
@@ -361,24 +361,26 @@ class GraphClient:
             return None
         return f"managedDeviceOwnerType eq '{self.cfg.ownership}'"
 
-    def fetch_device_hardware_detail(self, device_id: str) -> dict[str, Any]:
-        """Fetch the non-default hardware properties for one device.
+    def get_hardware_details(self, device_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """Fetch the non-default hardware properties, 20 devices per `$batch`.
 
-        Costs one Graph call per device; only worth enabling when the CMDB
-        needs RAM / ethernet MAC / UDID.
+        Graph returns these only from a per-device GET, so batching is the only
+        way to cut the round trips: N devices cost N/20 requests instead of N.
+        Each sub-request still counts against Intune's throttling limits.
+
+        Best-effort: a device whose lookup fails is absent from the result and
+        syncs without these fields, rather than failing the run.
         """
-        response = self._http.request(
-            "GET",
-            f"/deviceManagement/managedDevices/{device_id}",
-            params={"$select": ",".join(NON_DEFAULT_DEVICE_FIELDS)},
+        select = ",".join(NON_DEFAULT_DEVICE_FIELDS)
+        return self._batch_get(
+            {
+                did: f"/deviceManagement/managedDevices/{did}?$select={select}"
+                for did in device_ids
+                if did
+            },
+            what="hardware detail",
+            required=False,
         )
-        if not response.is_success:
-            log.warning(
-                "hardware detail fetch failed; continuing without it",
-                extra={"device_id": device_id, "detail": describe_error(response)},
-            )
-            return {}
-        return dict(response.json())
 
     # ---- Entra ID users --------------------------------------------------
 
@@ -388,44 +390,83 @@ class GraphClient:
         Missing or deleted users are simply absent from the result; the caller
         treats that as "no owner" rather than an error.
         """
-        unique = [oid for oid in dict.fromkeys(object_ids) if oid]
-        resolved: dict[str, EntraUser] = {}
-        if not unique:
-            return resolved
-
         select = ",".join(self.cfg.user_select_fields)
-        pending: list[str] = unique
+        bodies = self._batch_get(
+            {oid: f"/users/{oid}?$select={select}" for oid in object_ids if oid},
+            what="user",
+            required=True,
+        )
+        return {oid: EntraUser.from_graph(body) for oid, body in bodies.items()}
+
+    # ---- JSON batching ---------------------------------------------------
+
+    def _batch_get(
+        self, urls: dict[str, str], *, what: str, required: bool
+    ) -> dict[str, dict[str, Any]]:
+        """GET every URL through `/$batch`, at most 20 per request.
+
+        Returns the 2xx bodies keyed like `urls`. A 404 is simply absent;
+        throttled sub-requests (429/503/504) are retried with backoff, since the
+        batch itself succeeds while its parts are refused. When a whole batch
+        request fails, `required` decides between raising and skipping it.
+        """
+        resolved: dict[str, dict[str, Any]] = {}
+        pending = list(urls)
+        if not pending:
+            return resolved
 
         for attempt in range(1, self.cfg.max_retries + 2):
             throttled: list[str] = []
 
             for chunk in _chunks(pending, GRAPH_BATCH_LIMIT):
                 requests = [
-                    {"id": str(i), "method": "GET", "url": f"/users/{oid}?$select={select}"}
-                    for i, oid in enumerate(chunk)
+                    {"id": str(i), "method": "GET", "url": urls[key]}
+                    for i, key in enumerate(chunk)
                 ]
-                response = self._http.request("POST", "/$batch", json_body={"requests": requests})
+                try:
+                    response = self._http.request(
+                        "POST", "/$batch", json_body={"requests": requests}
+                    )
+                except RetryableHTTPError as exc:
+                    # Retries exhausted on the batch itself (throttling, 5xx,
+                    # network). Optional lookups must not take the run down.
+                    if required:
+                        raise
+                    log.warning(
+                        "graph $batch failed; continuing without it",
+                        extra={"what": what, "size": len(chunk), "detail": str(exc)},
+                    )
+                    continue
                 if not response.is_success:
-                    raise GraphError(f"user $batch failed: {describe_error(response)}")
+                    if required:
+                        raise GraphError(f"{what} $batch failed: {describe_error(response)}")
+                    log.warning(
+                        "graph $batch failed; continuing without it",
+                        extra={"what": what, "size": len(chunk),
+                               "detail": describe_error(response)},
+                    )
+                    continue
 
                 for sub in response.json().get("responses", []):
                     index = int(sub.get("id", -1))
                     if not 0 <= index < len(chunk):
                         continue
-                    object_id = chunk[index]
+                    graph_id = chunk[index]
                     status = int(sub.get("status", 0))
                     body = sub.get("body") or {}
 
                     if 200 <= status < 300:
-                        resolved[object_id] = EntraUser.from_graph(body)
+                        resolved[graph_id] = dict(body)
                     elif status == 404:
-                        log.debug("entra user not found", extra={"object_id": object_id})
+                        log.debug(
+                            "graph object not found", extra={"what": what, "graph_id": graph_id}
+                        )
                     elif status in (429, 503, 504):
-                        throttled.append(object_id)
+                        throttled.append(graph_id)
                     else:
                         log.warning(
-                            "entra user lookup failed",
-                            extra={"object_id": object_id, "status": status,
+                            "graph lookup failed",
+                            extra={"what": what, "graph_id": graph_id, "status": status,
                                    "error": str(body.get("error", body))[:300]},
                         )
 
@@ -435,15 +476,16 @@ class GraphClient:
             pending = throttled
             if attempt > self.cfg.max_retries:
                 log.warning(
-                    "giving up on throttled Entra user lookups",
-                    extra={"unresolved": len(pending)},
+                    "giving up on throttled graph lookups",
+                    extra={"what": what, "unresolved": len(pending)},
                 )
                 break
 
             delay = _batch_backoff(attempt)
             log.warning(
-                "Entra user sub-requests throttled, retrying",
-                extra={"pending": len(pending), "attempt": attempt, "delay_s": delay},
+                "graph sub-requests throttled, retrying",
+                extra={"what": what, "pending": len(pending), "attempt": attempt,
+                       "delay_s": delay},
             )
             time.sleep(delay)
 

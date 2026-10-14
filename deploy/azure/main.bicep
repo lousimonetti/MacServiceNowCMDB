@@ -161,6 +161,13 @@ param retireMissingDevices bool = false
 @description('Run without committing anything to the CMDB.')
 param dryRun bool = false
 
+@description('''
+Fetch the hardware properties Graph returns only per device (RAM, ethernet MAC,
+UDID). Without it `ram` is never sent. Costs one Graph $batch request per 20
+devices per run.
+''')
+param fetchHardwareDetail bool = false
+
 var useManagedIdentityForGraph = graphAuthMode == 'managed_identity'
 var useFederatedIdentityForGraph = graphAuthMode == 'federated_managed_identity'
 
@@ -361,6 +368,7 @@ var baseEnv = {
   SNOW_DISCOVERY_SOURCE: discoverySource
   SNOW_RETIRE_MISSING: string(retireMissingDevices)
   DRY_RUN: string(dryRun)
+  INTUNE_FETCH_HARDWARE_DETAIL: string(fetchHardwareDetail)
   // Without this a run where every device failed still exits 0.
   FAIL_ON_ERROR: 'true'
   LOG_FORMAT: 'json'

@@ -169,7 +169,7 @@ A run is dominated by ServiceNow round-trips: at `SNOW_BATCH_SIZE=100` a
 10,000-device fleet is ~100 IRE requests, comfortably inside the limit. Two
 things push you over it:
 
-- `INTUNE_FETCH_HARDWARE_DETAIL=true`, which adds one Graph call *per device*.
+- `INTUNE_FETCH_HARDWARE_DETAIL=true`, which adds one Graph `$batch` request per 20 devices (each device still counts against Intune throttling).
 - Sustained throttling on a large tenant.
 
 If you cannot finish in 15 minutes, set `host = "ecs"` (see below). The task

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any
 
@@ -179,19 +178,14 @@ class SyncRunner:
     def _enrich_hardware(self, devices: list[dict[str, Any]]) -> None:
         """Fill in the Graph properties that the collection endpoint returns as null."""
         log.info("fetching per-device hardware detail", extra={"devices": len(devices)})
-        workers = min(self.cfg.servicenow.concurrency, max(len(devices), 1))
-
-        def fetch(device: dict[str, Any]) -> None:
-            device_id = str(device.get("id") or "")
-            if not device_id:
-                return
-            detail = self.graph.fetch_device_hardware_detail(device_id)
+        details = self.graph.get_hardware_details(
+            str(device.get("id") or "") for device in devices
+        )
+        for device in devices:
+            detail = details.get(str(device.get("id") or ""), {})
             for key, value in detail.items():
                 if key != "id" and value not in (None, ""):
                     device[key] = value
-
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(fetch, devices))
 
     def _resolve_users(
         self, devices: list[dict[str, Any]], report: RunReport

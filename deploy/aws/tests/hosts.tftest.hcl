@@ -70,6 +70,11 @@ run "lambda_is_the_default_host" {
   }
 
   assert {
+    condition     = aws_lambda_function.sync[0].environment[0].variables["INTUNE_FETCH_HARDWARE_DETAIL"] == "false"
+    error_message = "fetch_hardware_detail must reach the function, off by default"
+  }
+
+  assert {
     condition     = !contains(keys(aws_lambda_function.sync[0].environment[0].variables), "MAPPING_OVERRIDES_JSON")
     error_message = "MAPPING_OVERRIDES_JSON must be absent when no overrides file is given"
   }
