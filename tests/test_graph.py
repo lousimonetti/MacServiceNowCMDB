@@ -212,6 +212,93 @@ class TestHardwareDetail:
         assert route.call_count == 0
 
 
+SCRIPTS = "https://graph.microsoft.com/beta/deviceManagement/deviceCustomAttributeShellScripts"
+
+
+class TestCustomAttributeValues:
+    def _scripts(self, *scripts):
+        return respx.get(SCRIPTS).mock(
+            return_value=httpx.Response(200, json={"value": list(scripts)})
+        )
+
+    @respx.mock
+    def test_reads_successful_outputs_by_device_across_pages(self, graph: GraphClient):
+        self._scripts({"id": "s1", "customAttributeName": "RAM bytes", "displayName": "Mac RAM"})
+        page2 = f"{SCRIPTS}/s1/deviceRunStates?$skiptoken=2"
+        states = respx.get(f"{SCRIPTS}/s1/deviceRunStates").mock(
+            side_effect=[
+                httpx.Response(200, json={
+                    "value": [
+                        {"runState": "success", "resultMessage": "17179869184\n",
+                         "managedDevice": {"id": "mac-1"}},
+                        {"runState": "fail", "resultMessage": "boom",
+                         "managedDevice": {"id": "mac-2"}},
+                    ],
+                    "@odata.nextLink": page2,
+                }),
+                httpx.Response(200, json={"value": [
+                    {"runState": "success", "resultMessage": "34359738368",
+                     "managedDevice": {"id": "mac-3"}},
+                ]}),
+            ]
+        )
+        values = graph.get_custom_attribute_values("ram BYTES")
+        assert values == {"mac-1": "17179869184", "mac-3": "34359738368"}
+        assert states.calls[0].request.url.params["$expand"] == "managedDevice($select=id)"
+
+    @respx.mock
+    def test_rejected_nested_select_falls_back_to_plain_expand(self, graph: GraphClient):
+        self._scripts({"id": "s1", "customAttributeName": "RAM bytes"})
+        states = respx.get(f"{SCRIPTS}/s1/deviceRunStates").mock(
+            side_effect=[
+                httpx.Response(400, json={"error": {"message": "bad $expand"}}),
+                httpx.Response(200, json={"value": [
+                    {"runState": "success", "resultMessage": "8589934592",
+                     "managedDevice": {"id": "mac-1", "deviceName": "MDS-1"}},
+                ]}),
+            ]
+        )
+        assert graph.get_custom_attribute_values("RAM bytes") == {"mac-1": "8589934592"}
+        assert states.calls[1].request.url.params["$expand"] == "managedDevice"
+
+    @respx.mock
+    def test_matches_display_name_or_id(self, graph: GraphClient):
+        self._scripts({"id": "s1", "customAttributeName": "ram", "displayName": "Mac RAM"})
+        respx.get(f"{SCRIPTS}/s1/deviceRunStates").mock(
+            return_value=httpx.Response(200, json={"value": []})
+        )
+        assert graph.get_custom_attribute_values("Mac RAM") == {}
+        assert graph.get_custom_attribute_values("s1") == {}
+
+    @respx.mock
+    def test_missing_attribute_is_an_error(self, graph: GraphClient):
+        self._scripts({"id": "s1", "customAttributeName": "Battery", "displayName": "Battery"})
+        with pytest.raises(GraphError, match="no macOS custom attribute named 'RAM bytes'"):
+            graph.get_custom_attribute_values("RAM bytes")
+
+    @respx.mock
+    def test_ambiguous_name_is_an_error(self, graph: GraphClient):
+        self._scripts(
+            {"id": "s1", "customAttributeName": "RAM bytes", "displayName": "A"},
+            {"id": "s2", "customAttributeName": "RAM bytes", "displayName": "B"},
+        )
+        with pytest.raises(GraphError, match="use its id"):
+            graph.get_custom_attribute_values("RAM bytes")
+
+    @respx.mock
+    def test_missing_permission_is_an_error_naming_it(self, graph: GraphClient):
+        """The shape Graph returned live on 2026-10-14 without the permission."""
+        respx.get(SCRIPTS).mock(
+            return_value=httpx.Response(403, json={"error": {
+                "code": "Forbidden",
+                "message": "Application must have one of the following scopes: "
+                           "DeviceManagementScripts.Read.All",
+            }})
+        )
+        with pytest.raises(GraphError, match=r"DeviceManagementScripts\.Read\.All"):
+            graph.get_custom_attribute_values("RAM bytes")
+
+
 class TestGetUsers:
     @respx.mock
     def test_batches_at_twenty_per_request(self, graph: GraphClient):

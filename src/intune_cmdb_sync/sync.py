@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .config import Config
-from .errors import ServiceNowError
+from .errors import GraphError, RetryableHTTPError, ServiceNowError
 from .graph import GraphClient, is_corporate
 from .mapping import DeviceMapper, resolve_class_name, to_snow_datetime
 from .models import DeviceOutcome, EntraUser, RunReport, SysUserRef
@@ -89,6 +89,8 @@ class SyncRunner:
 
         if self.cfg.servicenow.fetch_hardware_detail:
             self._enrich_hardware(devices)
+        if self.cfg.graph.mac_ram_attribute:
+            self._fill_ram_from_attribute(devices, report)
 
         sys_users, entra_users = self._resolve_users(devices, report)
         self._prime_references(devices)
@@ -191,6 +193,42 @@ class SyncRunner:
             for key, value in detail.items():
                 if key != "id" and value not in (None, ""):
                     device[key] = value
+
+    def _fill_ram_from_attribute(self, devices: list[dict[str, Any]], report: RunReport) -> None:
+        """Take RAM from the macOS custom attribute where Graph reported none.
+
+        Best-effort: an unreadable attribute (missing permission, wrong name)
+        costs the Macs their RAM, not the run, and is said in the report.
+        """
+        attribute = self.cfg.graph.mac_ram_attribute or ""
+        try:
+            outputs = self.graph.get_custom_attribute_values(attribute)
+        except (GraphError, RetryableHTTPError, ValueError) as exc:
+            # ValueError: a reply that was not JSON. Still not worth the run.
+            message = f"RAM custom attribute {attribute!r} could not be read: {exc}"
+            log.warning("RAM custom attribute could not be read", extra={"error": str(exc)})
+            report.warnings.append(message)
+            return
+
+        filled = unparseable = 0
+        for device in devices:
+            if _positive_int(device.get("physicalMemoryInBytes")):
+                continue  # Graph's own value wins wherever it has one.
+            output = outputs.get(str(device.get("id") or ""))
+            if output is None:
+                continue
+            value = _positive_int(output)
+            if value is None:
+                unparseable += 1
+                continue
+            device["physicalMemoryInBytes"] = value
+            filled += 1
+        report.ram_from_custom_attribute = filled
+        log.info(
+            "filled RAM from custom attribute",
+            extra={"attribute": attribute, "results": len(outputs), "filled": filled,
+                   "unparseable": unparseable},
+        )
 
     def _resolve_users(
         self, devices: list[dict[str, Any]], report: RunReport
@@ -440,6 +478,15 @@ class SyncRunner:
         state.forget(retired)
         report.retired = len(retired)
         log.info("retired CIs absent from Intune", extra={"count": len(retired)})
+
+
+def _positive_int(raw: Any) -> int | None:
+    """A whole number of bytes, or None. The attribute's output arrives as text."""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _chunks(items: Sequence[CiPayload], size: int) -> Iterator[list[CiPayload]]:

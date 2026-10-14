@@ -109,6 +109,8 @@ class RunReport:
     # Whether RAM / ethernet MAC were requested at all. A setting that never
     # reached the process looks identical to Graph returning nothing.
     fetch_hardware_detail: bool = False
+    # Devices whose `ram` came from INTUNE_MAC_RAM_ATTRIBUTE rather than Graph.
+    ram_from_custom_attribute: int = 0
     devices_fetched: int = 0
     devices_after_ownership_filter: int = 0
     devices_skipped_no_class: int = 0
@@ -163,6 +165,7 @@ class RunReport:
             "dry_run": self.dry_run,
             "write_mode": self.write_mode,
             "fetch_hardware_detail": self.fetch_hardware_detail,
+            "ram_from_custom_attribute": self.ram_from_custom_attribute,
             "devices_fetched": self.devices_fetched,
             "devices_after_ownership_filter": self.devices_after_ownership_filter,
             "devices_skipped_no_class": self.devices_skipped_no_class,

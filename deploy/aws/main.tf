@@ -163,6 +163,12 @@ variable "write_mode" {
   }
 }
 
+variable "mac_ram_attribute" {
+  description = "INTUNE_MAC_RAM_ATTRIBUTE: macOS custom attribute printing RAM in bytes. Needs DeviceManagementScripts.Read.All. Empty = not used."
+  type        = string
+  default     = ""
+}
+
 variable "class_map" {
   description = <<-DESC
     SNOW_CLASS_MAP, e.g. "windows=cmdb_ci_computer;macos=cmdb_ci_computer".
@@ -281,6 +287,7 @@ locals {
     },
     # Set only when given: an empty SNOW_CLASS_MAP is not the same as none.
     var.class_map == "" ? {} : { SNOW_CLASS_MAP = var.class_map },
+    var.mac_ram_attribute == "" ? {} : { INTUNE_MAC_RAM_ATTRIBUTE = var.mac_ram_attribute },
     local.mapping_overrides == "" ? {} : { MAPPING_OVERRIDES_JSON = local.mapping_overrides },
   )
 }

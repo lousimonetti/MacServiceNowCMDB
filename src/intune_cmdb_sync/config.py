@@ -171,6 +171,10 @@ class GraphConfig:
     # access_token only: a pre-obtained Graph bearer token. Local development
     # against a tenant where you cannot create an app registration.
     access_token: str | None = None
+    # A macOS custom attribute (name, display name or id) whose script prints
+    # the Mac's RAM in bytes. Graph reports physicalMemoryInBytes as 0 for Macs,
+    # so this is the only source of `ram` for them. None = not used.
+    mac_ram_attribute: str | None = None
 
     @property
     def authority_host(self) -> str:
@@ -375,6 +379,7 @@ def _build_config() -> Config:
         max_retries=_env_int("GRAPH_MAX_RETRIES", 5, minimum=0, maximum=10),
         assertion_identity_client_id=_env("GRAPH_ASSERTION_IDENTITY_CLIENT_ID"),
         access_token=graph_access_token,
+        mac_ram_attribute=_env("INTUNE_MAC_RAM_ATTRIBUTE"),
     )
 
     # ---- ServiceNow ------------------------------------------------------

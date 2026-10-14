@@ -190,6 +190,15 @@ behaviour change, particularly anything altering what gets written to a CI.
   against `/beta/$batch` because `processorArchitecture` (-> `cpu_type`) exists
   only there. Everything else stays on v1.0. Macs report
   `physicalMemoryInBytes` as 0 on both endpoints, so no `ram` for Macs.
+- **Mac RAM comes from an Intune custom attribute, not Graph.** Graph reports
+  `physicalMemoryInBytes` as 0 for Macs. `INTUNE_MAC_RAM_ATTRIBUTE` names a
+  macOS custom attribute (`sysctl -n hw.memsize`), read from
+  `/beta/deviceManagement/deviceCustomAttributeShellScripts/{id}/deviceRunStates`
+  (needs `DeviceManagementScripts.Read.All`, confirmed by a live 403
+  2026-10-14). It fills only devices where Graph gave no RAM, and an unreadable
+  attribute is a report warning, never a failed run. Run-state parsing
+  (`$expand=managedDevice($select=id)`, `resultMessage`) is from the docs, not
+  yet seen against a tenant with the attribute deployed.
 - **Graph data calls are plain REST, deliberately** — `azure-identity` handles
   tokens, but `msgraph-sdk` is not used. Do not add it.
 

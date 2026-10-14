@@ -149,6 +149,13 @@ than extending it, so list every OS you want written.
 param classMap string = ''
 
 @description('''
+INTUNE_MAC_RAM_ATTRIBUTE: the macOS custom attribute (name, display name or id)
+whose script prints the Mac's RAM in bytes. Graph reports 0 for Macs, so this is
+their only RAM source. Needs DeviceManagementScripts.Read.All. Empty = not used.
+''')
+param macRamAttribute string = ''
+
+@description('''
 Mapping overrides as a JSON object, the same content as a local
 MAPPING_OVERRIDES_FILE (e.g. {"drop": ["last_discovered"]}). Reaches the app as
 MAPPING_OVERRIDES_JSON. Empty object = no overrides.
@@ -382,7 +389,8 @@ var baseEnv = {
 // Omitted rather than set empty, so the connector's own defaults apply.
 var mappingEnv = union(
   empty(classMap) ? {} : { SNOW_CLASS_MAP: classMap },
-  empty(mappingOverrides) ? {} : { MAPPING_OVERRIDES_JSON: string(mappingOverrides) }
+  empty(mappingOverrides) ? {} : { MAPPING_OVERRIDES_JSON: string(mappingOverrides) },
+  empty(macRamAttribute) ? {} : { INTUNE_MAC_RAM_ATTRIBUTE: macRamAttribute }
 )
 
 // The complete settings list. Deploying 'appsettings' replaces every setting, so

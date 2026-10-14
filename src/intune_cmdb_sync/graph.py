@@ -292,7 +292,8 @@ class GraphClient:
         provider = token_provider
         # Same host and version layout as base_url, so a national cloud keeps
         # working: https://graph.microsoft.us/v1.0 -> https://graph.microsoft.us/beta.
-        self._beta_batch_url = cfg.base_url.rsplit("/", 1)[0] + "/beta/$batch"
+        self._beta_base = cfg.base_url.rsplit("/", 1)[0] + "/beta"
+        self._beta_batch_url = f"{self._beta_base}/$batch"
         self._http = RetryingClient(
             base_url=cfg.base_url,
             token_provider=provider,
@@ -392,6 +393,74 @@ class GraphClient:
             required=False,
             batch_url=self._beta_batch_url,
         )
+
+    def get_custom_attribute_values(self, attribute: str) -> dict[str, str]:
+        """Latest successful output of a macOS custom attribute, by device id.
+
+        `attribute` matches the custom attribute's name, its profile's display
+        name, or its id. Intune runs the script on each Mac every 8 hours and
+        keeps the output as `resultMessage`. Beta only; needs
+        DeviceManagementScripts.Read.All. Raises GraphError when the attribute
+        cannot be found or read, and the caller decides what that costs.
+        """
+        scripts_url = f"{self._beta_base}/deviceManagement/deviceCustomAttributeShellScripts"
+        wanted = attribute.strip().lower()
+        matches = [
+            script
+            for script in self._iter_pages(
+                scripts_url,
+                {"$select": "id,customAttributeName,displayName"},
+                what="listing macOS custom attributes",
+            )
+            if wanted in {
+                str(script.get(key) or "").strip().lower()
+                for key in ("id", "customAttributeName", "displayName")
+            }
+        ]
+        if not matches:
+            raise GraphError(f"no macOS custom attribute named {attribute!r}")
+        if len(matches) > 1:
+            raise GraphError(
+                f"{len(matches)} macOS custom attributes match {attribute!r}; use its id"
+            )
+
+        states_url = f"{scripts_url}/{matches[0]['id']}/deviceRunStates"
+        what = f"reading custom attribute {attribute!r}"
+        try:
+            # The nested $select keeps each state small. It is standard OData
+            # but has not been seen against this endpoint, so a 400 falls back
+            # to the documented plain expand rather than losing Mac RAM.
+            states = list(
+                self._iter_pages(states_url, {"$expand": "managedDevice($select=id)"}, what=what)
+            )
+        except _GraphBadRequest:
+            states = list(self._iter_pages(states_url, {"$expand": "managedDevice"}, what=what))
+
+        values: dict[str, str] = {}
+        for state in states:
+            if str(state.get("runState") or "").lower() != "success":
+                continue
+            device_id = (state.get("managedDevice") or {}).get("id")
+            output = str(state.get("resultMessage") or "").strip()
+            if device_id and output:
+                values[str(device_id)] = output
+        return values
+
+    def _iter_pages(
+        self, url: str, params: dict[str, Any], *, what: str
+    ) -> Iterator[dict[str, Any]]:
+        next_url: str | None = url
+        next_params: dict[str, Any] | None = params
+        while next_url:
+            response = self._http.request("GET", next_url, params=next_params)
+            if response.status_code == 400:
+                raise _GraphBadRequest(f"{what} failed: {describe_error(response)}")
+            if not response.is_success:
+                raise GraphError(f"{what} failed: {describe_error(response)}")
+            payload = response.json()
+            yield from payload.get("value") or []
+            # nextLink already carries every query parameter.
+            next_url, next_params = payload.get("@odata.nextLink"), None
 
     # ---- Entra ID users --------------------------------------------------
 
@@ -501,6 +570,10 @@ class GraphClient:
             time.sleep(delay)
 
         return resolved
+
+
+class _GraphBadRequest(GraphError):
+    """A 400 from a paged read, which a caller may answer with a simpler query."""
 
 
 def _batch_backoff(attempt: int) -> float:

@@ -19,7 +19,7 @@ pin every rule below.
 | `manufacturer` | `manufacturer` | resolved to a `core_company` sys_id |
 | `model_id` | `model` | resolved to a `cmdb_model` sys_id |
 | `mac_address` | `ethernetMacAddress`, else `wiFiMacAddress` | normalised to `AA:BB:CC:DD:EE:FF` |
-| `ram` | `physicalMemoryInBytes` | bytes → MB (requires `INTUNE_FETCH_HARDWARE_DETAIL=true`) |
+| `ram` | `physicalMemoryInBytes`; for Macs, the `INTUNE_MAC_RAM_ATTRIBUTE` custom attribute | bytes → MB (Graph's value requires `INTUNE_FETCH_HARDWARE_DETAIL=true`; see [Mac RAM](#mac-ram-from-a-custom-attribute)) |
 | `cpu_type` | `processorArchitecture` (beta) | `x64`, `x86`, `ARM64`, `ARM`; `unknown` is left out (requires `INTUNE_FETCH_HARDWARE_DETAIL=true`) |
 | `disk_space` | `totalStorageSpaceInBytes` | bytes → GB, 2 dp |
 | `first_discovered` | `enrolledDateTime` | ISO-8601 → `YYYY-MM-DD HH:MM:SS` UTC |
@@ -59,6 +59,34 @@ source, or collect them with an Intune custom attribute script.
 `cpu_type` is a weak value. If another source writes a full processor name into
 it, add `"drop": ["cpu_type"]` to the overrides file, or let a reconciliation
 rule give that source priority.
+
+### Mac RAM from a custom attribute
+
+Intune can run a script on each Mac every 8 hours and keep its output. The
+connector reads that output when `INTUNE_MAC_RAM_ATTRIBUTE` names the attribute.
+It fills `ram` only where Graph reported none, so Windows values are untouched.
+
+1. In Intune: **Devices > macOS > Custom attributes > Add**. Name it (for
+   example `RAM bytes`), set the data type to **Integer**, and use this script:
+
+   ```sh
+   #!/bin/sh
+   sysctl -n hw.memsize
+   ```
+
+   Assign it to the Macs.
+2. Grant the Graph app `DeviceManagementScripts.Read.All` (Application), with
+   admin consent. In `managed_identity` mode, `deploy.sh` grants it when the
+   setting is set.
+3. Set `INTUNE_MAC_RAM_ATTRIBUTE=RAM bytes`. The value can be the attribute
+   name, the profile's display name, or its id.
+
+The connector reads only runs that succeeded, and ignores output that is not a
+whole number of bytes. A Mac has no value until its first run reports back. If
+the attribute cannot be read (wrong name, missing permission), the run continues
+and the run report carries a warning. The summary field
+`ram_from_custom_attribute` counts the devices it filled. The read uses Graph's
+beta endpoint, the only one that exposes custom attributes.
 
 ## Identity
 

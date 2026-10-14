@@ -272,6 +272,20 @@ def test_hardware_detail_setting_reaches_every_host():
     assert '_env_bool("INTUNE_FETCH_HARDWARE_DETAIL"' in config
 
 
+def test_mac_ram_attribute_reaches_every_host_with_its_permission():
+    """Graph reports Mac RAM as 0; the custom attribute is the only source, and
+    without the setting on the host it silently never applies."""
+    bicep = BICEP.read_text()
+    assert "param macRamAttribute string = ''" in bicep
+    assert "empty(macRamAttribute) ? {} : { INTUNE_MAC_RAM_ATTRIBUTE: macRamAttribute }" in bicep
+    assert "macRamAttribute" in _deploy_sh_bicep_parameters()
+    deploy_sh = DEPLOY_SH.read_text()
+    assert 'REQUIRED_ROLES+=("DeviceManagementScripts.Read.All")' in deploy_sh
+    assert "INTUNE_MAC_RAM_ATTRIBUTE = var.mac_ram_attribute" in TERRAFORM.read_text()
+    config = (REPO / "src" / "intune_cmdb_sync" / "config.py").read_text()
+    assert '_env("INTUNE_MAC_RAM_ATTRIBUTE")' in config
+
+
 def test_empty_class_map_is_omitted_not_blanked():
     """SNOW_CLASS_MAP replaces the built-in map. Setting it to '' on the app
     would be at best a no-op; omitting it keeps the default unambiguous."""

@@ -453,6 +453,110 @@ class TestHardwareDetail:
         assert values["cpu_type"] == "ARM64"
 
 
+SCRIPTS = "https://graph.microsoft.com/beta/deviceManagement/deviceCustomAttributeShellScripts"
+
+
+class TestMacRamFromCustomAttribute:
+    def _run(self, set_env, runner_factory, devices, states=None, scripts_status=200):
+        set_env(INTUNE_MAC_RAM_ATTRIBUTE="RAM bytes")
+        cfg = Config.from_env()
+        respx.get(DEVICES).mock(return_value=httpx.Response(200, json={"value": devices}))
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        respx.get(SCRIPTS).mock(
+            return_value=httpx.Response(
+                scripts_status,
+                json={"value": [{"id": "s1", "customAttributeName": "RAM bytes"}]}
+                if scripts_status == 200 else {"error": {"message": "Forbidden"}},
+            )
+        )
+        respx.get(f"{SCRIPTS}/s1/deviceRunStates").mock(
+            return_value=httpx.Response(200, json={"value": states or []})
+        )
+        mock_snow_plumbing()
+        ire = respx.post(IRE).mock(return_value=ire_response("UPDATE"))
+        report = runner_factory(cfg).run()
+        items = json.loads(ire.calls[0].request.read())["items"] if ire.called else []
+        return report, {i["internal_id"]: i["values"] for i in items}
+
+    @staticmethod
+    def _state(device_id, output, run_state="success"):
+        return {"runState": run_state, "resultMessage": output,
+                "managedDevice": {"id": device_id}}
+
+    @respx.mock
+    def test_fills_mac_ram_graph_reported_as_missing(self, set_env, runner_factory):
+        report, values = self._run(
+            set_env, runner_factory,
+            [make_device(id="mac", operatingSystem="macOS", physicalMemoryInBytes=0)],
+            [self._state("mac", "17179869184")],
+        )
+        assert values["mac"]["ram"] == 16384
+        assert report.ram_from_custom_attribute == 1
+
+    @respx.mock
+    def test_graph_value_wins_over_the_attribute(self, set_env, runner_factory):
+        report, values = self._run(
+            set_env, runner_factory,
+            [make_device(id="win", physicalMemoryInBytes=34359738368)],
+            [self._state("win", "17179869184")],
+        )
+        assert values["win"]["ram"] == 32768
+        assert report.ram_from_custom_attribute == 0
+
+    @respx.mock
+    def test_unparseable_output_is_ignored(self, set_env, runner_factory):
+        report, values = self._run(
+            set_env, runner_factory,
+            [make_device(id="mac", operatingSystem="macOS")],
+            [self._state("mac", "16 GB")],
+        )
+        assert "ram" not in values["mac"]
+        assert report.ram_from_custom_attribute == 0
+
+    @respx.mock
+    def test_unreadable_attribute_warns_and_the_run_continues(self, set_env, runner_factory):
+        report, values = self._run(
+            set_env, runner_factory,
+            [make_device(id="mac", operatingSystem="macOS")],
+            scripts_status=403,
+        )
+        assert "mac" in values, "the device must still be written"
+        assert any("RAM custom attribute 'RAM bytes'" in w for w in report.warnings)
+        assert report.degraded == []
+
+    @respx.mock
+    def test_hardware_detail_zero_is_replaced(self, set_env, runner_factory):
+        """With INTUNE_FETCH_HARDWARE_DETAIL on, Graph puts an explicit 0 on Macs."""
+        set_env(INTUNE_FETCH_HARDWARE_DETAIL="true")
+        beta = respx.post(BETA_BATCH).mock(return_value=httpx.Response(200, json={"responses": [
+            {"id": "0", "status": 200, "body": {"id": "mac", "physicalMemoryInBytes": 0}},
+        ]}))
+        report, values = self._run(
+            set_env, runner_factory,
+            [make_device(id="mac", operatingSystem="macOS")],
+            [self._state("mac", "34359738368")],
+        )
+        assert beta.called, "the hardware lookup must have run and returned the 0"
+        assert values["mac"]["ram"] == 32768
+        assert report.ram_from_custom_attribute == 1
+
+    @respx.mock
+    def test_not_configured_makes_no_call(self, runner_factory):
+        respx.get(DEVICES).mock(
+            return_value=httpx.Response(200, json={"value": [make_device(id="d1")]})
+        )
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        scripts = respx.get(SCRIPTS)
+        mock_snow_plumbing()
+        respx.post(IRE).mock(return_value=ire_response("NO_CHANGE"))
+        runner_factory().run()
+        assert not scripts.called
+
+
 class TestSourceRecency:
     """IRE drops a payload that is not newer than the last one from this source,
     so which timestamp goes out decides whether a new field can land at all."""

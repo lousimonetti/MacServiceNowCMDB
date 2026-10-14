@@ -27,8 +27,9 @@ az account show --query tenantId -o tsv    # subscription tenant
 | --- | --- | --- |
 | `DeviceManagementManagedDevices.Read.All` | Application | Reading `/deviceManagement/managedDevices`. Always required. |
 | `User.Read.All` | Application | Reading `/users/{id}` to resolve device owners to Entra users. Required only when `GRAPH_ENRICH_USERS=true`, which is the default. |
+| `DeviceManagementScripts.Read.All` | Application | Reading the macOS custom attribute that reports Mac RAM. Required only when `INTUNE_MAC_RAM_ATTRIBUTE` is set. |
 
-Both are read-only. The connector never writes to Graph, and never calls a
+All are read-only. The connector never writes to Graph, and never calls a
 device action such as wipe or retire — those methods exist on the
 `managedDevice` resource but are not used here.
 
@@ -79,6 +80,7 @@ equivalent is below.
 
    GRAPH_SP_ID=$(az ad sp show --id "$GRAPH_APP_ID" --query id -o tsv)
 
+   # Add DeviceManagementScripts.Read.All when INTUNE_MAC_RAM_ATTRIBUTE is set.
    for ROLE in DeviceManagementManagedDevices.Read.All User.Read.All; do
      ROLE_ID=$(az ad sp show --id "$GRAPH_APP_ID" \
        --query "appRoles[?value=='$ROLE'].id | [0]" -o tsv)
@@ -126,8 +128,9 @@ granting usually means "wait", not "wrong".
 
 2. **API permissions > Add a permission > Microsoft Graph > Application permissions**
 
-   Add `DeviceManagementManagedDevices.Read.All` and `User.Read.All`, then
-   **Grant admin consent**. Application permissions are inert until consented;
+   Add `DeviceManagementManagedDevices.Read.All` and `User.Read.All` (plus
+   `DeviceManagementScripts.Read.All` if you use `INTUNE_MAC_RAM_ATTRIBUTE`),
+   then **Grant admin consent**. Application permissions are inert until consented;
    without that click every Graph call returns `403`.
 
 3. **Certificates & secrets > New client secret**

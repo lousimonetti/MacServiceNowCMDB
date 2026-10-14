@@ -93,6 +93,9 @@ REQUIRED_ROLES=(
   "DeviceManagementManagedDevices.Read.All"
   "User.Read.All"
 )
+#   DeviceManagementScripts.Read.All         read the macOS RAM custom attribute
+#                                            (only when INTUNE_MAC_RAM_ATTRIBUTE is set)
+[[ -z "${INTUNE_MAC_RAM_ATTRIBUTE:-}" ]] || REQUIRED_ROLES+=("DeviceManagementScripts.Read.All")
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -383,6 +386,7 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
       discoverySource="${SNOW_DISCOVERY_SOURCE:-Intune}" \
       writeMode="$SNOW_WRITE_MODE" \
       classMap="${SNOW_CLASS_MAP:-}" \
+      macRamAttribute="${INTUNE_MAC_RAM_ATTRIBUTE:-}" \
       mappingOverrides="$MAPPING_OVERRIDES" \
       retireMissingDevices="$RETIRE_MISSING" \
       fetchHardwareDetail="$INTUNE_FETCH_HARDWARE_DETAIL" \
@@ -512,6 +516,7 @@ Deployed.
   Dry run          ${DRY_RUN}$([[ "$DRY_RUN" == false ]] && echo "  -- LIVE: the next run commits to the CMDB")
   Retire missing   ${RETIRE_MISSING}
   Hardware detail  ${INTUNE_FETCH_HARDWARE_DETAIL}
+  Mac RAM source   ${INTUNE_MAC_RAM_ATTRIBUTE:-none (Macs get no RAM)}
   Class map        ${SNOW_CLASS_MAP:-built-in (windows, macos)}
   Mapping override ${MAPPING_OVERRIDES_FILE:-none}
   Resource group   ${RESOURCE_GROUP} (${LOCATION})
