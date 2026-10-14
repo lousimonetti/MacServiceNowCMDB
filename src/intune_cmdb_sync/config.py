@@ -172,7 +172,7 @@ class GraphConfig:
     # against a tenant where you cannot create an app registration.
     access_token: str | None = None
     # A macOS custom attribute (name, display name or id) whose script prints
-    # the Mac's RAM in bytes. Graph reports physicalMemoryInBytes as 0 for Macs,
+    # the Mac's RAM in MB. Graph reports physicalMemoryInBytes as 0 for Macs,
     # so this is the only source of `ram` for them. None = not used.
     mac_ram_attribute: str | None = None
 

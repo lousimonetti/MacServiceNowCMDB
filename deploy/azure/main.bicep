@@ -150,7 +150,7 @@ param classMap string = ''
 
 @description('''
 INTUNE_MAC_RAM_ATTRIBUTE: the macOS custom attribute (name, display name or id)
-whose script prints the Mac's RAM in bytes. Graph reports 0 for Macs, so this is
+whose script prints the Mac's RAM in MB. Graph reports 0 for Macs, so this is
 their only RAM source. Needs DeviceManagementScripts.Read.All. Empty = not used.
 ''')
 param macRamAttribute string = ''

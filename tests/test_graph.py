@@ -231,7 +231,8 @@ class TestCustomAttributeValues:
                     "value": [
                         {"runState": "success", "resultMessage": "17179869184\n",
                          "managedDevice": {"id": "mac-1"}},
-                        {"runState": "fail", "resultMessage": "boom",
+                        # Intune keeps the output of a failed run; it is not used.
+                        {"runState": "fail", "resultMessage": "17179869184",
                          "managedDevice": {"id": "mac-2"}},
                     ],
                     "@odata.nextLink": page2,

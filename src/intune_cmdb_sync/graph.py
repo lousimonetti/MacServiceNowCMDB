@@ -437,13 +437,22 @@ class GraphClient:
             states = list(self._iter_pages(states_url, {"$expand": "managedDevice"}, what=what))
 
         values: dict[str, str] = {}
+        not_successful = 0
         for state in states:
             if str(state.get("runState") or "").lower() != "success":
+                # A failed run can still carry output (an Integer attribute whose
+                # value overflowed, for one), but Intune did not accept it.
+                not_successful += 1
                 continue
             device_id = (state.get("managedDevice") or {}).get("id")
             output = str(state.get("resultMessage") or "").strip()
             if device_id and output:
                 values[str(device_id)] = output
+        log.info(
+            "read custom attribute run states",
+            extra={"attribute": attribute, "states": len(states),
+                   "not_successful": not_successful},
+        )
         return values
 
     def _iter_pages(

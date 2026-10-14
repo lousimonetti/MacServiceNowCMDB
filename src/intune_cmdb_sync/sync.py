@@ -217,11 +217,13 @@ class SyncRunner:
             output = outputs.get(str(device.get("id") or ""))
             if output is None:
                 continue
-            value = _positive_int(output)
-            if value is None:
+            megabytes = _positive_int(output)
+            if megabytes is None:
                 unparseable += 1
                 continue
-            device["physicalMemoryInBytes"] = value
+            # The attribute reports MB (deploy/intune/mac-ram-mb.sh): bytes
+            # overflow Intune's 32-bit Integer type and the run is marked Failed.
+            device["physicalMemoryInBytes"] = megabytes * 1024 * 1024
             filled += 1
         report.ram_from_custom_attribute = filled
         log.info(
@@ -481,7 +483,7 @@ class SyncRunner:
 
 
 def _positive_int(raw: Any) -> int | None:
-    """A whole number of bytes, or None. The attribute's output arrives as text."""
+    """A positive whole number, or None. The attribute's output arrives as text."""
     try:
         value = int(str(raw).strip())
     except (TypeError, ValueError):

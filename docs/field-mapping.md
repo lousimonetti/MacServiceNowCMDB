@@ -67,18 +67,23 @@ connector reads that output when `INTUNE_MAC_RAM_ATTRIBUTE` names the attribute.
 It fills `ram` only where Graph reported none, so Windows values are untouched.
 
 1. In Intune: **Devices > macOS > Custom attributes > Add**. Name it (for
-   example `RAM bytes`), set the data type to **Integer**, and upload
-   [`deploy/intune/mac-ram-bytes.sh`](../deploy/intune/mac-ram-bytes.sh). It
-   prints `sysctl -n hw.memsize`, and exits non-zero rather than print anything
-   that is not a whole number. Assign it to the Macs.
+   example `RAM MB`), set the data type to **Integer**, and upload
+   [`deploy/intune/mac-ram-mb.sh`](../deploy/intune/mac-ram-mb.sh). It
+   prints `sysctl -n hw.memsize` in MB, and exits non-zero rather than print
+   anything that is not a whole number. Assign it to the Macs.
+
+   The output must be MB, not bytes. Intune marks an Integer attribute's run
+   **Failed** when the value does not fit 32 bits, and 16 GB in bytes
+   (17179869184) does not; the device report still shows the number, which
+   makes this easy to miss. The connector skips failed runs.
 2. Grant the Graph app `DeviceManagementScripts.Read.All` (Application), with
    admin consent. In `managed_identity` mode, `deploy.sh` grants it when the
    setting is set.
-3. Set `INTUNE_MAC_RAM_ATTRIBUTE=RAM bytes`. The value can be the attribute
+3. Set `INTUNE_MAC_RAM_ATTRIBUTE=RAM MB`. The value can be the attribute
    name, the profile's display name, or its id.
 
 The connector reads only runs that succeeded, and ignores output that is not a
-whole number of bytes. A Mac has no value until its first run reports back. If
+whole number of MB. A Mac has no value until its first run reports back. If
 the attribute cannot be read (wrong name, missing permission), the run continues
 and the run report carries a warning. The summary field
 `ram_from_custom_attribute` counts the devices it filled. The read uses Graph's

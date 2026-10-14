@@ -192,7 +192,8 @@ behaviour change, particularly anything altering what gets written to a CI.
   `physicalMemoryInBytes` as 0 on both endpoints, so no `ram` for Macs.
 - **Mac RAM comes from an Intune custom attribute, not Graph.** Graph reports
   `physicalMemoryInBytes` as 0 for Macs. `INTUNE_MAC_RAM_ATTRIBUTE` names a
-  macOS custom attribute (`sysctl -n hw.memsize`), read from
+  macOS custom attribute (`sysctl -n hw.memsize` **in MB**: bytes overflow
+  Intune's 32-bit Integer type and the run shows Failed, seen 2026-10-14), read from
   `/beta/deviceManagement/deviceCustomAttributeShellScripts/{id}/deviceRunStates`
   (needs `DeviceManagementScripts.Read.All`, confirmed by a live 403
   2026-10-14). It fills only devices where Graph gave no RAM, and an unreadable

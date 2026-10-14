@@ -164,7 +164,7 @@ variable "write_mode" {
 }
 
 variable "mac_ram_attribute" {
-  description = "INTUNE_MAC_RAM_ATTRIBUTE: macOS custom attribute printing RAM in bytes. Needs DeviceManagementScripts.Read.All. Empty = not used."
+  description = "INTUNE_MAC_RAM_ATTRIBUTE: macOS custom attribute printing RAM in MB. Needs DeviceManagementScripts.Read.All. Empty = not used."
   type        = string
   default     = ""
 }

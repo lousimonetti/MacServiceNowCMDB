@@ -458,7 +458,7 @@ SCRIPTS = "https://graph.microsoft.com/beta/deviceManagement/deviceCustomAttribu
 
 class TestMacRamFromCustomAttribute:
     def _run(self, set_env, runner_factory, devices, states=None, scripts_status=200):
-        set_env(INTUNE_MAC_RAM_ATTRIBUTE="RAM bytes")
+        set_env(INTUNE_MAC_RAM_ATTRIBUTE="RAM MB")
         cfg = Config.from_env()
         respx.get(DEVICES).mock(return_value=httpx.Response(200, json={"value": devices}))
         respx.post(f"{GRAPH}/$batch").mock(
@@ -467,7 +467,7 @@ class TestMacRamFromCustomAttribute:
         respx.get(SCRIPTS).mock(
             return_value=httpx.Response(
                 scripts_status,
-                json={"value": [{"id": "s1", "customAttributeName": "RAM bytes"}]}
+                json={"value": [{"id": "s1", "customAttributeName": "RAM MB"}]}
                 if scripts_status == 200 else {"error": {"message": "Forbidden"}},
             )
         )
@@ -490,17 +490,29 @@ class TestMacRamFromCustomAttribute:
         report, values = self._run(
             set_env, runner_factory,
             [make_device(id="mac", operatingSystem="macOS", physicalMemoryInBytes=0)],
-            [self._state("mac", "17179869184")],
+            [self._state("mac", "16384")],
         )
         assert values["mac"]["ram"] == 16384
         assert report.ram_from_custom_attribute == 1
+
+    @respx.mock
+    def test_a_failed_run_is_not_used_even_with_output(self, set_env, runner_factory):
+        """Seen 2026-10-14: an Integer attribute printing bytes (17179869184)
+        overflows 32 bits, and Intune keeps the output but marks the run Failed."""
+        report, values = self._run(
+            set_env, runner_factory,
+            [make_device(id="mac", operatingSystem="macOS", physicalMemoryInBytes=0)],
+            [self._state("mac", "17179869184", run_state="fail")],
+        )
+        assert "ram" not in values["mac"]
+        assert report.ram_from_custom_attribute == 0
 
     @respx.mock
     def test_graph_value_wins_over_the_attribute(self, set_env, runner_factory):
         report, values = self._run(
             set_env, runner_factory,
             [make_device(id="win", physicalMemoryInBytes=34359738368)],
-            [self._state("win", "17179869184")],
+            [self._state("win", "16384")],
         )
         assert values["win"]["ram"] == 32768
         assert report.ram_from_custom_attribute == 0
@@ -523,7 +535,7 @@ class TestMacRamFromCustomAttribute:
             scripts_status=403,
         )
         assert "mac" in values, "the device must still be written"
-        assert any("RAM custom attribute 'RAM bytes'" in w for w in report.warnings)
+        assert any("RAM custom attribute 'RAM MB'" in w for w in report.warnings)
         assert report.degraded == []
 
     @respx.mock
@@ -536,7 +548,7 @@ class TestMacRamFromCustomAttribute:
         report, values = self._run(
             set_env, runner_factory,
             [make_device(id="mac", operatingSystem="macOS")],
-            [self._state("mac", "34359738368")],
+            [self._state("mac", "32768")],
         )
         assert beta.called, "the hardware lookup must have run and returned the 0"
         assert values["mac"]["ram"] == 32768
