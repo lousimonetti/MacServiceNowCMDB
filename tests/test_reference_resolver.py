@@ -170,6 +170,23 @@ class TestCreation:
         assert body["manufacturer"] == "mfr-1"
 
     @respx.mock
+    def test_a_created_company_is_flagged_as_a_manufacturer(self, snow_client):
+        """core_company holds every kind of company; the CI's Manufacturer field
+        only offers rows with manufacturer=true."""
+        respx.get(COMPANY).mock(return_value=httpx.Response(200, json={"result": []}))
+        respx.get(MODEL).mock(return_value=httpx.Response(200, json={"result": []}))
+        create = respx.post(COMPANY).mock(
+            return_value=httpx.Response(201, json={"result": {"sys_id": "mfr-new"}})
+        )
+        resolver = ReferenceResolver(snow_client, create_missing_manufacturers=True)
+        resolver.prime(["LENOVO"], [])
+        assert resolver.references_for("LENOVO", None) == {"manufacturer": "mfr-new"}
+        assert json.loads(create.calls[0].request.read()) == {
+            "name": "LENOVO",
+            "manufacturer": "true",
+        }
+
+    @respx.mock
     def test_creation_is_off_by_default(self, snow_client):
         respx.get(COMPANY).mock(return_value=httpx.Response(200, json={"result": []}))
         respx.get(MODEL).mock(return_value=httpx.Response(200, json={"result": []}))

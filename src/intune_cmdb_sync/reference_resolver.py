@@ -92,6 +92,9 @@ class ReferenceResolver:
             missing=self._missing_manufacturers,
             table=CORE_COMPANY_TABLE,
             create=self._create_manufacturers,
+            # Without the flag the company is invisible to anything filtering
+            # on manufacturer=true, including the Manufacturer field's picker.
+            extra_values={"manufacturer": "true"},
         )
         if manufacturer_sys_id:
             out["manufacturer"] = manufacturer_sys_id
