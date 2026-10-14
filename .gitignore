@@ -29,6 +29,11 @@ servicenow-app/.now/
 .env
 .env.*
 !.env.example
+# Explicit, so the production credentials file survives any edit to .env.* above.
+.env.prod
+# deploy.sh environment files (deploy/azure/dev.env, prod.env): instance names,
+# client IDs and subnet IDs that are specific to one landing zone.
+*.env
 state.json
 run-report.json
 # local container runs write their report here (see deploy/aws/README.md)
