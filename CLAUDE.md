@@ -197,7 +197,9 @@ behaviour change, particularly anything altering what gets written to a CI.
   `/beta/deviceManagement/deviceCustomAttributeShellScripts/{id}/deviceRunStates`
   (needs `DeviceManagementScripts.Read.All`, confirmed by a live 403
   2026-10-14). It fills only devices where Graph gave no RAM, and an unreadable
-  attribute is a report warning, never a failed run. Run-state parsing
+  attribute is a report warning, never a failed run. `INTUNE_MAC_CPU_ATTRIBUTE`
+  does the same for `cpu_name` (String attribute, `machdep.cpu.brand_string`);
+  Graph has no CPU name on any platform. Run-state parsing
   (`$expand=managedDevice($select=id)`, `resultMessage`) is from the docs, not
   yet seen against a tenant with the attribute deployed.
 - **Graph data calls are plain REST, deliberately** — `azure-identity` handles

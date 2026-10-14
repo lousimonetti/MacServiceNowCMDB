@@ -156,6 +156,13 @@ their only RAM source. Needs DeviceManagementScripts.Read.All. Empty = not used.
 param macRamAttribute string = ''
 
 @description('''
+INTUNE_MAC_CPU_ATTRIBUTE: the macOS custom attribute (name, display name or id)
+whose script prints the processor name, mapped to cpu_name. Graph has no CPU
+name. Needs DeviceManagementScripts.Read.All. Empty = not used.
+''')
+param macCpuAttribute string = ''
+
+@description('''
 Mapping overrides as a JSON object, the same content as a local
 MAPPING_OVERRIDES_FILE (e.g. {"drop": ["last_discovered"]}). Reaches the app as
 MAPPING_OVERRIDES_JSON. Empty object = no overrides.
@@ -390,7 +397,8 @@ var baseEnv = {
 var mappingEnv = union(
   empty(classMap) ? {} : { SNOW_CLASS_MAP: classMap },
   empty(mappingOverrides) ? {} : { MAPPING_OVERRIDES_JSON: string(mappingOverrides) },
-  empty(macRamAttribute) ? {} : { INTUNE_MAC_RAM_ATTRIBUTE: macRamAttribute }
+  empty(macRamAttribute) ? {} : { INTUNE_MAC_RAM_ATTRIBUTE: macRamAttribute },
+  empty(macCpuAttribute) ? {} : { INTUNE_MAC_CPU_ATTRIBUTE: macCpuAttribute }
 )
 
 // The complete settings list. Deploying 'appsettings' replaces every setting, so

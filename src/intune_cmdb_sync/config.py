@@ -175,6 +175,9 @@ class GraphConfig:
     # the Mac's RAM in MB. Graph reports physicalMemoryInBytes as 0 for Macs,
     # so this is the only source of `ram` for them. None = not used.
     mac_ram_attribute: str | None = None
+    # A macOS custom attribute whose script prints the processor name ("Apple
+    # M5"). Graph has no CPU name for any platform. None = not used.
+    mac_cpu_attribute: str | None = None
 
     @property
     def authority_host(self) -> str:
@@ -380,6 +383,7 @@ def _build_config() -> Config:
         assertion_identity_client_id=_env("GRAPH_ASSERTION_IDENTITY_CLIENT_ID"),
         access_token=graph_access_token,
         mac_ram_attribute=_env("INTUNE_MAC_RAM_ATTRIBUTE"),
+        mac_cpu_attribute=_env("INTUNE_MAC_CPU_ATTRIBUTE"),
     )
 
     # ---- ServiceNow ------------------------------------------------------

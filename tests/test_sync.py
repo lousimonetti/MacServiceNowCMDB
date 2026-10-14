@@ -569,6 +569,80 @@ class TestMacRamFromCustomAttribute:
         assert not scripts.called
 
 
+class TestMacCpuNameFromCustomAttribute:
+    def _run(self, set_env, runner_factory, devices, states, scripts_status=200):
+        set_env(INTUNE_MAC_CPU_ATTRIBUTE="proctype")
+        cfg = Config.from_env()
+        respx.get(DEVICES).mock(return_value=httpx.Response(200, json={"value": devices}))
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        respx.get(SCRIPTS).mock(
+            return_value=httpx.Response(
+                scripts_status,
+                json={"value": [{"id": "s2", "customAttributeName": "proctype"}]}
+                if scripts_status == 200 else {"error": {"message": "Forbidden"}},
+            )
+        )
+        respx.get(f"{SCRIPTS}/s2/deviceRunStates").mock(
+            return_value=httpx.Response(200, json={"value": states})
+        )
+        mock_snow_plumbing()
+        ire = respx.post(IRE).mock(return_value=ire_response("UPDATE"))
+        report = runner_factory(cfg).run()
+        items = json.loads(ire.calls[0].request.read())["items"] if ire.called else []
+        return report, {i["internal_id"]: i["values"] for i in items}
+
+    @staticmethod
+    def _state(device_id, output, run_state="success"):
+        return {"runState": run_state, "resultMessage": output,
+                "managedDevice": {"id": device_id}}
+
+    @respx.mock
+    def test_fills_cpu_name(self, set_env, runner_factory):
+        report, values = self._run(
+            set_env, runner_factory,
+            [make_device(id="mac", operatingSystem="macOS"), make_device(id="other")],
+            [self._state("mac", "Apple M5\n")],
+        )
+        assert values["mac"]["cpu_name"] == "Apple M5"
+        assert "cpu_name" not in values["other"]
+        assert report.cpu_name_from_custom_attribute == 1
+
+    @respx.mock
+    def test_only_the_first_line_and_the_field_length_are_kept(self, set_env, runner_factory):
+        _, values = self._run(
+            set_env, runner_factory,
+            [make_device(id="a", operatingSystem="macOS"),
+             make_device(id="b", operatingSystem="macOS")],
+            [self._state("a", "Apple M5\nsome debug output"), self._state("b", "x" * 150)],
+        )
+        assert values["a"]["cpu_name"] == "Apple M5"
+        assert values["b"]["cpu_name"] == "x" * 100
+
+    @respx.mock
+    def test_failed_or_empty_runs_are_not_used(self, set_env, runner_factory):
+        report, values = self._run(
+            set_env, runner_factory,
+            [make_device(id="a", operatingSystem="macOS"),
+             make_device(id="b", operatingSystem="macOS")],
+            [self._state("a", "Apple M5", run_state="fail"), self._state("b", "  \n")],
+        )
+        assert "cpu_name" not in values["a"]
+        assert "cpu_name" not in values["b"]
+        assert report.cpu_name_from_custom_attribute == 0
+
+    @respx.mock
+    def test_unreadable_attribute_warns_and_the_run_continues(self, set_env, runner_factory):
+        report, values = self._run(
+            set_env, runner_factory,
+            [make_device(id="mac", operatingSystem="macOS")], [], scripts_status=403,
+        )
+        assert "mac" in values, "the device must still be written"
+        assert any("CPU name custom attribute 'proctype'" in w for w in report.warnings)
+        assert report.degraded == []
+
+
 class TestSourceRecency:
     """IRE drops a payload that is not newer than the last one from this source,
     so which timestamp goes out decides whether a new field can land at all."""

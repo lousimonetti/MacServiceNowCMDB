@@ -4,6 +4,7 @@ import pytest
 
 from intune_cmdb_sync.config import DEFAULT_SERIAL_BLOCKLIST, Config
 from intune_cmdb_sync.mapping import (
+    CPU_NAME_KEY,
     DeviceMapper,
     bytes_to_gb,
     bytes_to_mb,
@@ -187,6 +188,12 @@ class TestDeviceMapper:
     def test_unknown_architecture_leaves_cpu_type_alone(self, config: Config, arch):
         values = DeviceMapper(config).build_values(make_device(processorArchitecture=arch))
         assert "cpu_type" not in values
+
+    def test_cpu_name_comes_only_from_the_custom_attribute_key(self, config: Config):
+        mapper = DeviceMapper(config)
+        assert "cpu_name" not in mapper.build_values(make_device())
+        values = mapper.build_values(make_device(**{CPU_NAME_KEY: "  Apple   M5 "}))
+        assert values["cpu_name"] == "Apple M5"
 
     def test_ethernet_mac_wins_over_wifi(self, config: Config):
         device = make_device(ethernetMacAddress="001122334455")

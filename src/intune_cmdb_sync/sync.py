@@ -10,7 +10,13 @@ from typing import Any
 from .config import Config
 from .errors import GraphError, RetryableHTTPError, ServiceNowError
 from .graph import GraphClient, is_corporate
-from .mapping import DeviceMapper, resolve_class_name, to_snow_datetime
+from .mapping import (
+    CPU_NAME_KEY,
+    CPU_NAME_MAX,
+    DeviceMapper,
+    resolve_class_name,
+    to_snow_datetime,
+)
 from .models import DeviceOutcome, EntraUser, RunReport, SysUserRef
 from .reference_resolver import ReferenceResolver
 from .servicenow.client import ServiceNowClient
@@ -91,6 +97,8 @@ class SyncRunner:
             self._enrich_hardware(devices)
         if self.cfg.graph.mac_ram_attribute:
             self._fill_ram_from_attribute(devices, report)
+        if self.cfg.graph.mac_cpu_attribute:
+            self._fill_cpu_name_from_attribute(devices, report)
 
         sys_users, entra_users = self._resolve_users(devices, report)
         self._prime_references(devices)
@@ -194,20 +202,30 @@ class SyncRunner:
                 if key != "id" and value not in (None, ""):
                     device[key] = value
 
-    def _fill_ram_from_attribute(self, devices: list[dict[str, Any]], report: RunReport) -> None:
-        """Take RAM from the macOS custom attribute where Graph reported none.
+    def _read_custom_attribute(
+        self, attribute: str, purpose: str, report: RunReport
+    ) -> dict[str, str] | None:
+        """Outputs by device id, or None after a warning.
 
         Best-effort: an unreadable attribute (missing permission, wrong name)
-        costs the Macs their RAM, not the run, and is said in the report.
+        costs the Macs that field, not the run, and is said in the report.
         """
-        attribute = self.cfg.graph.mac_ram_attribute or ""
         try:
-            outputs = self.graph.get_custom_attribute_values(attribute)
+            return self.graph.get_custom_attribute_values(attribute)
         except (GraphError, RetryableHTTPError, ValueError) as exc:
             # ValueError: a reply that was not JSON. Still not worth the run.
-            message = f"RAM custom attribute {attribute!r} could not be read: {exc}"
-            log.warning("RAM custom attribute could not be read", extra={"error": str(exc)})
+            message = f"{purpose} custom attribute {attribute!r} could not be read: {exc}"
+            log.warning(
+                f"{purpose} custom attribute could not be read", extra={"error": str(exc)}
+            )
             report.warnings.append(message)
+            return None
+
+    def _fill_ram_from_attribute(self, devices: list[dict[str, Any]], report: RunReport) -> None:
+        """Take RAM from the macOS custom attribute where Graph reported none."""
+        attribute = self.cfg.graph.mac_ram_attribute or ""
+        outputs = self._read_custom_attribute(attribute, "RAM", report)
+        if outputs is None:
             return
 
         filled = unparseable = 0
@@ -230,6 +248,34 @@ class SyncRunner:
             "filled RAM from custom attribute",
             extra={"attribute": attribute, "results": len(outputs), "filled": filled,
                    "unparseable": unparseable},
+        )
+
+    def _fill_cpu_name_from_attribute(
+        self, devices: list[dict[str, Any]], report: RunReport
+    ) -> None:
+        """Take the processor name from the macOS custom attribute.
+
+        Graph has no CPU name at all, so there is nothing to defer to. Only the
+        first line is kept, so a script that prints extra lines cannot put
+        them on the CI.
+        """
+        attribute = self.cfg.graph.mac_cpu_attribute or ""
+        outputs = self._read_custom_attribute(attribute, "CPU name", report)
+        if outputs is None:
+            return
+
+        filled = 0
+        for device in devices:
+            output = outputs.get(str(device.get("id") or ""))
+            name = (output or "").strip().splitlines()[0].strip() if output else ""
+            if not name:
+                continue
+            device[CPU_NAME_KEY] = name[:CPU_NAME_MAX]
+            filled += 1
+        report.cpu_name_from_custom_attribute = filled
+        log.info(
+            "filled CPU name from custom attribute",
+            extra={"attribute": attribute, "results": len(outputs), "filled": filled},
         )
 
     def _resolve_users(

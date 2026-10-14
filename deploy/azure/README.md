@@ -502,6 +502,7 @@ These are the complete settings the WebJob receives. Nothing else from a local
 | `DRY_RUN` | `DRY_RUN` (**required**, no default) |
 | `INTUNE_FETCH_HARDWARE_DETAIL` | `INTUNE_FETCH_HARDWARE_DETAIL` (default `false`). Set `true` for `ram`, `cpu_type` and the ethernet MAC, which Graph returns only per device: one extra `$batch` request per 20 devices per run |
 | `INTUNE_MAC_RAM_ATTRIBUTE` | `INTUNE_MAC_RAM_ATTRIBUTE`; omitted when unset. The macOS custom attribute that reports Mac RAM; see `docs/field-mapping.md` |
+| `INTUNE_MAC_CPU_ATTRIBUTE` | `INTUNE_MAC_CPU_ATTRIBUTE`; omitted when unset. The macOS custom attribute that reports the processor name (`cpu_name`); see `docs/field-mapping.md` |
 | `SNOW_CLASS_MAP` | `SNOW_CLASS_MAP`; omitted when unset, so the built-in map applies |
 | `MAPPING_OVERRIDES_JSON` | the contents of the local `MAPPING_OVERRIDES_FILE`, minus `_comment`; omitted when unset |
 | `GRAPH_AUTH_MODE`, `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET` | depend on the Graph mode |

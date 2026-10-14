@@ -111,6 +111,8 @@ class RunReport:
     fetch_hardware_detail: bool = False
     # Devices whose `ram` came from INTUNE_MAC_RAM_ATTRIBUTE rather than Graph.
     ram_from_custom_attribute: int = 0
+    # Devices whose `cpu_name` came from INTUNE_MAC_CPU_ATTRIBUTE.
+    cpu_name_from_custom_attribute: int = 0
     devices_fetched: int = 0
     devices_after_ownership_filter: int = 0
     devices_skipped_no_class: int = 0
@@ -166,6 +168,7 @@ class RunReport:
             "write_mode": self.write_mode,
             "fetch_hardware_detail": self.fetch_hardware_detail,
             "ram_from_custom_attribute": self.ram_from_custom_attribute,
+            "cpu_name_from_custom_attribute": self.cpu_name_from_custom_attribute,
             "devices_fetched": self.devices_fetched,
             "devices_after_ownership_filter": self.devices_after_ownership_filter,
             "devices_skipped_no_class": self.devices_skipped_no_class,

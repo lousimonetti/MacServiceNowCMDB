@@ -286,6 +286,19 @@ def test_mac_ram_attribute_reaches_every_host_with_its_permission():
     assert '_env("INTUNE_MAC_RAM_ATTRIBUTE")' in config
 
 
+def test_mac_cpu_attribute_reaches_every_host_with_its_permission():
+    bicep = BICEP.read_text()
+    assert "param macCpuAttribute string = ''" in bicep
+    assert "empty(macCpuAttribute) ? {} : { INTUNE_MAC_CPU_ATTRIBUTE: macCpuAttribute }" in bicep
+    assert "macCpuAttribute" in _deploy_sh_bicep_parameters()
+    assert "${INTUNE_MAC_CPU_ATTRIBUTE:-}" in DEPLOY_SH.read_text().split(
+        'REQUIRED_ROLES+=("DeviceManagementScripts.Read.All")'
+    )[0], "the permission must also be required when only the CPU attribute is set"
+    assert "INTUNE_MAC_CPU_ATTRIBUTE = var.mac_cpu_attribute" in TERRAFORM.read_text()
+    config = (REPO / "src" / "intune_cmdb_sync" / "config.py").read_text()
+    assert '_env("INTUNE_MAC_CPU_ATTRIBUTE")' in config
+
+
 def test_empty_class_map_is_omitted_not_blanked():
     """SNOW_CLASS_MAP replaces the built-in map. Setting it to '' on the app
     would be at best a no-op; omitting it keeps the default unambiguous."""

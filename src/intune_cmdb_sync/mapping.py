@@ -41,6 +41,12 @@ DEFAULT_OS_NAMES = {
 # "arM64"; `unknown` maps to nothing, so the field is left alone.
 CPU_TYPES = {"x86": "x86", "x64": "x64", "arm": "ARM", "arm64": "ARM64"}
 
+# Where SyncRunner puts the processor name read from INTUNE_MAC_CPU_ATTRIBUTE.
+# Not a Graph property: Graph has no CPU name, which is why the attribute exists.
+CPU_NAME_KEY = "_cpuNameFromCustomAttribute"
+# cmdb_ci_computer.cpu_name is a 100-character string.
+CPU_NAME_MAX = 100
+
 # Serial numbers shorter than this are placeholders, not identifiers.
 MIN_SERIAL_LENGTH = 3
 
@@ -181,6 +187,7 @@ class DeviceMapper:
             ),
             "ram": bytes_to_mb(device.get("physicalMemoryInBytes")),
             "cpu_type": CPU_TYPES.get(str(device.get("processorArchitecture") or "").lower()),
+            "cpu_name": _clean(device.get(CPU_NAME_KEY)),
             "disk_space": bytes_to_gb(device.get("totalStorageSpaceInBytes")),
             "first_discovered": to_snow_datetime(device.get("enrolledDateTime")),
             "last_discovered": to_snow_datetime(device.get("lastSyncDateTime")),

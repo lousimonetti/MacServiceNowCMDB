@@ -20,6 +20,7 @@ pin every rule below.
 | `model_id` | `model` | resolved to a `cmdb_model` sys_id |
 | `mac_address` | `ethernetMacAddress`, else `wiFiMacAddress` | normalised to `AA:BB:CC:DD:EE:FF` |
 | `ram` | `physicalMemoryInBytes`; for Macs, the `INTUNE_MAC_RAM_ATTRIBUTE` custom attribute | bytes → MB (Graph's value requires `INTUNE_FETCH_HARDWARE_DETAIL=true`; see [Mac RAM](#mac-ram-from-a-custom-attribute)) |
+| `cpu_name` | the `INTUNE_MAC_CPU_ATTRIBUTE` custom attribute (Macs only) | first line, up to 100 characters; see [Mac CPU name](#mac-cpu-name-from-a-custom-attribute) |
 | `cpu_type` | `processorArchitecture` (beta) | `x64`, `x86`, `ARM64`, `ARM`; `unknown` is left out (requires `INTUNE_FETCH_HARDWARE_DETAIL=true`) |
 | `disk_space` | `totalStorageSpaceInBytes` | bytes → GB, 2 dp |
 | `first_discovered` | `enrolledDateTime` | ISO-8601 → `YYYY-MM-DD HH:MM:SS` UTC |
@@ -49,9 +50,10 @@ change.
 
 `cpu_type` carries the processor architecture, which Graph exposes only on the
 beta endpoint. For that reason the hardware-detail lookup is batched against
-beta. Nothing is mapped to `cpu_name`, `cpu_count`, `cpu_speed` or
-`cpu_core_count`. Intune's Graph data has no processor name, speed or core
-count, in v1.0 or in beta's `hardwareInformation`. Graph reports
+beta. Nothing is mapped to `cpu_count`, `cpu_speed` or `cpu_core_count`, and
+`cpu_name` comes only from a Mac custom attribute. Intune's Graph data has no
+processor name, speed or core count, in v1.0 or in beta's
+`hardwareInformation`. Graph reports
 `physicalMemoryInBytes` as 0 for Macs on both endpoints (seen in two tenants,
 2026-10-14), so Macs get no `ram`. Leave these fields to another discovery
 source, or collect them with an Intune custom attribute script.
@@ -88,6 +90,23 @@ the attribute cannot be read (wrong name, missing permission), the run continues
 and the run report carries a warning. The summary field
 `ram_from_custom_attribute` counts the devices it filled. The read uses Graph's
 beta endpoint, the only one that exposes custom attributes.
+
+### Mac CPU name from a custom attribute
+
+The same mechanism fills `cpu_name`, which Graph has for no platform.
+
+1. In Intune: **Devices > macOS > Custom attributes > Add**, data type
+   **String**, with [`deploy/intune/mac-cpu-name.sh`](../deploy/intune/mac-cpu-name.sh)
+   (`sysctl -n machdep.cpu.brand_string`, which prints `Apple M5` on Apple
+   silicon and the full brand string on Intel). Assign it to the Macs.
+2. The same `DeviceManagementScripts.Read.All` permission as for RAM.
+3. Set `INTUNE_MAC_CPU_ATTRIBUTE` to the attribute's name.
+
+Only the first line of a successful run is used, trimmed to the field's 100
+characters. The summary field `cpu_name_from_custom_attribute` counts the
+devices it filled; an unreadable attribute is a run report warning. If another
+discovery source also writes `cpu_name`, whichever IRE lets write last wins;
+add `"drop": ["cpu_name"]` or a reconciliation rule to settle it.
 
 ## Identity
 

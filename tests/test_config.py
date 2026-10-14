@@ -175,6 +175,10 @@ class TestMappingOverridesFile:
         set_env(INTUNE_MAC_RAM_ATTRIBUTE="RAM bytes")
         assert Config.from_env().graph.mac_ram_attribute == "RAM bytes"
 
+    def test_mac_cpu_attribute_is_read(self, set_env):
+        set_env(INTUNE_MAC_CPU_ATTRIBUTE="proctype")
+        assert Config.from_env().graph.mac_cpu_attribute == "proctype"
+
     def test_source_recency_defaults_to_last_sync(self, set_env):
         set_env()
         assert Config.from_env().servicenow.source_recency == "last_sync"

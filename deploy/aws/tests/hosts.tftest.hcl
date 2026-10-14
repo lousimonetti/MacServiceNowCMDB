@@ -85,6 +85,11 @@ run "lambda_is_the_default_host" {
   }
 
   assert {
+    condition     = !contains(keys(aws_lambda_function.sync[0].environment[0].variables), "INTUNE_MAC_CPU_ATTRIBUTE")
+    error_message = "an unset mac_cpu_attribute must not be sent"
+  }
+
+  assert {
     condition     = !contains(keys(aws_lambda_function.sync[0].environment[0].variables), "SNOW_CLASS_MAP")
     error_message = "an unset class_map must leave the built-in map in effect, not send an empty one"
   }
