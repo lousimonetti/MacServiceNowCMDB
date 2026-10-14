@@ -49,6 +49,8 @@ class SyncRunner:
             create_missing_manufacturers=cfg.servicenow.create_missing_manufacturers,
             create_missing_models=cfg.servicenow.create_missing_models,
             dry_run=cfg.runtime.dry_run,
+            manufacturer_aliases=cfg.runtime.mapping_overrides.get("manufacturer_aliases"),
+            model_aliases=cfg.runtime.mapping_overrides.get("model_aliases"),
         )
 
     def run(self) -> RunReport:
@@ -303,13 +305,19 @@ class SyncRunner:
                     values=values,
                     device_name=device_name,
                     serial_number=serial,
-                    source_recency=to_snow_datetime(device.get("lastSyncDateTime")),
+                    source_recency=self._source_recency(device, report),
                 )
             )
             outcome.sent_values = values
             outcomes[intune_id] = outcome
 
         return payloads, outcomes
+
+    def _source_recency(self, device: dict[str, Any], report: RunReport) -> str | None:
+        """IRE's source_recency_timestamp; see VALID_SOURCE_RECENCY in config.py."""
+        if self.cfg.servicenow.source_recency == "run_time":
+            return report.started_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        return to_snow_datetime(device.get("lastSyncDateTime"))
 
     def _write_batch(
         self,

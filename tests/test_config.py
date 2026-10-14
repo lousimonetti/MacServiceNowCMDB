@@ -166,6 +166,20 @@ class TestMappingOverridesFile:
         with pytest.raises(ConfigError, match="must be a JSON object"):
             Config.from_env()
 
+    def test_reference_aliases_must_map_names_to_names(self, set_env):
+        set_env(MAPPING_OVERRIDES_JSON='{"manufacturer_aliases": {"LENOVO": 1}}')
+        with pytest.raises(ConfigError, match="'manufacturer_aliases' must be an object"):
+            Config.from_env()
+
+    def test_source_recency_defaults_to_last_sync(self, set_env):
+        set_env()
+        assert Config.from_env().servicenow.source_recency == "last_sync"
+
+    def test_source_recency_rejects_unknown_values(self, set_env):
+        set_env(SNOW_SOURCE_RECENCY="now")
+        with pytest.raises(ConfigError, match="SNOW_SOURCE_RECENCY must be one of"):
+            Config.from_env()
+
     def test_inline_json_must_parse(self, set_env):
         set_env(MAPPING_OVERRIDES_JSON="{not json")
         with pytest.raises(ConfigError, match="not valid JSON"):

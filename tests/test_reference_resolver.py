@@ -55,6 +55,41 @@ class TestPrimeAndResolve:
         assert resolver.references_for("APPLE", None)["manufacturer"] == "mfr-1"
 
     @respx.mock
+    def test_aliases_rename_before_lookup(self, snow_client):
+        """Intune says LENOVO; the instance's core_company row says Lenovo."""
+        company = respx.get(COMPANY).mock(
+            return_value=httpx.Response(
+                200, json={"result": [{"sys_id": "mfr-1", "name": "Lenovo"}]}
+            )
+        )
+        respx.get(MODEL).mock(
+            return_value=httpx.Response(
+                200, json={"result": [{"sys_id": "model-1", "name": "ThinkPad T14 Gen 2"}]}
+            )
+        )
+        resolver = ReferenceResolver(
+            snow_client,
+            manufacturer_aliases={"lenovo": "Lenovo"},
+            model_aliases={"20W1S2BG00": "ThinkPad T14 Gen 2"},
+        )
+        resolver.prime(["LENOVO"], ["20W1S2BG00"])
+        assert "nameLenovo" in company.calls[0].request.url.params["sysparm_query"].replace("=", "")
+        assert resolver.references_for("LENOVO", "20W1S2BG00") == {
+            "manufacturer": "mfr-1",
+            "model_id": "model-1",
+        }
+        assert resolver.unresolved == {"manufacturers": [], "models": []}
+
+    @respx.mock
+    def test_an_alias_to_a_missing_record_reports_the_alias(self, snow_client):
+        respx.get(COMPANY).mock(return_value=httpx.Response(200, json={"result": []}))
+        respx.get(MODEL).mock(return_value=httpx.Response(200, json={"result": []}))
+        resolver = ReferenceResolver(snow_client, manufacturer_aliases={"Apple": "Apple Inc."})
+        resolver.prime(["Apple"], [])
+        assert resolver.references_for("Apple", None) == {}
+        assert resolver.unresolved["manufacturers"] == ["Apple Inc."]
+
+    @respx.mock
     def test_unknown_names_are_reported_not_guessed(self, snow_client):
         respx.get(COMPANY).mock(return_value=httpx.Response(200, json={"result": []}))
         respx.get(MODEL).mock(return_value=httpx.Response(200, json={"result": []}))

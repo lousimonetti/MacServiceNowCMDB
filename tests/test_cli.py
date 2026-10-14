@@ -89,6 +89,27 @@ class TestRun:
         assert commit.call_count == 0
 
     @respx.mock
+    def test_source_recency_flag_applies_for_this_call_only(self, set_env):
+        """The backfill flag must not leak into a later invocation (Lambda reuses
+        the process), or every run after a backfill would keep using run time."""
+        import os
+
+        set_env(SNOW_SOURCE_RECENCY=None)
+        respx.get(DEVICES).mock(
+            return_value=httpx.Response(200, json={"value": [make_device(id="d1")]})
+        )
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        mock_snow_plumbing()
+        ire = respx.post(IRE).mock(return_value=ire_response("NO_CHANGE"))
+
+        assert main(["--source-recency", "run_time"]) == EXIT_OK
+        sent = json.loads(ire.calls[0].request.read())["items"][0]["sys_object_source_info"]
+        assert sent["source_recency_timestamp"] != "2026-08-25 06:11:02"
+        assert "SNOW_SOURCE_RECENCY" not in os.environ
+
+    @respx.mock
     def test_fail_on_error_exits_four(self, set_env):
         """One device of two fails: a partial failure, which is an ordinary
         outcome unless the flag says otherwise. A run where *nothing* was

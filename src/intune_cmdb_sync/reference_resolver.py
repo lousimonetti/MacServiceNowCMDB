@@ -38,8 +38,15 @@ class ReferenceResolver:
         create_missing_manufacturers: bool = False,
         create_missing_models: bool = False,
         dry_run: bool = False,
+        manufacturer_aliases: dict[str, str] | None = None,
+        model_aliases: dict[str, str] | None = None,
     ) -> None:
         self._client = client
+        # Intune name -> the name the ServiceNow record actually has (e.g.
+        # "LENOVO" -> "Lenovo"), matched case-insensitively. Applied before
+        # every lookup, so unresolved names are reported as looked up.
+        self._manufacturer_aliases = _fold(manufacturer_aliases)
+        self._model_aliases = _fold(model_aliases)
         self._create_manufacturers = create_missing_manufacturers
         self._create_models = create_missing_models
         self._dry_run = dry_run
@@ -57,6 +64,8 @@ class ReferenceResolver:
 
     def prime(self, manufacturers: Iterable[str], models: Iterable[str]) -> None:
         """Bulk-load every manufacturer and model the run will need."""
+        manufacturers = [_alias(m, self._manufacturer_aliases) for m in manufacturers]
+        models = [_alias(m, self._model_aliases) for m in models]
         self._manufacturers.update(
             self._lookup(CORE_COMPANY_TABLE, usable_values(manufacturers))
         )
@@ -72,6 +81,10 @@ class ReferenceResolver:
     def references_for(self, manufacturer: str | None, model: str | None) -> dict[str, str]:
         """Return {'manufacturer': sys_id, 'model_id': sys_id} for what resolved."""
         out: dict[str, str] = {}
+        if manufacturer:
+            manufacturer = _alias(manufacturer, self._manufacturer_aliases)
+        if model:
+            model = _alias(model, self._model_aliases)
 
         manufacturer_sys_id = self._resolve(
             manufacturer,
@@ -164,3 +177,11 @@ class ReferenceResolver:
         if sys_id:
             log.info("created reference record", extra={"table": table, "record_name": name})
         return str(sys_id) if sys_id else None
+
+
+def _fold(aliases: dict[str, str] | None) -> dict[str, str]:
+    return {k.strip().lower(): v.strip() for k, v in (aliases or {}).items() if v.strip()}
+
+
+def _alias(name: str, aliases: dict[str, str]) -> str:
+    return aliases.get(name.strip().lower(), name)

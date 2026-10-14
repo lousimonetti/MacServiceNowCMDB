@@ -213,6 +213,8 @@ class ServiceNowConfig:
     correlation_field: str | None
     set_correlation: bool
     fetch_hardware_detail: bool
+    # What IRE's source_recency_timestamp carries: see VALID_SOURCE_RECENCY.
+    source_recency: str
     create_missing_manufacturers: bool
     create_missing_models: bool
 
@@ -261,6 +263,19 @@ VALID_GRAPH_AUTH_MODES = {
 }
 VALID_SNOW_AUTH_MODES = {"oauth_client_credentials", "oauth_password", "basic"}
 VALID_WRITE_MODES = {"identify_reconcile", "cmdb_instance"}
+
+# IRE only applies a payload whose source_recency_timestamp is strictly later
+# than the one stored for that source on sys_object_source; otherwise the whole
+# payload becomes NO_CHANGE ("newer entry in sys_object_source from same feed",
+# observed 2026-10-14).
+#   last_sync  the device's lastSyncDateTime: honest recency, but nothing changes
+#              until the device checks in again, even a newly mapped field.
+#   run_time   when this run started: every run is newer, so a backfill applies.
+#              Intune then looks fresh even for devices that stopped reporting.
+VALID_SOURCE_RECENCY = {"last_sync", "run_time"}
+
+# Overrides-file keys that rename an Intune value before the reference lookup.
+REFERENCE_ALIAS_KEYS = ("manufacturer_aliases", "model_aliases")
 VALID_OWNERSHIP = {"company", "personal", "any"}
 VALID_USER_MATCH_KEYS = {"employee_number", "email", "user_name", "entra_id"}
 
@@ -413,6 +428,13 @@ def _build_config() -> Config:
             f"SNOW_WRITE_MODE must be one of {sorted(VALID_WRITE_MODES)} (got {write_mode!r})"
         )
 
+    source_recency = (_env("SNOW_SOURCE_RECENCY", "last_sync") or "").lower()
+    if source_recency not in VALID_SOURCE_RECENCY:
+        problems.append(
+            f"SNOW_SOURCE_RECENCY must be one of {sorted(VALID_SOURCE_RECENCY)} "
+            f"(got {source_recency!r})"
+        )
+
     user_match_order = _env_csv("SNOW_USER_MATCH_ORDER", ("employee_number", "email", "user_name"))
     unknown_keys = [k for k in user_match_order if k not in VALID_USER_MATCH_KEYS]
     if unknown_keys:
@@ -465,6 +487,7 @@ def _build_config() -> Config:
         correlation_field=_env("SNOW_CORRELATION_FIELD", "correlation_id"),
         set_correlation=_env_bool("SNOW_SET_CORRELATION", True),
         fetch_hardware_detail=_env_bool("INTUNE_FETCH_HARDWARE_DETAIL", False),
+        source_recency=source_recency,
         create_missing_manufacturers=_env_bool("SNOW_CREATE_MISSING_MANUFACTURERS", False),
         create_missing_models=_env_bool("SNOW_CREATE_MISSING_MODELS", False),
     )
@@ -510,6 +533,16 @@ def _build_config() -> Config:
                 problems.append("MAPPING_OVERRIDES_JSON must be a JSON object")
     if isinstance(loaded, dict):
         mapping_overrides = loaded
+        for key in REFERENCE_ALIAS_KEYS:
+            aliases = mapping_overrides.get(key)
+            if aliases is not None and not (
+                isinstance(aliases, dict)
+                and all(isinstance(k, str) and isinstance(v, str) for k, v in aliases.items())
+            ):
+                problems.append(
+                    f"mapping overrides '{key}' must be an object of Intune name -> "
+                    f"ServiceNow record name, e.g. {{\"LENOVO\": \"Lenovo\"}}"
+                )
 
     device_limit = _env_int("INTUNE_DEVICE_LIMIT", 0, minimum=0) or None
 

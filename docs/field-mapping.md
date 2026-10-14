@@ -73,6 +73,16 @@ duplicate CI. `source_recency_timestamp` carries the device's last Intune
 check-in, which is what lets IRE decide that a stale payload should not overwrite
 fresher data from another source.
 
+The same check has a cost. IRE applies a payload only when its timestamp is
+*later* than the one stored for this source, and otherwise reports the whole
+payload as `NO_CHANGE` ("newer entry in sys_object_source from same feed"). So a
+newly mapped field, a newly created model or a new owner match reaches a CI only
+after that device checks in to Intune again. For a one-off backfill, run once with
+`--source-recency run_time` (or `SNOW_SOURCE_RECENCY=run_time`), which sends the
+run's start time instead. Afterwards, go back to the default (`last_sync`). Each
+device then waits for its next check-in after the backfill before IRE accepts
+its updates again, because the stored timestamp is now the backfill time.
+
 **Identification rules** — used the first time a device is seen, and the only
 mechanism available in `cmdb_instance` mode. For `cmdb_ci_computer` that is
 normally serial number, then name.
@@ -201,7 +211,9 @@ SNOW_EXTRA_ATTRIBUTES='{"company":"a1b2c3...","u_managed_by_team":"EUC"}'
   },
   "os_names": { "macos": "macOS" },
   "static":   { "u_data_source": "intune-cmdb-sync" },
-  "drop":     ["disk_space"]
+  "drop":     ["disk_space"],
+  "manufacturer_aliases": { "LENOVO": "Lenovo", "Apple": "Apple Inc." },
+  "model_aliases":        { "20W1S2BG00": "ThinkPad T14 Gen 2" }
 }
 ```
 
@@ -211,6 +223,11 @@ SNOW_EXTRA_ATTRIBUTES='{"company":"a1b2c3...","u_managed_by_team":"EUC"}'
 - `os_names` — override the `operatingSystem` translation table.
 - `static` — merged after everything else, so it wins.
 - `drop` — remove a default field you do not want written.
+- `manufacturer_aliases` / `model_aliases` — Intune name → the `name` of the
+  existing `core_company` / `cmdb_model` record, matched case-insensitively.
+  Use them when Intune spells a manufacturer differently (`LENOVO`), or reports
+  a machine-type code instead of a model name. A name that still has no record
+  appears under `unresolved_references` in the run report, as the alias.
 
 There is a working example in [`examples/mapping-overrides.json`](examples/mapping-overrides.json).
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC
 
 import httpx
 import pytest
@@ -445,6 +446,36 @@ class TestHardwareDetail:
         assert sent["ram"] == 65536
         values = json.loads(ire.calls[0].request.read())["items"][0]["values"]
         assert values["ram"] == 65536
+
+
+class TestSourceRecency:
+    """IRE drops a payload that is not newer than the last one from this source,
+    so which timestamp goes out decides whether a new field can land at all."""
+
+    def _sent_recency(self, runner_factory, cfg=None) -> str:
+        respx.get(DEVICES).mock(
+            return_value=httpx.Response(200, json={"value": [make_device(id="d1")]})
+        )
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        mock_snow_plumbing()
+        ire = respx.post(IRE).mock(return_value=ire_response("NO_CHANGE"))
+        runner = runner_factory(cfg)
+        runner.run()
+        item = json.loads(ire.calls[0].request.read())["items"][0]
+        self.started_at = runner.report.started_at
+        return item["sys_object_source_info"]["source_recency_timestamp"]
+
+    @respx.mock
+    def test_default_is_the_device_last_sync(self, runner_factory):
+        assert self._sent_recency(runner_factory) == "2026-08-25 06:11:02"
+
+    @respx.mock
+    def test_run_time_sends_when_the_run_started(self, set_env, runner_factory):
+        set_env(SNOW_SOURCE_RECENCY="run_time")
+        sent = self._sent_recency(runner_factory, Config.from_env())
+        assert sent == self.started_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
 
 
 class TestDryRunUnderCmdbInstance:

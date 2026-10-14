@@ -106,6 +106,16 @@ def build_parser() -> argparse.ArgumentParser:
             "'no CMDB class mapped'."
         ),
     )
+    parser.add_argument(
+        "--source-recency",
+        choices=("last_sync", "run_time"),
+        help=(
+            "What IRE's source_recency_timestamp carries. IRE ignores a payload that is "
+            "not newer than the last one from this source, so with last_sync (the "
+            "default) a new field reaches a CI only after the device checks in again. "
+            "Use run_time for a one-off backfill. Overrides SNOW_SOURCE_RECENCY."
+        ),
+    )
     parser.add_argument("--log-level", help="Override LOG_LEVEL (DEBUG, INFO, WARNING, ERROR).")
     parser.add_argument("--log-format", choices=("json", "text"), help="Override LOG_FORMAT.")
     parser.add_argument(
@@ -152,6 +162,7 @@ def _apply_overrides(args: argparse.Namespace) -> Iterator[None]:
     override("INTUNE_DEVICE_LIMIT", None if args.limit is None else str(args.limit))
     override("RUN_REPORT_DEVICES", "true" if args.report_devices else None)
     override("FAIL_ON_ERROR", "true" if args.fail_on_error else None)
+    override("SNOW_SOURCE_RECENCY", args.source_recency)
 
     try:
         yield

@@ -31,6 +31,14 @@ behaviour change, particularly anything altering what gets written to a CI.
   between runs makes every device an UPDATE. `last_discovered`
   (`lastSyncDateTime`) is the classic offender; it is dropped via
   `MAPPING_OVERRIDES_FILE` in local setups. Check that before adding a field.
+- **IRE drops a payload that is not newer than the last one.** It compares
+  `source_recency_timestamp` with the one stored on `sys_object_source`, and an
+  equal or older timestamp makes the whole item `NO_CHANGE` ("newer entry in
+  sys_object_source from same feed", seen on PROD 2026-10-14). The default
+  (`SNOW_SOURCE_RECENCY=last_sync`, i.e. `lastSyncDateTime`) therefore holds back
+  a new field until the device checks in. `--source-recency run_time` is the
+  backfill. Look at `ire_detail` in the run report before concluding a field is
+  not mapped.
 - **Unresolved reference fields are omitted, not blanked.** A failed
   `manufacturer` / `model_id` / `assigned_to` lookup leaves the existing CI
   value alone rather than clearing it. Preserve that property.
