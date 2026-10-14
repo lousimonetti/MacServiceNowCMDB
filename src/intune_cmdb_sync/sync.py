@@ -121,6 +121,7 @@ class SyncRunner:
             report.degrade(f"write run stopped early: {aborted}")
 
         report.unresolved_references = self.references.unresolved
+        report.warnings.extend(self.references.blank_creations)
         if any(report.unresolved_references.values()):
             log.info(
                 "some manufacturer/model references had no matching record",

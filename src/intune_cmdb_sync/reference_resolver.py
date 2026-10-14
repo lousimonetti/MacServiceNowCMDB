@@ -54,6 +54,8 @@ class ReferenceResolver:
         self._models: dict[str, str] = {}
         self._missing_manufacturers: set[str] = set()
         self._missing_models: set[str] = set()
+        # Records ServiceNow created but stored without the name we sent.
+        self.blank_creations: list[str] = []
 
     @property
     def unresolved(self) -> dict[str, list[str]]:
@@ -167,7 +169,7 @@ class ReferenceResolver:
                 "POST",
                 f"/api/now/table/{table}",
                 json_body=body,
-                params={"sysparm_fields": "sys_id"},
+                params={"sysparm_fields": "sys_id,name"},
                 context=f"create {table}",
             )
         except ServiceNowError as exc:
@@ -176,10 +178,30 @@ class ReferenceResolver:
                 extra={"table": table, "record_name": name, "error": str(exc)},
             )
             return None
-        sys_id = ((payload or {}).get("result") or {}).get("sys_id")
-        if sys_id:
-            log.info("created reference record", extra={"table": table, "record_name": name})
-        return str(sys_id) if sys_id else None
+        result = (payload or {}).get("result") or {}
+        sys_id = result.get("sys_id")
+        if not sys_id:
+            return None
+        stored = str(result.get("name") or "").strip()
+        if stored.lower() != name.strip().lower():
+            # The Table API drops fields the caller may not write and still
+            # creates the row. A nameless company linked to every CI is worse
+            # than no link, and the lookup can never find it again, so each run
+            # would create another (observed on PROD 2026-10-14).
+            message = (
+                f"{table} record {sys_id} was created but ServiceNow stored name "
+                f"{stored!r} instead of {name!r}: the integration account cannot write "
+                f"{table}.name. Not linking CIs to it; turn off record creation or grant "
+                f"that write, and delete the blank record."
+            )
+            log.warning(
+                "created reference record has no name",
+                extra={"table": table, "record_name": name, "sys_id": sys_id},
+            )
+            self.blank_creations.append(message)
+            return None
+        log.info("created reference record", extra={"table": table, "record_name": name})
+        return str(sys_id)
 
 
 def _fold(aliases: dict[str, str] | None) -> dict[str, str]:

@@ -158,7 +158,9 @@ class TestCreation:
         )
         respx.get(MODEL).mock(return_value=httpx.Response(200, json={"result": []}))
         create = respx.post(MODEL).mock(
-            return_value=httpx.Response(201, json={"result": {"sys_id": "model-new"}})
+            return_value=httpx.Response(
+                201, json={"result": {"sys_id": "model-new", "name": "Mac16,1"}}
+            )
         )
         resolver = ReferenceResolver(snow_client, create_missing_models=True)
         resolver.prime(["Apple"], ["Mac16,1"])
@@ -176,7 +178,9 @@ class TestCreation:
         respx.get(COMPANY).mock(return_value=httpx.Response(200, json={"result": []}))
         respx.get(MODEL).mock(return_value=httpx.Response(200, json={"result": []}))
         create = respx.post(COMPANY).mock(
-            return_value=httpx.Response(201, json={"result": {"sys_id": "mfr-new"}})
+            return_value=httpx.Response(
+                201, json={"result": {"sys_id": "mfr-new", "name": "LENOVO"}}
+            )
         )
         resolver = ReferenceResolver(snow_client, create_missing_manufacturers=True)
         resolver.prime(["LENOVO"], [])
@@ -185,6 +189,24 @@ class TestCreation:
             "name": "LENOVO",
             "manufacturer": "true",
         }
+
+    @respx.mock
+    def test_a_record_created_without_its_name_is_not_used(self, snow_client):
+        """ServiceNow drops a field the account may not write and still returns
+        a sys_id. Linking every CI to that blank company is worse than no link."""
+        respx.get(COMPANY).mock(return_value=httpx.Response(200, json={"result": []}))
+        respx.get(MODEL).mock(return_value=httpx.Response(200, json={"result": []}))
+        respx.post(COMPANY).mock(
+            return_value=httpx.Response(
+                201, json={"result": {"sys_id": "blank-1", "name": ""}}
+            )
+        )
+        resolver = ReferenceResolver(snow_client, create_missing_manufacturers=True)
+        resolver.prime(["Apple"], [])
+        assert resolver.references_for("Apple", None) == {}
+        assert resolver.unresolved["manufacturers"] == ["Apple"]
+        assert len(resolver.blank_creations) == 1
+        assert "blank-1" in resolver.blank_creations[0]
 
     @respx.mock
     def test_creation_is_off_by_default(self, snow_client):
