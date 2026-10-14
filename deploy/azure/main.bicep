@@ -163,7 +163,7 @@ param dryRun bool = false
 
 @description('''
 Fetch the hardware properties Graph returns only per device (RAM, ethernet MAC,
-UDID). Without it `ram` is never sent. Costs one Graph $batch request per 20
+CPU architecture, UDID). Without it `ram` is never sent. Costs one Graph $batch request per 20
 devices per run.
 ''')
 param fetchHardwareDetail bool = false

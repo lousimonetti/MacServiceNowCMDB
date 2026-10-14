@@ -175,6 +175,19 @@ class TestDeviceMapper:
         enriched = make_device(physicalMemoryInBytes=68719476736)
         assert mapper.build_values(enriched)["ram"] == 65536
 
+    @pytest.mark.parametrize(
+        ("arch", "expected"),
+        [("x64", "x64"), ("arM64", "ARM64"), ("x86", "x86"), ("arm", "ARM")],
+    )
+    def test_cpu_type_from_processor_architecture(self, config: Config, arch, expected):
+        values = DeviceMapper(config).build_values(make_device(processorArchitecture=arch))
+        assert values["cpu_type"] == expected
+
+    @pytest.mark.parametrize("arch", [None, "unknown", "", "somethingNew"])
+    def test_unknown_architecture_leaves_cpu_type_alone(self, config: Config, arch):
+        values = DeviceMapper(config).build_values(make_device(processorArchitecture=arch))
+        assert "cpu_type" not in values
+
     def test_ethernet_mac_wins_over_wifi(self, config: Config):
         device = make_device(ethernetMacAddress="001122334455")
         values = DeviceMapper(config).build_values(device)

@@ -186,6 +186,10 @@ behaviour change, particularly anything altering what gets written to a CI.
   three times. Reserved concurrency 1 stops overlapping runs racing on
   `state.json`. ECS has no equivalent, which the README documents.
 
+- **The hardware-detail lookup is the one beta Graph call.** It batches
+  against `/beta/$batch` because `processorArchitecture` (-> `cpu_type`) exists
+  only there. Everything else stays on v1.0. Macs report
+  `physicalMemoryInBytes` as 0 on both endpoints, so no `ram` for Macs.
 - **Graph data calls are plain REST, deliberately** — `azure-identity` handles
   tokens, but `msgraph-sdk` is not used. Do not add it.
 

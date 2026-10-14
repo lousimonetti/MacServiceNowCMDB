@@ -68,10 +68,13 @@ DEVICE_SELECT_FIELDS = (
 
 # Graph documents these as "non-default" properties: they come back null from the
 # collection endpoint and require a per-device GET with $select to populate.
+# processorArchitecture exists only on the beta endpoint, which is why the
+# hardware-detail lookup goes to beta (see GraphClient.get_hardware_details).
 NON_DEFAULT_DEVICE_FIELDS = (
     "id",
     "ethernetMacAddress",
     "physicalMemoryInBytes",
+    "processorArchitecture",
     "udid",
 )
 
@@ -287,6 +290,9 @@ class GraphClient:
             else:
                 token_provider = _CredentialTokenProvider(build_credential(cfg), cfg.scope)
         provider = token_provider
+        # Same host and version layout as base_url, so a national cloud keeps
+        # working: https://graph.microsoft.us/v1.0 -> https://graph.microsoft.us/beta.
+        self._beta_batch_url = cfg.base_url.rsplit("/", 1)[0] + "/beta/$batch"
         self._http = RetryingClient(
             base_url=cfg.base_url,
             token_provider=provider,
@@ -368,6 +374,10 @@ class GraphClient:
         way to cut the round trips: N devices cost N/20 requests instead of N.
         Each sub-request still counts against Intune's throttling limits.
 
+        Goes to the beta endpoint: `processorArchitecture` does not exist in
+        v1.0. Beta returns the same RAM / ethernet MAC values (checked against a
+        39-device tenant on 2026-10-14). Macs report RAM as 0 on both.
+
         Best-effort: a device whose lookup fails is absent from the result and
         syncs without these fields, rather than failing the run.
         """
@@ -380,6 +390,7 @@ class GraphClient:
             },
             what="hardware detail",
             required=False,
+            batch_url=self._beta_batch_url,
         )
 
     # ---- Entra ID users --------------------------------------------------
@@ -401,7 +412,7 @@ class GraphClient:
     # ---- JSON batching ---------------------------------------------------
 
     def _batch_get(
-        self, urls: dict[str, str], *, what: str, required: bool
+        self, urls: dict[str, str], *, what: str, required: bool, batch_url: str = "/$batch"
     ) -> dict[str, dict[str, Any]]:
         """GET every URL through `/$batch`, at most 20 per request.
 
@@ -425,7 +436,7 @@ class GraphClient:
                 ]
                 try:
                     response = self._http.request(
-                        "POST", "/$batch", json_body={"requests": requests}
+                        "POST", batch_url, json_body={"requests": requests}
                     )
                 except RetryableHTTPError as exc:
                     # Retries exhausted on the batch itself (throttling, 5xx,

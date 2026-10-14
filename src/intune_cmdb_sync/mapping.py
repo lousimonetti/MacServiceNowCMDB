@@ -37,6 +37,10 @@ DEFAULT_OS_NAMES = {
     "chromeos": "ChromeOS",
 }
 
+# Intune `processorArchitecture` (beta only) -> `cpu_type`. Graph spells ARM64
+# "arM64"; `unknown` maps to nothing, so the field is left alone.
+CPU_TYPES = {"x86": "x86", "x64": "x64", "arm": "ARM", "arm64": "ARM64"}
+
 # Serial numbers shorter than this are placeholders, not identifiers.
 MIN_SERIAL_LENGTH = 3
 
@@ -176,6 +180,7 @@ class DeviceMapper:
                 device.get("ethernetMacAddress") or device.get("wiFiMacAddress")
             ),
             "ram": bytes_to_mb(device.get("physicalMemoryInBytes")),
+            "cpu_type": CPU_TYPES.get(str(device.get("processorArchitecture") or "").lower()),
             "disk_space": bytes_to_gb(device.get("totalStorageSpaceInBytes")),
             "first_discovered": to_snow_datetime(device.get("enrolledDateTime")),
             "last_discovered": to_snow_datetime(device.get("lastSyncDateTime")),

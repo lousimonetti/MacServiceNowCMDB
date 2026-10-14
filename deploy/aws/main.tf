@@ -126,7 +126,7 @@ variable "retire_missing_devices" {
 }
 
 variable "fetch_hardware_detail" {
-  description = "Fetch RAM / ethernet MAC / UDID with one Graph $batch request per 20 devices. Without it `ram` is never sent."
+  description = "Fetch RAM / ethernet MAC / CPU architecture / UDID with one Graph $batch request per 20 devices. Without it `ram` is never sent."
   type        = bool
   default     = false
 }

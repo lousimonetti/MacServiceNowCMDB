@@ -20,6 +20,7 @@ pin every rule below.
 | `model_id` | `model` | resolved to a `cmdb_model` sys_id |
 | `mac_address` | `ethernetMacAddress`, else `wiFiMacAddress` | normalised to `AA:BB:CC:DD:EE:FF` |
 | `ram` | `physicalMemoryInBytes` | bytes → MB (requires `INTUNE_FETCH_HARDWARE_DETAIL=true`) |
+| `cpu_type` | `processorArchitecture` (beta) | `x64`, `x86`, `ARM64`, `ARM`; `unknown` is left out (requires `INTUNE_FETCH_HARDWARE_DETAIL=true`) |
 | `disk_space` | `totalStorageSpaceInBytes` | bytes → GB, 2 dp |
 | `first_discovered` | `enrolledDateTime` | ISO-8601 → `YYYY-MM-DD HH:MM:SS` UTC |
 | `last_discovered` | `lastSyncDateTime` | ISO-8601 → `YYYY-MM-DD HH:MM:SS` UTC |
@@ -44,11 +45,20 @@ Check the class's reconciliation rules in CI Class Manager before you assume a
 mapping bug. The fix there is a ServiceNow configuration decision, not a code
 change.
 
-### CPU
+### CPU and Mac memory
 
-Nothing is mapped to `cpu_name`, `cpu_type`, `cpu_count`, `cpu_speed` or
-`cpu_core_count`. Microsoft Graph v1.0 `managedDevice` has no processor
-properties to map from. Leave those fields to a source that collects them.
+`cpu_type` carries the processor architecture, which Graph exposes only on the
+beta endpoint. For that reason the hardware-detail lookup is batched against
+beta. Nothing is mapped to `cpu_name`, `cpu_count`, `cpu_speed` or
+`cpu_core_count`. Intune's Graph data has no processor name, speed or core
+count, in v1.0 or in beta's `hardwareInformation`. Graph reports
+`physicalMemoryInBytes` as 0 for Macs on both endpoints (seen in two tenants,
+2026-10-14), so Macs get no `ram`. Leave these fields to another discovery
+source, or collect them with an Intune custom attribute script.
+
+`cpu_type` is a weak value. If another source writes a full processor name into
+it, add `"drop": ["cpu_type"]` to the overrides file, or let a reconciliation
+rule give that source priority.
 
 ## Identity
 

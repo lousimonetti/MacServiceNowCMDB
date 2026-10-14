@@ -22,6 +22,8 @@ from .conftest import make_device
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 DEVICES = f"{GRAPH}/deviceManagement/managedDevices"
+# Hardware detail is batched against beta, which alone has processorArchitecture.
+BETA_BATCH = "https://graph.microsoft.com/beta/$batch"
 
 
 @pytest.fixture
@@ -135,7 +137,7 @@ class TestHardwareDetail:
     @respx.mock
     def test_batches_twenty_devices_per_request(self, graph: GraphClient):
         ids = [f"dev-{i}" for i in range(45)]
-        route = respx.post(f"{GRAPH}/$batch").mock(
+        route = respx.post(BETA_BATCH).mock(
             side_effect=_batch_echo(
                 body_for=lambda url: {"id": _device_id(url), "physicalMemoryInBytes": 8 << 30}
             )
@@ -146,7 +148,7 @@ class TestHardwareDetail:
 
     @respx.mock
     def test_selects_non_default_properties(self, graph: GraphClient):
-        route = respx.post(f"{GRAPH}/$batch").mock(
+        route = respx.post(BETA_BATCH).mock(
             side_effect=_batch_echo(
                 body_for=lambda url: {"id": "dev-1", "physicalMemoryInBytes": 17179869184}
             )
@@ -156,10 +158,19 @@ class TestHardwareDetail:
         url = json.loads(route.calls[0].request.read())["requests"][0]["url"]
         assert url.startswith("/deviceManagement/managedDevices/dev-1?$select=")
         assert "physicalMemoryInBytes" in url and "ethernetMacAddress" in url
+        assert "processorArchitecture" in url
+
+    @respx.mock
+    def test_goes_to_beta_not_v1(self, graph: GraphClient):
+        """processorArchitecture does not exist in v1.0."""
+        v1 = respx.post(f"{GRAPH}/$batch")
+        beta = respx.post(BETA_BATCH).mock(side_effect=_batch_echo())
+        graph.get_hardware_details(["dev-1"])
+        assert beta.call_count == 1 and v1.call_count == 0
 
     @respx.mock
     def test_failed_sub_request_leaves_the_device_out(self, graph: GraphClient):
-        respx.post(f"{GRAPH}/$batch").mock(
+        respx.post(BETA_BATCH).mock(
             side_effect=_batch_echo(
                 status_for=lambda url: 404 if "dev-2" in url else 200,
                 body_for=lambda url: {"id": _device_id(url)},
@@ -170,7 +181,7 @@ class TestHardwareDetail:
     @respx.mock
     def test_throttled_sub_requests_are_retried(self, graph: GraphClient, monkeypatch):
         monkeypatch.setattr("intune_cmdb_sync.graph.time.sleep", lambda _s: None)
-        respx.post(f"{GRAPH}/$batch").mock(
+        respx.post(BETA_BATCH).mock(
             side_effect=[
                 httpx.Response(200, json={"responses": [{"id": "0", "status": 429, "body": {}}]}),
                 httpx.Response(
@@ -183,7 +194,7 @@ class TestHardwareDetail:
     @respx.mock
     def test_batch_level_failure_degrades_instead_of_raising(self, graph: GraphClient):
         """Hardware detail is optional; losing it must not fail the whole sync."""
-        respx.post(f"{GRAPH}/$batch").mock(return_value=httpx.Response(401, text="unauth"))
+        respx.post(BETA_BATCH).mock(return_value=httpx.Response(401, text="unauth"))
         assert graph.get_hardware_details(["dev-1"]) == {}
 
     @respx.mock
@@ -191,12 +202,12 @@ class TestHardwareDetail:
         """A batch throttled past the retry budget raises inside the HTTP client.
         For optional hardware detail that must cost the fields, not the run."""
         graph._http._sleep = lambda _s: None
-        respx.post(f"{GRAPH}/$batch").mock(return_value=httpx.Response(503, text="busy"))
+        respx.post(BETA_BATCH).mock(return_value=httpx.Response(503, text="busy"))
         assert graph.get_hardware_details(["dev-1"]) == {}
 
     @respx.mock
     def test_empty_input_makes_no_request(self, graph: GraphClient):
-        route = respx.post(f"{GRAPH}/$batch")
+        route = respx.post(BETA_BATCH)
         assert graph.get_hardware_details([]) == {}
         assert route.call_count == 0
 

@@ -20,6 +20,7 @@ from .conftest import make_device
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 DEVICES = f"{GRAPH}/deviceManagement/managedDevices"
+BETA_BATCH = "https://graph.microsoft.com/beta/$batch"
 SNOW = "https://acme.service-now.com"
 IRE = f"{SNOW}/api/now/identifyreconcile"
 TABLE = f"{SNOW}/api/now/table"
@@ -406,9 +407,11 @@ class TestHardwareDetail:
         mock_snow_plumbing()
         respx.post(IRE).mock(return_value=ire_response("INSERT"))
         detail = respx.get(f"{DEVICES}/d1")
+        beta = respx.post(BETA_BATCH)
 
         runner_factory().run()
         assert detail.call_count == 0
+        assert not beta.called
         urls = [
             r["url"] for call in batches.calls
             for r in json.loads(call.request.read())["requests"]
@@ -423,16 +426,17 @@ class TestHardwareDetail:
             return_value=httpx.Response(200, json={"value": [make_device(id="d1")]})
         )
 
-        def batch(request: httpx.Request) -> httpx.Response:
-            # Hardware detail and user lookups share /$batch; answer only the former.
-            requests = json.loads(request.read())["requests"]
-            return httpx.Response(200, json={"responses": [
-                {"id": r["id"], "status": 200,
-                 "body": {"id": "d1", "physicalMemoryInBytes": 68719476736}}
-                for r in requests if r["url"].startswith("/deviceManagement/managedDevices/d1?")
+        # Hardware detail goes to beta's $batch; user lookups stay on v1.0.
+        batches = respx.post(BETA_BATCH).mock(
+            return_value=httpx.Response(200, json={"responses": [
+                {"id": "0", "status": 200,
+                 "body": {"id": "d1", "physicalMemoryInBytes": 68719476736,
+                          "processorArchitecture": "arM64"}}
             ]})
-
-        batches = respx.post(f"{GRAPH}/$batch").mock(side_effect=batch)
+        )
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
         single = respx.get(f"{DEVICES}/d1")
         mock_snow_plumbing()
         ire = respx.post(IRE).mock(return_value=ire_response("INSERT"))
@@ -446,6 +450,7 @@ class TestHardwareDetail:
         assert sent["ram"] == 65536
         values = json.loads(ire.calls[0].request.read())["items"][0]["values"]
         assert values["ram"] == 65536
+        assert values["cpu_type"] == "ARM64"
 
 
 class TestSourceRecency:
