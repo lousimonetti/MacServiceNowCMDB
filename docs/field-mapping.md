@@ -212,6 +212,14 @@ Names that match no record are left unset and listed under
 have the connector create them instead — off by default, because auto-populating
 the model catalogue affects Asset Management, and that is the asset team's call.
 
+A model is only ever created under a manufacturer that resolved to a real
+`core_company` record, and it is linked to that record. If the device's
+manufacturer matches nothing, the model is not created either: `model_id` is
+left unset, and the run report carries a warning naming the model. Create the
+manufacturer, or add a `manufacturer_aliases` entry, and the next run creates
+the model. An existing model still resolves whatever the manufacturer; the gate
+applies to creation only.
+
 ## Owner resolution
 
 Intune reports the owner as an Entra object ID plus a UPN, email, and display

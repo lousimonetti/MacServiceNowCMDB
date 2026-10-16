@@ -237,6 +237,49 @@ class TestSkips:
         assert report.finished_at is not None
 
 
+class TestModelCreationNeedsAManufacturer:
+    @respx.mock
+    def test_model_of_an_unknown_manufacturer_is_reported_not_created(
+        self, set_env, runner_factory
+    ):
+        set_env(SNOW_CREATE_MISSING_MODELS="true")
+        cfg = Config.from_env()
+        respx.get(DEVICES).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "value": [
+                        make_device(id="d1", manufacturer="Dell Inc.", model="Latitude 7455"),
+                        make_device(id="d2", deviceName="MAC-2", model="Mac16,1"),
+                    ]
+                },
+            )
+        )
+        respx.post(f"{GRAPH}/$batch").mock(
+            return_value=httpx.Response(200, json={"responses": []})
+        )
+        mock_snow_plumbing(company_rows=[{"sys_id": "mfr-apple", "name": "Apple"}])
+        create = respx.post(f"{TABLE}/cmdb_model").mock(
+            return_value=httpx.Response(
+                201, json={"result": {"sys_id": "model-new", "name": "Mac16,1"}}
+            )
+        )
+        ire = respx.post(IRE).mock(return_value=ire_response("UPDATE", "UPDATE"))
+
+        report = runner_factory(cfg).run()
+
+        assert create.call_count == 1
+        assert json.loads(create.calls[0].request.read())["name"] == "Mac16,1"
+        dell, mac = (item["values"] for item in json.loads(ire.calls[0].request.read())["items"])
+        assert "model_id" not in dell and "manufacturer" not in dell
+        assert mac["model_id"] == "model-new"
+        assert report.unresolved_references["models"] == ["Latitude 7455"]
+        assert any(
+            "not created because their manufacturer" in w and "Latitude 7455" in w
+            for w in report.warnings
+        )
+
+
 class TestFailureHandling:
     @respx.mock
     def test_batch_failure_marks_every_device_in_it(self, runner_factory):

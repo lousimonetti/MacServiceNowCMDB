@@ -230,11 +230,90 @@ class TestCreation:
 
     @respx.mock
     def test_failed_creation_is_not_retried_per_device(self, snow_client):
-        respx.get(COMPANY).mock(return_value=httpx.Response(200, json={"result": []}))
+        respx.get(COMPANY).mock(
+            return_value=httpx.Response(
+                200, json={"result": [{"sys_id": "mfr-1", "name": "Apple"}]}
+            )
+        )
         respx.get(MODEL).mock(return_value=httpx.Response(200, json={"result": []}))
         create = respx.post(MODEL).mock(return_value=httpx.Response(403, text="no ACL"))
         resolver = ReferenceResolver(snow_client, create_missing_models=True)
-        resolver.prime([], [])
+        resolver.prime(["Apple"], [])
         for _ in range(5):
-            resolver.references_for(None, "Mac16,1")
+            resolver.references_for("Apple", "Mac16,1")
         assert create.call_count == 1
+
+
+class TestModelCreationNeedsAManufacturer:
+    @respx.mock
+    def test_no_model_is_created_without_a_resolved_manufacturer(self, snow_client):
+        """A model with no manufacturer is an unusable catalogue entry."""
+        respx.get(COMPANY).mock(return_value=httpx.Response(200, json={"result": []}))
+        respx.get(MODEL).mock(return_value=httpx.Response(200, json={"result": []}))
+        create = respx.post(MODEL)
+        resolver = ReferenceResolver(snow_client, create_missing_models=True)
+        resolver.prime(["Dell Inc."], ["Latitude 7455"])
+        assert resolver.references_for("Dell Inc.", "Latitude 7455") == {}
+        assert resolver.references_for(None, "Latitude 7455") == {}
+        assert create.call_count == 0
+        assert resolver.unresolved["models"] == ["Latitude 7455"]
+        assert resolver.models_awaiting_manufacturer == ["Latitude 7455"]
+
+    @respx.mock
+    def test_a_later_device_with_a_manufacturer_still_creates_the_model(self, snow_client):
+        respx.get(COMPANY).mock(
+            return_value=httpx.Response(
+                200, json={"result": [{"sys_id": "mfr-1", "name": "Apple"}]}
+            )
+        )
+        respx.get(MODEL).mock(return_value=httpx.Response(200, json={"result": []}))
+        create = respx.post(MODEL).mock(
+            return_value=httpx.Response(
+                201, json={"result": {"sys_id": "model-new", "name": "Mac16,1"}}
+            )
+        )
+        resolver = ReferenceResolver(snow_client, create_missing_models=True)
+        resolver.prime(["Apple"], ["Mac16,1"])
+        assert resolver.references_for(None, "Mac16,1") == {}
+        refs = resolver.references_for("Apple", "Mac16,1")
+        assert refs == {"manufacturer": "mfr-1", "model_id": "model-new"}
+        assert json.loads(create.calls[0].request.read())["manufacturer"] == "mfr-1"
+        assert resolver.unresolved["models"] == []
+        assert resolver.models_awaiting_manufacturer == []
+        # Cached from here on: one create for the whole run.
+        resolver.references_for(None, "Mac16,1")
+        assert create.call_count == 1
+
+    @respx.mock
+    def test_a_failed_create_stays_failed_after_a_device_with_no_manufacturer(
+        self, snow_client
+    ):
+        respx.get(COMPANY).mock(
+            return_value=httpx.Response(
+                200, json={"result": [{"sys_id": "mfr-1", "name": "Apple"}]}
+            )
+        )
+        respx.get(MODEL).mock(return_value=httpx.Response(200, json={"result": []}))
+        create = respx.post(MODEL).mock(return_value=httpx.Response(403, text="no ACL"))
+        resolver = ReferenceResolver(snow_client, create_missing_models=True)
+        resolver.prime(["Apple"], [])
+        resolver.references_for("Apple", "Mac16,1")
+        resolver.references_for(None, "Mac16,1")
+        resolver.references_for("Apple", "Mac16,1")
+        assert create.call_count == 1
+        assert resolver.models_awaiting_manufacturer == []
+        assert resolver.unresolved["models"] == ["Mac16,1"]
+
+    @respx.mock
+    def test_an_existing_model_still_resolves_without_a_manufacturer(self, snow_client):
+        """The manufacturer gate is on creation only, never on lookup."""
+        respx.get(COMPANY).mock(return_value=httpx.Response(200, json={"result": []}))
+        respx.get(MODEL).mock(
+            return_value=httpx.Response(
+                200, json={"result": [{"sys_id": "model-1", "name": "Mac16,1"}]}
+            )
+        )
+        resolver = ReferenceResolver(snow_client, create_missing_models=True)
+        resolver.prime([], ["Mac16,1"])
+        assert resolver.references_for("Unknown Vendor", "Mac16,1") == {"model_id": "model-1"}
+        assert resolver.models_awaiting_manufacturer == []

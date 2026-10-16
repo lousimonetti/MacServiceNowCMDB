@@ -54,6 +54,10 @@ class ReferenceResolver:
         self._models: dict[str, str] = {}
         self._missing_manufacturers: set[str] = set()
         self._missing_models: set[str] = set()
+        # Model names not created because their manufacturer did not resolve,
+        # lowercased. A later device with the same model and a resolved
+        # manufacturer may still create it.
+        self._models_awaiting_manufacturer: set[str] = set()
         # Records ServiceNow created but stored without the name we sent.
         self.blank_creations: list[str] = []
 
@@ -63,6 +67,13 @@ class ReferenceResolver:
             "manufacturers": sorted(self._missing_manufacturers),
             "models": sorted(self._missing_models),
         }
+
+    @property
+    def models_awaiting_manufacturer(self) -> list[str]:
+        """Model names left uncreated because no manufacturer resolved for them."""
+        return sorted(
+            m for m in self._missing_models if m.lower() in self._models_awaiting_manufacturer
+        )
 
     def prime(self, manufacturers: Iterable[str], models: Iterable[str]) -> None:
         """Bulk-load every manufacturer and model the run will need."""
@@ -101,18 +112,42 @@ class ReferenceResolver:
         if manufacturer_sys_id:
             out["manufacturer"] = manufacturer_sys_id
 
+        # A model is created only under a manufacturer that exists. A model row
+        # with no manufacturer is a catalogue entry Asset Management cannot use,
+        # and on PROD the only fallback would be a blank company.
+        model_key = (model or "").strip().lower()
+        if self._create_models and model_key and manufacturer_sys_id:
+            self._retry_model_awaiting_manufacturer(model_key)
+        # A name already given up on (e.g. a failed create) must not become
+        # retryable just because this device has no manufacturer.
+        already_missing = model_key in {m.lower() for m in self._missing_models}
         model_sys_id = self._resolve(
             model,
             cache=self._models,
             missing=self._missing_models,
             table=CMDB_MODEL_TABLE,
-            create=self._create_models,
+            create=self._create_models and manufacturer_sys_id is not None,
             extra_values={"manufacturer": manufacturer_sys_id} if manufacturer_sys_id else None,
         )
+        if (
+            not model_sys_id
+            and model_key
+            and self._create_models
+            and not manufacturer_sys_id
+            and not already_missing
+        ):
+            self._models_awaiting_manufacturer.add(model_key)
         if model_sys_id:
             out["model_id"] = model_sys_id
 
         return out
+
+    def _retry_model_awaiting_manufacturer(self, model_key: str) -> None:
+        """Forget an earlier skip, so this device's manufacturer can create it."""
+        if model_key not in self._models_awaiting_manufacturer:
+            return
+        self._models_awaiting_manufacturer.discard(model_key)
+        self._missing_models = {m for m in self._missing_models if m.lower() != model_key}
 
     def _resolve(
         self,

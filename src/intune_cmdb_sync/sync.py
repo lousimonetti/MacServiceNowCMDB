@@ -132,6 +132,13 @@ class SyncRunner:
 
         report.unresolved_references = self.references.unresolved
         report.warnings.extend(self.references.blank_creations)
+        awaiting = self.references.models_awaiting_manufacturer
+        if awaiting:
+            report.warnings.append(
+                f"{len(awaiting)} model(s) not created because their manufacturer has no "
+                f"core_company record: {', '.join(awaiting)}. Create the manufacturer "
+                "(or add a manufacturer_aliases entry) and the next run creates them."
+            )
         if any(report.unresolved_references.values()):
             log.info(
                 "some manufacturer/model references had no matching record",
