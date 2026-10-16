@@ -75,6 +75,16 @@ run "lambda_is_the_default_host" {
   }
 
   assert {
+    condition     = aws_lambda_function.sync[0].environment[0].variables["SNOW_CREATE_MISSING_MODELS"] == "false"
+    error_message = "create_missing_models must reach the function, off by default"
+  }
+
+  assert {
+    condition     = !contains(keys(aws_lambda_function.sync[0].environment[0].variables), "SNOW_CREATE_MISSING_MANUFACTURERS")
+    error_message = "manufacturer creation must not be configurable from the deployment"
+  }
+
+  assert {
     condition     = !contains(keys(aws_lambda_function.sync[0].environment[0].variables), "MAPPING_OVERRIDES_JSON")
     error_message = "MAPPING_OVERRIDES_JSON must be absent when no overrides file is given"
   }

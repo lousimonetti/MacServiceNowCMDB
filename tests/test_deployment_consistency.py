@@ -272,6 +272,29 @@ def test_hardware_detail_setting_reaches_every_host():
     assert '_env_bool("INTUNE_FETCH_HARDWARE_DETAIL"' in config
 
 
+def test_model_creation_reaches_every_host_and_manufacturer_creation_does_not():
+    """A deployed job ran with the code default (no model creation) whatever the
+    local `.env` said. Manufacturer creation stays out of the deployments: on
+    PROD the account could insert `core_company` rows but not write their name,
+    so turning it on created blank companies (2026-10-14)."""
+    bicep = BICEP.read_text()
+    assert "param createMissingModels bool = false" in bicep
+    assert "SNOW_CREATE_MISSING_MODELS: string(createMissingModels)" in bicep
+    assert "createMissingModels" in _deploy_sh_bicep_parameters()
+    deploy_sh = DEPLOY_SH.read_text()
+    assert "require_bool SNOW_CREATE_MISSING_MODELS" in deploy_sh
+    assert 'createMissingModels="$SNOW_CREATE_MISSING_MODELS"' in deploy_sh
+    terraform = TERRAFORM.read_text()
+    assert "SNOW_CREATE_MISSING_MODELS = tostring(var.create_missing_models)" in terraform
+
+    for text in (bicep, deploy_sh, terraform):
+        assert "SNOW_CREATE_MISSING_MANUFACTURERS:" not in text
+        assert "SNOW_CREATE_MISSING_MANUFACTURERS =" not in text
+    config = (REPO / "src" / "intune_cmdb_sync" / "config.py").read_text()
+    assert '_env_bool("SNOW_CREATE_MISSING_MANUFACTURERS", False)' in config
+    assert '_env_bool("SNOW_CREATE_MISSING_MODELS", False)' in config
+
+
 def test_mac_ram_attribute_reaches_every_host_with_its_permission():
     """Graph reports Mac RAM as 0; the custom attribute is the only source, and
     without the setting on the host it silently never applies."""

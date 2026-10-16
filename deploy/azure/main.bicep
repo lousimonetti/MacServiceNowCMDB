@@ -182,6 +182,14 @@ devices per run.
 ''')
 param fetchHardwareDetail bool = false
 
+@description('''
+Create a cmdb_model row for a model name that matches none. Off by default: it
+adds to Asset Management's catalogue. There is deliberately no counterpart for
+manufacturers, because an account that can insert core_company rows but not
+write their name creates blank companies (PROD, 2026-10-14).
+''')
+param createMissingModels bool = false
+
 var useManagedIdentityForGraph = graphAuthMode == 'managed_identity'
 var useFederatedIdentityForGraph = graphAuthMode == 'federated_managed_identity'
 
@@ -383,6 +391,7 @@ var baseEnv = {
   SNOW_RETIRE_MISSING: string(retireMissingDevices)
   DRY_RUN: string(dryRun)
   INTUNE_FETCH_HARDWARE_DETAIL: string(fetchHardwareDetail)
+  SNOW_CREATE_MISSING_MODELS: string(createMissingModels)
   // Without this a run where every device failed still exits 0.
   FAIL_ON_ERROR: 'true'
   LOG_FORMAT: 'json'

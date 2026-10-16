@@ -131,6 +131,12 @@ variable "fetch_hardware_detail" {
   default     = false
 }
 
+variable "create_missing_models" {
+  description = "Create a cmdb_model row for an unmatched model name instead of omitting model_id. No manufacturer equivalent on purpose: see deploy/azure/main.bicep."
+  type        = bool
+  default     = false
+}
+
 variable "dry_run" {
   description = <<-DESC
     Run without committing anything to the CMDB. Required, deliberately: a
@@ -276,6 +282,8 @@ locals {
       SNOW_WRITE_MODE       = var.write_mode
       SNOW_DISCOVERY_SOURCE = var.discovery_source
       SNOW_RETIRE_MISSING   = tostring(var.retire_missing_devices)
+
+      SNOW_CREATE_MISSING_MODELS = tostring(var.create_missing_models)
 
       STATE_PATH = "s3://${aws_s3_bucket.state.id}/state.json"
       DRY_RUN    = tostring(var.dry_run)

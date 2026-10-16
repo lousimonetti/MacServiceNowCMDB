@@ -149,6 +149,11 @@ require_bool RETIRE_MISSING ""
 # the listing.
 INTUNE_FETCH_HARDWARE_DETAIL="${INTUNE_FETCH_HARDWARE_DETAIL:-false}"
 require_bool INTUNE_FETCH_HARDWARE_DETAIL ""
+# Off by default: an unmatched model name is reported and model_id omitted.
+# true creates the cmdb_model row instead. Manufacturers have no such switch here:
+# see main.bicep.
+SNOW_CREATE_MISSING_MODELS="${SNOW_CREATE_MISSING_MODELS:-false}"
+require_bool SNOW_CREATE_MISSING_MODELS ""
 
 # The app receives only what main.bicep sets, so local tuning has to be passed
 # through explicitly or the Azure run differs from the one tested locally.
@@ -392,6 +397,7 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
       mappingOverrides="$MAPPING_OVERRIDES" \
       retireMissingDevices="$RETIRE_MISSING" \
       fetchHardwareDetail="$INTUNE_FETCH_HARDWARE_DETAIL" \
+      createMissingModels="$SNOW_CREATE_MISSING_MODELS" \
       dryRun="$DRY_RUN" \
       alertEmail="${ALERT_EMAIL:-}" \
   --query properties.outputs \
@@ -518,6 +524,7 @@ Deployed.
   Dry run          ${DRY_RUN}$([[ "$DRY_RUN" == false ]] && echo "  -- LIVE: the next run commits to the CMDB")
   Retire missing   ${RETIRE_MISSING}
   Hardware detail  ${INTUNE_FETCH_HARDWARE_DETAIL}
+  Create models    ${SNOW_CREATE_MISSING_MODELS}
   Mac RAM source   ${INTUNE_MAC_RAM_ATTRIBUTE:-none (Macs get no RAM)}
   Mac CPU source   ${INTUNE_MAC_CPU_ATTRIBUTE:-none (no cpu_name)}
   Class map        ${SNOW_CLASS_MAP:-built-in (windows, macos)}
