@@ -39,6 +39,7 @@ run-report.json
 # local container runs write their report here (see deploy/aws/README.md)
 out/
 mapping-overrides.json
+mapping-overrides.prod.json
 !docs/examples/mapping-overrides.json
 
 # Editors / OS

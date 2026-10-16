@@ -170,7 +170,11 @@ behaviour change, particularly anything altering what gets written to a CI.
   because S3 state imports boto3. `INTUNE_FETCH_HARDWARE_DETAIL` passes
   through both stacks the same way (`fetchHardwareDetail` /
   `fetch_hardware_detail`, default `false`). Before 2026-10-14 it did not, so
-  a deployed job never sent `ram`.
+  a deployed job never sent `ram`. `SNOW_CREATE_MISSING_MODELS` passes through
+  the same way (`createMissingModels` / `create_missing_models`, default
+  `false`, since 2026-10-16). `SNOW_CREATE_MISSING_MANUFACTURERS` deliberately
+  does not: deployments keep the code default `false`, and a test pins its
+  absence (see the PROD `core_company` note in Constraints).
 - **AWS secrets are referenced by SSM parameter name, never passed to
   Terraform.** As variables they landed in plaintext in `terraform.tfvars` and
   the (backend-less, local) state. The parameter ARNs are built from the names
@@ -196,7 +200,7 @@ behaviour change, particularly anything altering what gets written to a CI.
   Intune's 32-bit Integer type and the run shows Failed, seen 2026-10-14), read from
   `/beta/deviceManagement/deviceCustomAttributeShellScripts/{id}/deviceRunStates`
   (needs `DeviceManagementScripts.Read.All`, confirmed by a live 403
-  2026-10-14). It fills only devices where Graph gave no RAM, and an unreadable
+  2026-10-14; PROD's Graph app still lacked it on 2026-10-16). It fills only devices where Graph gave no RAM, and an unreadable
   attribute is a report warning, never a failed run. `INTUNE_MAC_CPU_ATTRIBUTE`
   does the same for `cpu_name` (String attribute, `machdep.cpu.brand_string`);
   Graph has no CPU name on any platform. Run-state parsing
@@ -283,6 +287,24 @@ behaviour change, particularly anything altering what gets written to a CI.
   credential may call — and prints the record for an admin when ACLs refuse.
   Keep it on its own flag: a connector that edited choice lists as a side
   effect of syncing devices would be far worse to operate.
+
+- **On PROD (dpsnow), `svc_intune` can insert into `core_company` but cannot
+  write `name` or `manufacturer`.** The Table API drops both and still returns
+  a sys_id, which is how `SNOW_CREATE_MISSING_MANUFACTURERS=true` made 42 blank
+  companies on 2026-10-14. On 2026-10-16 a PATCH of `{name, manufacturer}`
+  returned 200 and changed nothing (`sys_mod_count` stayed 0), so always read
+  back after a write to this table. `core_company` there is an import of
+  corporate legal entities (custom `u_mrc` / `u_company_id` fields) with no
+  hardware vendors in it. Many non-Intune CIs hold the literal `undefined` or
+  sys_ids that return nothing. It is not a read ACL: `X-Total-Count` equals
+  the rows returned. An admin renamed the three linked blanks to Apple, Lenovo
+  and Microsoft (manufacturer flag still `false`). Prod therefore runs with
+  creation off and `mapping-overrides.prod.json` (gitignored), which maps
+  `Microsoft Corporation` -> `Microsoft` and drops `last_discovered`. It is
+  kept apart from `mapping-overrides.json`, which dev's `.env` uses. A new
+  vendor needs an admin to create it, then an alias if Intune spells it
+  differently. 39 blank companies remain; delete them only after nothing
+  references them (some connector-created models still do).
 
 - **The CMDB Instance API takes strings only.** `POST
   /api/now/cmdb/instance/{class}` deserialises `attributes` as String->String
